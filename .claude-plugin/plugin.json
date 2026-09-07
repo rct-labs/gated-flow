@@ -1,0 +1,10 @@
+{
+  "name": "gated-flow",
+  "version": "0.1.0",
+  "description": "Evidence-gated development workflow: shape ideas into specs, run task queues unattended behind a git pre-commit acceptance gate, and review drafts with multi-model debate.",
+  "author": { "name": "rct-labs", "url": "https://github.com/rct-labs" },
+  "homepage": "https://github.com/rct-labs/gated-flow",
+  "repository": "https://github.com/rct-labs/gated-flow",
+  "license": "MIT",
+  "keywords": ["skills", "workflow", "task-queue", "acceptance-gate", "multi-model-review", "claude-code", "codex"]
+}

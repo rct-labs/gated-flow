@@ -1,0 +1,20 @@
+{
+  "name": "rct-labs",
+  "owner": { "name": "rct-labs", "url": "https://github.com/rct-labs" },
+  "metadata": {
+    "description": "Skills and engines published by rct-labs",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "gated-flow",
+      "source": "./",
+      "description": "Evidence-gated development workflow: flow, flow-run, run-queue and model-debate skills plus the git pre-commit acceptance gate.",
+      "version": "0.1.0",
+      "category": "workflow",
+      "tags": ["workflow", "task-queue", "acceptance-gate", "code-review", "multi-model"],
+      "license": "MIT",
+      "homepage": "https://github.com/rct-labs/gated-flow"
+    }
+  ]
+}

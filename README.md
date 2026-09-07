@@ -1,5 +1,9 @@
 # flow — an evidence-gated development workflow for coding agents
 
+[![CI](https://github.com/rct-labs/gated-flow/actions/workflows/validate.yml/badge.svg)](https://github.com/rct-labs/gated-flow/actions/workflows/validate.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Install with skills.sh](https://img.shields.io/badge/skills.sh-npx%20skills%20add%20rct--labs%2Fgated--flow-black)](https://skills.sh/rct-labs/gated-flow)
+
 Four skills and one small engine that let a coding agent shape an idea into a
 testable spec, queue small verifiable tasks, run them unattended, and prove
 each one closed — without ever letting a model mark its own work done.
@@ -79,6 +83,13 @@ skills (it installs skills only, not the `flow` command):
 ```bash
 npx skills add rct-labs/gated-flow --list
 npx skills add rct-labs/gated-flow --skill flow --skill run-queue --skill model-debate
+```
+
+As a Claude Code plugin (skills only, namespaced `gated-flow:flow` etc.):
+
+```text
+/plugin marketplace add rct-labs/gated-flow
+/plugin install gated-flow@rct-labs
 ```
 
 Then, once per project:
