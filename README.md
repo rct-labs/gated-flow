@@ -154,5 +154,5 @@ fake completion, star the repository so others can find it.
 
 ## License
 
-A repository license has not been selected yet. Dependencies and fonts, where
-any are used, keep their own licenses.
+[MIT](LICENSE). Dependencies and fonts, where any are used, keep their own
+licenses.
