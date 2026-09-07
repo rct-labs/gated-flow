@@ -4,6 +4,8 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Install with skills.sh](https://img.shields.io/badge/skills.sh-npx%20skills%20add%20rct--labs%2Fgated--flow-black)](https://skills.sh/rct-labs/gated-flow)
 
+![Admission refuses a decision and an oversized task; the pre-commit gate blocks a DONE commit that touches only the queue, then accepts the same task once code and a passing test are staged](docs/demo.gif)
+
 Four skills and one small engine that let a coding agent shape an idea into a
 testable spec, queue small verifiable tasks, run them unattended, and prove
 each one closed — without ever letting a model mark its own work done.
