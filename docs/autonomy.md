@@ -11,11 +11,13 @@
 One `$flow-run` should end in one of two states, without a human in the loop in between:
 
 1. every admitted task closed **and judged acceptable**, or
-2. a short list of things that genuinely need the user: an escalated task with the judge's
-   findings, or an irreversible task waiting for approval.
+2. a concrete unresolved condition: missing authorization/information, an unavailable external
+   dependency, or a cause with no supported correction after bounded diagnosis.
 
-Everything else — worker choice, quota outages, one or two quality iterations — is handled by
-the runner.
+The runner owns deterministic attempts, verification, review caps and stop evidence. The host
+owns diagnosis and admission of in-scope repairs between stopped runs. A request to finish
+authorizes such repairs without another confirmation; it does not authorize new external or
+irreversible effects. The shell supervisor does not interpret findings or write repair tasks.
 
 ## 1. Roles and model selection
 
@@ -80,7 +82,15 @@ Sequence after `task_done`:
    reset); HEAD unchanged → failed revision, counts against the cap; then re-judge.
    Same `non_gate_worktree_state` / `queue_status_changes` guards as a normal attempt.
 5. `escalate`, cap reached, or no-progress → stop the run `judge_escalated:<id>`; the report
-   carries score history and the last findings. The task stays DONE.
+   carries score history and the last findings. The task stays DONE. This ends the runner,
+   not the host's existing completion authorization. The host preserves that evidence, reads
+   the failure and workspace state, and admits one supported in-scope follow-up before
+   dependent tasks. A new run must pass normal admission, verification and independent
+   review under unchanged thresholds/caps. No hand-run judge loop or blind retry.
+   Repeated same-cause failure without progress gets one bounded diagnostic pass; another
+   repair requires a materially different evidence-backed correction. Otherwise report the
+   exact unresolved condition, asking only for actually missing information or authorization.
+   See `skills/run-queue/SKILL.md` for the host recovery procedure.
 6. Judge chain entirely down or every member returns unparsable JSON → `judge_skipped`, the
    run continues, the report says so in its own section. A judge outage is not a task failure,
    and must not silently switch quality off — visibility is the substitute.
@@ -97,8 +107,10 @@ Cost caps: claude judge/worker entries carry `--max-budget-usd`; codex has no eq
 | external | `git push`, broadcasts | worker prompt forbids; the **host** does it after the run if CONTEXT/user allowed, with `rev-list 0/0` re-verification |
 | **irreversible** | `irreversible_globs`: migrations, `data/**`, hooks, `.claude/settings*`, `--force` | needs `<!-- task:ID approved: <date or who> -->`; `admit` reports `needs-approval`; `run` stops with `needs_approval:<id>` **even in advisory mode** |
 
-Approval is per task id and single-use by construction. The host places such tasks at the queue
-tail so the run finishes everything else first and the user approves once, not mid-run.
+Approval evidence is recorded per task id. An already-approved concrete implementation scope
+can cover its necessary repair; the host records that original authorization and scope mapping
+for the new ID, rather than copying a marker or asking again. New effects require authorization.
+The host places independent irreversible work at the tail, preserving required dependencies.
 
 ## 5. Config keys (defaults)
 
@@ -127,5 +139,6 @@ new behaviour.
 ## 7. What the user sees at the end
 
 `RUN-REPORT.md` gains a **Judge** section (per task: rounds, scores, final verdict, worker per
-round) and a **Waiting on you** section that is empty on a clean run. That last section is the
-only thing the user has to read.
+round) and a **Waiting on you** section that is empty on a clean run. That heading is raw runner
+output; the host first diagnoses whether it can repair the issue within existing scope. Report
+what passed, what failed, the automatic recovery taken, and only decisions truly left to the user.

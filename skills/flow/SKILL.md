@@ -35,8 +35,9 @@ no-oracle until they set one; never invent an oracle for them.
 - `docs/work/<work-id>/brief.md` + `spec.md` (+ `evidence.md`; `prototype/`
   only when a repository-held prototype is explicitly needed) — one vertical
   work package per feature. Templates: `<home>/flow/templates/`.
-- `TASK_QUEUE.md` — the ONLY task list (gate.py format). Never create
-  tasks.yaml / tasks.json / a second queue.
+- The queue configured in `.gate/config.json` (default `TASK_QUEUE.md`) is the
+  ONLY task list, in gate format. All `TASK_QUEUE.md` mentions below mean that
+  configured path; preserve its existing name/extension, never create a second queue.
 
 ## Route by intent
 
@@ -101,10 +102,14 @@ Optionally give the table a `worker` column (`claude` / `codex` / `kimi` /
 falls through to the run-wide list when the pin is benched.
 
 A task whose declared files hit the project's `irreversible_globs`
-(migrations, `data/**`, hooks, settings) goes to the **tail** of the queue and
-is dispatched only with its own `<!-- task:ID approved: <who/date> -->` line.
-Write that line only when the user said yes to that task; otherwise `admit`
-shows `APPROVAL` and the run stops there for them. Every closed task is then
+(migrations, `data/**`, hooks, settings) needs its own
+`<!-- task:ID approved: <who/date> -->` line. Put independent irreversible work
+at the tail; preserve dependency order, including repairs before their dependents.
+Write approval evidence only when the user's authorization covers this exact
+scope. An approved concrete implementation package can cover a necessary repair:
+record the original instruction and its scope mapping to this task ID, never
+blindly copy another task's approval. Missing authorization for new effects still
+requires the user; `admit` reports `APPROVAL` until it is recorded. Every closed task is then
 scored by the read-only judge chain when the project enables `judge.enabled`;
 its acceptance in `spec.md` is what the judge reads, so write acceptance the
 judge can check.

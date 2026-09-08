@@ -15,7 +15,9 @@ description: >
 
 You are the launcher and the narrator. The loop belongs to `gate.py run`: a
 deterministic script that spawns one CLI process per task, runs the
-acceptance command itself, and decides when to stop.
+acceptance command itself, and decides when to stop. The host owns evidence-based
+recovery between stopped runs when the user has authorized completion; neither
+the runner nor its shell supervisor diagnoses findings or writes repair tasks.
 
 Process and conversation boundaries are separate. An opt-in `session_reuse`
 policy lets adjacent Codex tasks with the same explicit
@@ -43,16 +45,15 @@ flow admit  --repo <project>
 (`flow` is the PATH shim for gate.py/audit.py; `python <gate.py> doctor|admit`
 is the same thing if the shim is missing.)
 
-Show both outputs. **Stop and report** if the pre-commit hook is not installed
-(an unattended run without the gate is the exact failure that killed the
-previous orchestrator), if the queue parses to zero tasks, or if the head task
-is `BLOCKED`.
+Show the relevant results. Do not launch without the pre-commit hook, with a
+queue parsing to zero tasks, or into a `BLOCKED` head. Diagnose the state using
+the recovery procedure below; an in-scope repair does not require another yes.
+A truly empty completed queue is completion, not a request for permission.
 
 The `admit` report is the sweet-spot check (small / isolated / verifiable —
 the third leg of the design). If the **head** task is `REFUSE` or
-`UNDECLARED`, tell the user before launching: in advisory mode the run will
-proceed with a warning; with `strict_admit` it will stop immediately. Offer to
-add the missing scope line first:
+`UNDECLARED`, fix the declaration or split an already-authorized scope and
+re-run admission before launching. Do not rely on advisory mode to bypass it:
 
 ```
 <!-- task:WP-7 files: src/foo.py, tests/test_foo.py -->
@@ -105,7 +106,7 @@ Then **poll the journal** and narrate. The journal is append-only NDJSON at
 | `heartbeat` | still alive: elapsed seconds, lines so far, last line of output |
 | `task_done` | the runner verified it: commit sha and duration |
 | `judge_start` / `judge_verdict` | read-only judge round: `score`, `verdict`, `member` (a `judge.chain` entry) |
-| `revision_start` / `revision_end` | a judge-driven fix by a *different* worker; `outcome` is the runner's own re-verify |
+| `revision_start` / `revision_end` | a judge-driven fix, preferably by a different worker (`rotated: false` records same-worker fallback); `outcome` is the runner's own re-verify |
 | `judge_escalated` | cap, no progress, or the judge asked for a human; run stops |
 | `judge_skipped` | whole judge chain down; task stays DONE unreviewed (report says so) |
 | `probe` | usage probe result per CLI at run start (`usable`, `reason`) |
@@ -224,44 +225,96 @@ the signal the user actually needs.
 
 ## 4. Report the outcome
 
-From `.gate/RUN-REPORT.md`. Lead with its **Waiting on you** section (empty on
-a clean run), then how many tasks closed and why it stopped, then the
-**Judge** table (rounds / scores / workers) and the per-task table, then
-anything left uncommitted. If a task did not close, quote the last lines of
-its log from `.gate/runs/<run-id>/` instead of guessing why.
+Read `.gate/RUN-REPORT.md`, including **Waiting on you**, judge rounds/scores
+and task outcomes, then apply host recovery below. A recoverable stop gets a
+progress update and continued work, not a final permission question. At completion
+or a genuine unresolved condition, report verified results, recovery taken and
+anything left uncommitted. For an unclosed task, use its log under
+`.gate/runs/<run-id>/` instead of guessing why.
 
 ## Never
 
-- **Never mark a task done yourself.** You may not edit the queue, the
-  acceptance file, or any verify command. Only a worker closes a task, and only
-  the gate lets that commit through.
+- **Never mark a task done yourself.** The host may prepare/split TODO tasks,
+  declare dependencies and evidence-backed scope/approval, and write repair
+  acceptance through flow-run. It must not falsify status or test baselines,
+  weaken acceptance, or change verify commands to pass a failure. Only a worker
+  closes a task, and only the gate lets that commit through.
 - **Never `git commit --no-verify`**, and never suggest it as a way past a
   blocked commit. The block is the product.
-- **Never take over an `IN_PROGRESS` task.** Report and stop.
+- **Never take over a live or unrecovered `IN_PROGRESS` task.** Continue
+  read-only diagnosis or monitoring an owned worker; do not launch a competing
+  writer or end the session merely because a claim exists.
 - **Never push, merge, or open a PR.**
-- Never restart a run because it stopped early, and never raise `--max-tasks` to
-  push past a stop. It stopped for a reason.
+- Never blindly repeat a stopped run or raise limits to push past its stop.
+  A new run is allowed after the host resolves or scopes the recorded cause,
+  passes admission, and establishes a safe single-worker state as below.
 - Never weaken admission to get a task through: shrink the task, don't grow
   `max_task_files`.
 
+## Host recovery after a stopped run
+
+A completion request authorizes necessary reversible repairs within its scope.
+Do not turn `run_end`, a report heading such as **Waiting on you**, or a judge's
+`escalate` label into a new permission requirement by itself. The host must first
+verify what is missing. Preserve the runner's stop, verdicts, scores and logs.
+This procedure is host reasoning between runs, not an intelligent-retry feature
+of `supervise.ps1`, and it requires the host to remain active.
+
+1. Read the new run's report, journal, failing log, judge findings, `git status`
+   and relevant commits. Verify worker/supervisor ownership and that no writer
+   remains; preserve partial and unrelated changes. Never take over an
+   `IN_PROGRESS` claim. If ownership is stale, use the project's supported claim
+   recovery only if it actually exists, with evidence of termination; do not
+   invent a recovery command or hand-edit a claim to retry. If no supported
+   mechanism exists, keep dispatch paused and report the precise claim blocker.
+2. In the existing work package/CONTEXT, record the original run/task IDs,
+   failure fingerprint (cause plus failing check), prior repairs and their outcomes,
+   new evidence, proposed correction, scope, verification and expected measurable
+   improvement. Keep the original user budget and consumed usage across runs here
+   using actual records; unknown usage is unknown, never zero. Do not create a
+   separate recovery registry or treat a new run as a fresh total budget. If the findings
+   are clear and in scope, prepare one repair task before dependent TODOs via
+   flow-run. An unresolved quality failure blocks its dependents even if its
+   original row is DONE. Preserve the original row and add explicit dependencies;
+   do not downgrade it to TODO or hide the failed judge outcome.
+3. Recheck approval coverage, file limits, WIP 1, live baselines, canonical tests,
+   admission and configured independent review. A new task ID needs its own
+   approval evidence where required; existing authorization can cover the same
+   concrete work, but does not authorize new effects. Never change pass scores,
+   revision caps, verification, scopes or budgets to evade a stop.
+4. Announce the diagnosed repair and automatically launch a **new** normal run
+   when authorized and admitted. Keep the old run ID and capture a fresh journal
+   offset for the new one. Monitor it through `run_end`, then reassess. Do not
+   manually invoke a judge loop or reuse an old run's session checkpoint.
+
+**No-progress bound:** allow one follow-up per evidenced cause/correction. If it
+fails the same way without observable progress, do not create another copy or
+refresh its retry allowance by renaming it. Perform one bounded diagnostic pass
+using targeted reproduction, code inspection and existing evidence. A materially
+different, supported correction can be admitted with its rationale; absent that,
+stop execution on that cause and report the exact unresolved condition. Diagnose
+unknown failures before dispatching, using the same bound. Do not ask for a generic
+"continue" vote: ask only for a specific missing decision, information or
+authorization. If only an external condition is unavailable, report it and use
+an already-supported bounded wait/re-probe, without busy retries or invented
+success. Explicit user cancellation or a user budget remains binding.
+
 ## Reading a stop reason
 
-| stop | what it means | what the user should do |
-|---|---|---|
-| `queue_empty` | nothing eligible left | nothing — the queue is done |
-| `blocked:<id>` | head task needs decisions | answer its blocking questions, set it TODO |
-| `in_progress:<id>` | someone holds it, or a runner died | check `git status` before restarting |
-| `admit_refused:<id>` | head task is outside the sweet spot (strict mode) | re-shape it: split, declare scope, or take it interactive via $flow |
-| `budget` / `run_timeout` | hit the configured limit | start another run |
-| `no_progress:<id>` | two attempts failed identically | read the log; the task or its acceptance is wrong |
-| `not_done:<id>` | worker exited without closing the task | usually a rejected commit — read the log |
-| `worker_incomplete:<id>` | worker returned while background work was pending | read the log; do not dispatch into the still-active work |
-| `worker_left_changes:<id>` | worker exited with new partial changes | inspect the tree; never hand it to a concurrent retry |
-| `timeout:<id>` | worker exceeded `task_timeout_s`; its process tree was killed | check for a half-finished tree |
-| `no_workers` | every CLI is quota-disabled (reactively, or by the run-start probe) | wait for the cooldown; see `.gate/tool-status.json` |
-| `judge_escalated:<id>` | task is DONE by the gate but the judge could not get it to `pass_score` within 2 revisions, or asked for a human | read the Judge findings; fix / accept / re-shape — the user's call |
-| `revision_broke_verify:<id>` | a judge-driven revision commit fails acceptance or left the tree dirty | inspect `git log` / `git status` before any run; nothing is auto-reset |
-| `needs_approval:<id>` | head task touches an `irreversible_globs` path without `<!-- task:ID approved: … -->` | user approves that task explicitly, then relaunch |
+| stop | host action within existing authorization |
+|---|---|
+| `queue_empty` | Confirm authorized work is complete; hidden/deferred work is not automatically authorized. |
+| `blocked:<id>` | Read the actual blocker; resolve an in-scope technical choice and update its evidence, asking only for a missing user decision. |
+| `in_progress:<id>` | Inspect ownership and logs; never dispatch into a live or unrecovered claim. |
+| `admit_refused:<id>` | Split or declare the authorized task, then require admission; never relax its gate. |
+| `budget` / `run_timeout` | Inspect partial work and ownership; if this was a per-run cap, continue remaining authorized tasks under unchanged limits. A user total budget requires new authorization to exceed. |
+| `no_progress:<id>` / `not_done:<id>` | Read the rejected commit or failure evidence; apply the no-progress bound before preparing a changed repair. |
+| `worker_incomplete:<id>` | Check still-active background work; no concurrent retry. |
+| `worker_left_changes:<id>` / `timeout:<id>` | Preserve and inspect the partial tree, verify ownership/termination, then use supported recovery before another dispatch. |
+| `no_workers` | Inspect tool status and cooldown; use authorized available workers or supported bounded wait/re-probe. Never clear quota state or change an explicit model pin to force execution. |
+| `judge_escalated:<id>` | Read findings; automatically admit one evidenced in-scope follow-up before dependents. Preserve DONE plus failed review; never accept below-threshold quality. |
+| `revision_broke_verify:<id>` | Inspect commits and dirty state; prepare a verified forward repair where safe. No automatic reset or deletion of work. |
+| `needs_approval:<id>` | Check whether existing authorization covers this exact scope; record it for this ID if so, otherwise ask for the missing authorization. |
 
-`no_progress` and `not_done` are not failures of the system. They are the system
-refusing to record work it cannot verify.
+`no_progress` and `not_done` refuse unverifiable completion. Their evidence is
+an input to scoped host recovery, not permission to bypass the deterministic gate.

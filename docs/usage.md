@@ -123,8 +123,9 @@ the next CLI takes over without burning an attempt.
   reply benches the CLI for the cooldown period; a probe that never reached the
   provider benches it for only ten minutes and does not occupy the quota window.
 - **Judge every task as it closes.** A read-only judge chain scores the closed
-  task 0–100 against its spec; ≥85 passes. Below that, a **different** worker
-  revises, at most 2 rounds (initial + 2 = 3 rounds; the per-round gain of
+  task 0–100 against its spec; ≥85 passes. Below that, preferably a different
+  worker revises; one usable authorized worker may repeat with `rotated: false`
+  recorded. Revision is limited to 2 rounds (initial + 2 = 3 rounds; the per-round gain of
   self-correction drops under 2% after that), with an early stop when the score
   gains less than 5. After each revision the runner re-runs the acceptance
   command itself and stops with `revision_broke_verify` if it now fails. The
@@ -133,7 +134,9 @@ the next CLI takes over without burning an attempt.
   `irreversible_globs` (migrations, `data/**`, hooks, settings) is dispatched
   only when the queue carries `<!-- task:ID approved: <who/date> -->`; otherwise
   the run stops with `needs_approval`, even in advisory mode. Approval is per
-  task id and single-use.
+  task id: an already-approved concrete scope may cover a repair, with the
+  original instruction and scope mapping recorded for the new ID. Never blindly
+  copy another task's approval or infer authorization for new effects.
 - `judge.enabled` defaults to `false`; each project opts in. `probe` defaults
   to on.
 
@@ -147,15 +150,19 @@ Change them there when your CLIs or model names differ.
 | Stop reason | Meaning |
 |---|---|
 | `queue_empty` | Everything ran |
-| `blocked:<id>` / `admit_refused:<id>` | This task needs you: answer its questions or reshape it |
+| `blocked:<id>` / `admit_refused:<id>` | The host reads the blocker and reshapes an authorized scope; only missing user decisions require input |
 | `no_progress:<id>` / `not_done:<id>` | The system refused to record work it could not verify — read the log under `.gate/runs/<run-id>/` |
 | `no_workers` | Every CLI is quota-benched; wait for the cooldown (`.gate/tool-status.json`) |
-| `judge_escalated:<id>` | The task is DONE but two revisions did not reach 85, or the judge asked for a human — read the findings in the Judge section of RUN-REPORT and decide: fix, accept, or re-split |
+| `judge_escalated:<id>` | The task is DONE but review failed — the host reads findings and automatically admits a supported in-scope repair before dependents under existing completion authorization; preserve failed review and never accept below-threshold quality |
 | `revision_broke_verify:<id>` | A judge-driven revision commit broke acceptance or left the tree dirty — look at `git log` / `git status` first; nothing is rolled back automatically |
-| `needs_approval:<id>` | The task touches an irreversible path and has no approval line — read its scope; if you approve, add the `approved:` line and run again |
+| `needs_approval:<id>` | The task lacks required approval evidence — the host checks existing authorization for this exact scope before asking, then records the task-specific `approved:` line |
 
-**Only the "Waiting on you" section of RUN-REPORT needs reading.** After a
-clean run it says `- nothing`.
+The host reads **Waiting on you**, judge findings and logs before deciding whether
+a user decision is needed. Under existing completion authorization, a clear
+in-scope repair is admitted and launched automatically with the same gates and
+limits. Repeated same-cause failure requires bounded diagnosis and a materially
+different supported correction, not a blind rerun. See the run-queue skill's
+**Host recovery after a stopped run** procedure.
 
 **Stopping is good. The only unacceptable outcome is a green light that lies.**
 
