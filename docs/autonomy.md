@@ -17,24 +17,19 @@ One `$flow-run` should end in one of two states, without a human in the loop in 
 Everything else — worker choice, quota outages, one or two quality iterations — is handled by
 the runner.
 
-## 1. Roles and model sets (unchanged, now mechanised)
+## 1. Roles and model selection
 
-| role | who | model chain |
+| role | who | model selection |
 |---|---|---|
-| host | the interactive CLI running `$flow-run` | fable 5.1 → opus 5 → codex (skill rule; the host cannot switch itself, it says which it is) |
-| **judge** | headless process the runner spawns after every `task_done` | `judge.chain` = `["fable", "opus", "codex"]`, tried in order, next on outage / unparsable output |
-| worker | headless process per task attempt | opus / codex / kimi / grok only — fable forbidden (`ensure_worker_model`) |
+| host | interactive CLI | its current model |
+| judge | headless read-only review | configured chain: fable, opus, codex |
+| worker | headless task process | CLI configuration unless explicitly pinned in worker_cmds |
 
-The model names above are the authors' defaults, not a fixed contract: the judge chain, the
-worker list and the forbidden-worker list are configuration (`judge.chain`, `judge_cmds`,
-`workers`, `worker_cmds` in `.gate/config.json`, and `FORBIDDEN_WORKER_MODELS` in `gate.py`),
-and another deployment may pin different models.
-
-The judge path (`spawn_judge`) is separate from `spawn_worker`; the fable prohibition applies to
-workers only. Verified on the authors' installation at the time (2026-09-03): `claude -p --model
-claude-fable-5-1 --output-format json --json-schema …` returned `structured_output`; `codex exec
---sandbox read-only --output-schema f -o out -` wrote the JSON to `out`. Re-check these flags
-against the CLI versions you actually have installed.
+Claude workers omit `--model` and inherit effective CLI settings and environment at launch
+in the project directory. This does not copy a transient model selection from another
+interactive session. The runner neither injects Opus nor forbids a model family.
+Explicit project model arguments remain authoritative. Roles are separated by permissions
+and review lifecycle. The judge commands and their explicit model pins remain unchanged.
 
 ## 2. Usage-aware dispatch (probe before spend)
 

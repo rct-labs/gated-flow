@@ -223,8 +223,8 @@ JUDGE_SCHEMA = {
     "additionalProperties": False,
 }
 
-# Read-only judge contracts. The chain is fable → opus → codex; fable is allowed
-# here because the judge only reads. {schema} is the inline JSON schema,
+# Read-only judge contracts with explicit model pins, independent of workers.
+# {schema} is the inline JSON schema,
 # {schema_file} / {out_file} are paths for CLIs that take files.
 JUDGE_CMDS: dict[str, list[str]] = {
     "fable": [
@@ -265,13 +265,9 @@ WORKER_CMDS: dict[str, list[str]] = {
         "codex", "exec", "--sandbox", "danger-full-access",
         "--skip-git-repo-check", "-C", "{projdir}", "-",
     ],
-    # Queue workers never run on fable: fable is the host/judge model and a
-    # headless `claude -p` would silently inherit whatever the user last set as
-    # their CLI default. Pin opus here; ensure_worker_model() below enforces the
-    # same rule on any config override.
+    # Inherit the effective CLI model unless the project explicitly pins one.
     "claude": [
         "claude", "-p", "{prompt}",
-        "--model", "opus",
         "--permission-mode", "acceptEdits",
         "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep,TaskOutput",
         "--output-format", "text",
@@ -283,43 +279,6 @@ WORKER_CMDS: dict[str, list[str]] = {
     ],
     "kimi": ["kimi", "-p", "{prompt}", "--output-format", "text"],
 }
-
-# Models that may only host and judge, never execute queue tasks. Matched
-# case-insensitively as a substring of the --model value.
-FORBIDDEN_WORKER_MODELS = ("fable",)
-DEFAULT_CLAUDE_WORKER_MODEL = "opus"
-
-
-def ensure_worker_model(worker: str, template: list[str]) -> tuple[list[str], str | None]:
-    """Enforce the worker-model policy on a resolved command template.
-
-    For the claude worker: inject ``--model opus`` when no --model is given, and
-    refuse outright when --model names a forbidden (host-only) model. Other
-    workers are returned unchanged. Returns (template, error).
-    """
-    if worker != "claude":
-        return template, None
-    argv = list(template)
-    for i, part in enumerate(argv):
-        if part == "--model" and i + 1 < len(argv):
-            value = argv[i + 1]
-            if any(bad in value.lower() for bad in FORBIDDEN_WORKER_MODELS):
-                return argv, (
-                    f"claude worker --model {value!r} is a host-only model; "
-                    f"queue tasks may run on opus/codex/kimi/grok only"
-                )
-            return argv, None
-        if part.startswith("--model="):
-            value = part.split("=", 1)[1]
-            if any(bad in value.lower() for bad in FORBIDDEN_WORKER_MODELS):
-                return argv, (
-                    f"claude worker --model {value!r} is a host-only model; "
-                    f"queue tasks may run on opus/codex/kimi/grok only"
-                )
-            return argv, None
-    # No --model at all: never inherit the CLI default, pin the worker model.
-    argv[1:1] = ["--model", DEFAULT_CLAUDE_WORKER_MODEL]
-    return argv, None
 
 # Signatures that mean "this tool is unusable right now", not "this task
 # failed". Both classes get the same treatment — bench the tool, do not spend
@@ -1417,7 +1376,7 @@ def spawn_worker(
 ):
     """Spawn one headless CLI process and stream it. `template` overrides the
     worker contract (used by the read-only judge and the usage probe, which
-    are not queue workers and skip the worker-model policy); `timeout_s`
+    use their own invocation contracts); `timeout_s`
     overrides task_timeout_s; `extra` adds placeholder substitutions."""
     projdir = repo / (cfg.get("project_prefix") or "")
     exe = resolve_tool(worker)
@@ -1429,9 +1388,6 @@ def spawn_worker(
         template = (cfg.get("worker_cmds") or {}).get(worker) or WORKER_CMDS.get(worker)
         if not template:
             return None, f"no invocation contract for {worker}"
-        template, model_error = ensure_worker_model(worker, template)
-        if model_error:
-            return None, model_error
 
     argv = []
     for part in template:

@@ -50,26 +50,15 @@ Say one line before doing work: `host: <this CLI> · worker: <id>`.
 
 Unknown name → list the four ids and stop. Do not guess.
 
-### Model roles (hard rule)
+### Model roles and inheritance
 
-Two roles, two model sets. They never cross. The names below are the
-authors' defaults; a deployment changes them in `.gate/config.json`
-(`judge.chain`, `judge_cmds`, `workers`, `worker_cmds`) and in
-`FORBIDDEN_WORKER_MODELS` in `gate.py`, not in this skill.
-
-| role | who | model |
-|---|---|---|
-| host / judge | the CLI running this skill: inspect, decide, audit, write the queue | the strongest model available (`fable` first); if quota is short, fall back to `opus`, then `codex` — and say so in one line |
-| worker | the process `gate.py run` spawns per task | `opus`, `codex`, `kimi`, `grok` only. The host/judge model (`fable`) is **forbidden** as a worker |
-
-Why: the host/judge model is the judgement model and the most expensive; a
-headless `claude -p` inherits whatever the user last set as their CLI
-default, which may be that model. `gate.py` enforces this — its built-in
-`claude` worker pins `--model opus`, and `ensure_worker_model()` injects
-`opus` into any `worker_cmds.claude` override that omits `--model` and
-refuses one that names a forbidden model. When you write
-`worker_cmds.claude` yourself, still write `--model opus` explicitly; do not
-rely on the injection.
+The host uses its current model. Read-only judges use `judge.chain` and `judge_cmds`.
+Workers use effective CLI configuration unless the user requests a project model pin.
+For Claude Code, omit `--model` by default. The runner does not inject Opus or reject
+model families. Inheritance means the new process's effective settings and environment
+in the project directory, not a transient selection in another interactive session.
+Preserve existing explicit project pins unless the user asks to change them. Report
+configured selection separately from the actual model observed during execution.
 
 Audits and surveys: gather with cheaper subagents where the host supports
 them, judge with the host model. Never run a whole-project audit's data
@@ -157,12 +146,12 @@ the package `spec.md`.
 | task kind (from the scope line) | first choice | fallback |
 |---|---|---|
 | mechanical implementation inside one module, tests included | `codex` | `claude` |
-| cross-package change, tricky semantics, security / permission logic | `claude` (opus) | `codex` |
+| cross-package change, tricky semantics, security / permission logic | `claude` (inherited model) | `codex` |
 | docs, manual-test checklists, config, small text edits | `kimi` | `codex` |
 | UI polish against a design spec | `codex` | `claude` |
 
 Leave the cell empty when two rows are equally good; the run-wide list decides.
-Never pin the host/judge model — the runner refuses it as a worker.
+Do not add model pins unless requested; worker and judge roles may use the same model family.
 
 ### Related Codex tasks may share a session
 
