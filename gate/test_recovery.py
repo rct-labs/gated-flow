@@ -1644,6 +1644,34 @@ class ClosureRefusalRegressionTests(RecoveredRunTests):
         self.assertIsNotNone(recovery.receipt_for(env.repo, cfg, TASK))
         self.assertEqual(recovery.revalidation_budget(env.repo, cfg, TASK, receipt)["allowed"], 2)
 
+    def test_a_newer_recovery_supersedes_a_barrier_raised_under_the_old_receipt(self) -> None:
+        env = build(self.root, judge=self.JUDGE_ON)
+        first = self.recover(env)
+        self.commit_row(env)
+        code, _ = self.run_gate(env, [], verify_only=True)
+        self.assertEqual(code, 3)
+        cfg = self.cfg(env)
+        # Leave the first dispatch's barrier on file, as an older engine did.
+        recovery._append(recovery.barrier_path(env.repo), {
+            "at": "2026-09-11T00:00:00Z", "event": "barrier_raised", "task": TASK,
+            "receipt": first["sha256"], "reason": "stale", "pid": 1})
+        recovery.renew_revalidation(env.repo, cfg, TASK, "gate refused a passing closure")
+        run_id = [e["run"] for e in recovery.journal_events(env.repo) if e["event"] == "run_end"][-1]
+        with mock.patch.object(recovery, "ownership_evidence", return_value={
+            "owner_pid": DEAD_PID, "owner_source": "journal", "supervisor": None,
+            "census_size": 3, "census_at": "test", "matched_writers": []}):
+            second = self.recover(env, run_id=run_id)
+        self.assertNotEqual(first["sha256"], second["sha256"])
+        # Not DONE: the stale barrier does not block; nothing is owed yet.
+        self.assertEqual(recovery.open_barriers(env.repo), {})
+        # Closed through the hook: the obligation is owed under the new receipt.
+        self.commit_row(env)
+        self.verify(env)
+        self.stage_done(env)
+        self.check_commit(env)
+        git(env, "commit", "-q", "-m", f"close {TASK}")
+        self.assertEqual(recovery.open_barriers(env.repo)[TASK]["receipt"], second["sha256"])
+
     def test_renewal_needs_a_passing_oracle_and_an_unclosed_task(self) -> None:
         env = build(self.root)
         self.recover(env)

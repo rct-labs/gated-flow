@@ -1914,6 +1914,13 @@ def open_barriers(repo: Path) -> dict[str, dict]:
         queue = Path(repo) / _prefixed(cfg, cfg["queue_file"])
         tasks = _parse_queue(queue.read_text(encoding="utf-8"))
         latest = {e["task"]: e for e in entries}
+        # A newer recovery supersedes a barrier raised under an older receipt:
+        # the obligation, if any, is reconstructed below against the receipt
+        # that actually closed the row, so a judge pass binds to the right one.
+        for task, entry in latest.items():
+            raised = state.get(task)
+            if raised and raised.get("receipt") and raised.get("receipt") != entry["receipt"]:
+                state.pop(task)
         for task, entry in latest.items():
             if tasks.get(task, {}).get("status") not in cfg["done_markers"]:
                 continue
