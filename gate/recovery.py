@@ -2031,10 +2031,16 @@ def renew_revalidation(repo: Path, cfg: dict, task: str, reason: str) -> dict:
     repo = Path(repo)
     if not reason or not reason.strip():
         raise RecoveryError("renewal needs --reason stating why the gate refused a passing closure")
-    receipt = receipt_for(repo, cfg, task)
-    if receipt is None:
-        raise RecoveryError(f"no valid recovery receipt for {task}")
-    implementation = receipt["implementation"]["commit"]
+    # The lineage comes from the recovery history, not from a receipt that
+    # still revalidates: the engine contract may have changed since (which is
+    # exactly what a fixed defect looks like), and the recovery that follows a
+    # renewal re-proves every fact from scratch anyway.
+    entries = [e for e in _read_ndjson(index_path(repo), "recovery index") if e.get("task") == task]
+    if not entries:
+        raise RecoveryError(f"no recovery history for {task}")
+    implementation = entries[-1].get("implementation")
+    receipt = {"sha256": entries[-1].get("receipt"),
+               "scope": {"queue_file": _prefixed(cfg, cfg["queue_file"])}}
     dispatches = lineage_dispatches(repo, task, implementation)
     renewals = lineage_renewals(repo, task, implementation)
     if len(dispatches) != 1 or renewals:

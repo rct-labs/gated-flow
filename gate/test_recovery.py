@@ -1621,6 +1621,29 @@ class ClosureRefusalRegressionTests(RecoveredRunTests):
         self.assertEqual(
             self.gate.parse_queue(env.queue.read_text(encoding="utf-8"))[TASK]["status"], "DONE")
 
+    def test_renewal_survives_a_receipt_invalidated_by_a_contract_change(self) -> None:
+        """The exact shape a fixed defect produces: the receipt no longer
+        re-derives, but the journal still proves the passing dispatch."""
+        env = build(self.root, judge=self.JUDGE_ON)
+        self.recover(env)
+        self.commit_row(env)
+        code, _ = self.run_gate(env, [], verify_only=True)
+        self.assertEqual(code, 3)
+        config_file = env.repo / ".gate" / "config.json"
+        config_file.write_text(json.dumps({**json.loads(config_file.read_text(encoding="utf-8")),
+                                           "verdict_max_age_s": 7200}), encoding="utf-8")
+        cfg = self.cfg(env)
+        self.assertIsNone(recovery.receipt_for(env.repo, cfg, TASK))
+        grant = recovery.renew_revalidation(env.repo, cfg, TASK, "contract changed after the fix")
+        self.assertEqual(grant["implementation"], env.implementation)
+        run_id = [e["run"] for e in recovery.journal_events(env.repo) if e["event"] == "run_end"][-1]
+        with mock.patch.object(recovery, "ownership_evidence", return_value={
+            "owner_pid": DEAD_PID, "owner_source": "journal", "supervisor": None,
+            "census_size": 3, "census_at": "test", "matched_writers": []}):
+            receipt = self.recover(env, run_id=run_id)
+        self.assertIsNotNone(recovery.receipt_for(env.repo, cfg, TASK))
+        self.assertEqual(recovery.revalidation_budget(env.repo, cfg, TASK, receipt)["allowed"], 2)
+
     def test_renewal_needs_a_passing_oracle_and_an_unclosed_task(self) -> None:
         env = build(self.root)
         self.recover(env)
