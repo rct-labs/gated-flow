@@ -42,6 +42,16 @@ flow doctor --repo <project>
 flow admit  --repo <project>
 ```
 
+Read `<home>/docs/execution.md` for the queue-bound model contract. Before any
+probe or worker call, all primary/fallback workers, judges and revisions need
+concrete model IDs and supported reasoning settings. `flow lock-execution`
+persists resolved task profiles; the runner passes them explicitly on every
+invocation and saves per-task receipts. Missing profiles block dispatch even
+under advisory admission. Do not infer them from a later host/global setting.
+Resume the persisted profiles after restart; preserve explicit effort limits.
+Only a user instruction about task execution permits a `--reason` lock update
+for unstarted tasks. Already running calls cannot be retroactively changed.
+
 (`flow` is the PATH shim for gate.py/audit.py; `python <gate.py> doctor|admit`
 is the same thing if the shim is missing.)
 

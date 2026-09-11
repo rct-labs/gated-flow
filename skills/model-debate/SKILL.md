@@ -11,7 +11,10 @@ Turn a draft into an evidence-checked final document. This is a Markdown skill,
 not an orchestration framework. Use installed headless subscription CLIs; do not
 switch to paid APIs or install infrastructure implicitly.
 
-Read [artifacts.md](references/artifacts.md) at setup for roster, claim IDs,
+Before any inference/probe/retry, read [quota.md](references/quota.md) and run
+its fresh account/whole-run budget check. Apply owner exclusions before calls;
+record authorized backups and the project quorum. Read
+[artifacts.md](references/artifacts.md) at setup for roster, claim IDs,
 workspace and prompts. Read [runtime.md](references/runtime.md) before calls for
 model discovery, permissions, isolation and process handling. When changing this
 skill or a CLI adapter, use [acceptance.md](references/acceptance.md).
@@ -105,7 +108,10 @@ grants it; routine execution and corrections within scope need no new gate.
    three calls per seat (research and two rounds), two with `--no-web`, plus
    model preflights, capability probes and a stated retry allowance. Set total
    calls, concurrency by subscription and wall-clock deadlines per seat.
-5. Resolve/lock models and probe actual read/write boundaries and web capability
+5. Run the quota guard for the complete remaining budget, including inference
+   probes and retries. Missing allowance/estimate or insufficient project quorum
+   blocks the affected launch. Resolve/lock models and probe actual read/write
+   boundaries and web capability
    per `runtime.md`. Smoke tests consume quota too; existing authorization for
    this disclosed run covers them. Freeze `roster.md` after preflight. Preserve
    requests/failures; never silently replace a requested model with a default.

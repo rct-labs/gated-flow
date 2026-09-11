@@ -24,3 +24,4 @@ jobs:
           python-version: '3.12'
       - run: bash gate/selftest.sh "$RUNNER_TEMP/gate-selftest"
       - run: python -m unittest discover -s gate -p "test_*.py" -q
+      - run: python -m unittest discover -s scripts -p "test_debate_quota.py" -q

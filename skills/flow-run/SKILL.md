@@ -50,15 +50,17 @@ Say one line before doing work: `host: <this CLI> · worker: <id>`.
 
 Unknown name → list the four ids and stop. Do not guess.
 
-### Model roles and inheritance
+### Queue-bound models and reasoning
 
-The host uses its current model. Read-only judges use `judge.chain` and `judge_cmds`.
-Workers use effective CLI configuration unless the user requests a project model pin.
-For Claude Code, omit `--model` by default. The runner does not inject Opus or reject
-model families. Inheritance means the new process's effective settings and environment
-in the project directory, not a transient selection in another interactive session.
-Preserve existing explicit project pins unless the user asks to change them. Report
-configured selection separately from the actual model observed during execution.
+The host uses its current model, separately from the queue. Read
+`<home>/docs/execution.md` before queueing or launching: declare concrete model
+IDs and reasoning effort for workers, judges, revisions and every eligible
+fallback. Resolve once while queueing and persist with `flow lock-execution`.
+Never inherit a later host session or global CLI selection. Explicit user
+package/task effort limits apply to all covered calls, including revisions.
+Existing queues without profiles require deliberate profile preparation before
+their next launch; do not silently snapshot today's host as their intended model.
+Report configured and observed selections separately; missing metadata is unknown.
 
 Audits and surveys: gather with cheaper subagents where the host supports
 them, judge with the host model. Never run a whole-project audit's data
@@ -141,7 +143,8 @@ unknown id.
 
 ### Assign workers by usage and task kind
 
-Run `flow usage --repo .` first. It sends one tiny request per CLI and
+Declare execution profiles from local capability discovery first, then run
+`flow usage --repo .`. It sends a tiny request per distinct configured profile and
 benches the quota-dead ones in `.gate/tool-status.json` (a probe that never
 reached the provider is benched briefly, not for the cooldown). Then fill the
 `worker` column from this table, skipping benched CLIs. Put the reasoning in
@@ -150,12 +153,14 @@ the package `spec.md`.
 | task kind (from the scope line) | first choice | fallback |
 |---|---|---|
 | mechanical implementation inside one module, tests included | `codex` | `claude` |
-| cross-package change, tricky semantics, security / permission logic | `claude` (inherited model) | `codex` |
+| cross-package change, tricky semantics, security / permission logic | `claude` (declared model/effort) | `codex` |
 | docs, manual-test checklists, config, small text edits | `kimi` | `codex` |
 | UI polish against a design spec | `codex` | `claude` |
 
 Leave the cell empty when two rows are equally good; the run-wide list decides.
-Do not add model pins unless requested; worker and judge roles may use the same model family.
+All runnable profiles need explicit model and reasoning settings. Choose routine
+defaults from the approved constraints and task needs; do not ask the user to
+fill a model matrix. Worker and judge roles may use the same model family.
 
 ### Related Codex tasks may share a session
 
@@ -201,13 +206,18 @@ External actions (`git push`, broadcasts) are never a task: the host does them
 after the run when CONTEXT or the user already allowed it, with the
 `git rev-list --left-right --count origin/main...main` 0/0 re-check.
 
+Prepare per-task defaults/overrides now; freeze after finalizing the worker and
+judge lists below. A chat setting switch does not change queue execution.
+
 Baselines must match the live oracle (`flow verify` / whatever
 `.gate/config.json` `verify_cmd` is). Then `flow admit --repo .`. A `REFUSE`
 or `UNDECLARED` head task is split or declared now, not argued with later.
 
 ## 4. Pin the worker and launch
 
-Edit `.gate/config.json` `workers` (and `worker_cmds` when needed).
+Prepare `.gate/config.json` `workers` (and `worker_cmds` when needed) before
+freezing queue execution. Preserve existing frozen defaults when no new worker
+instruction was given; the host CLI default applies only to unconfigured queues.
 Preserve the project's `session_reuse` policy; it is not a per-run tuning knob:
 
 - `workers`: `[ "<id>" ]` — the pin from step 0, one id. This is the
@@ -220,6 +230,10 @@ Preserve the project's `session_reuse` policy; it is not a per-run tuning knob:
   `"worker_cmds": { "kimi": ["kimi", "-p", "{prompt}", "-m", "<qualified kimi model id>", "--output-format", "text"] }`
   if missing (`kimi provider list --json` prints the valid ids). Do not strip
   other keys.
+
+After finalizing dispatch lists and profiles, run `flow lock-execution --repo .`.
+For an explicit change to future tasks, use `--reason` with the actual instruction;
+preserve started tasks and prior receipts. New calls use explicit flags from the lock.
 
 Check whether `judge.enabled` is `true` for this project. When it is,
 every closed task is reviewed by the judge chain (`judge.chain`, read-only)

@@ -38,6 +38,9 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import execution
+
 GATE_DIR = ".gate"
 CONFIG_NAME = "config.json"
 VERDICT_NAME = "verdict.json"
@@ -87,6 +90,8 @@ DEFAULT_CONFIG = {
     # ---- unattended run -------------------------------------------------
     # Writers are tried in order; a quota-dead one is skipped for a cooldown.
     "workers": ["codex", "claude", "grok"],
+    # Filled while queueing, never inferred from a later host session.
+    "execution": {"defaults": {"workers": {}, "judges": {}}},
     # What one worker is asked to do. It should execute exactly one task and
     # stop — the loop belongs to this script, not to the model.
     "worker_prompt": (
@@ -1190,6 +1195,48 @@ def cmd_admit(args) -> None:
         bad += v["verdict"] != "admit"
     mode = "strict" if cfg.get("strict_admit") else "advisory"
     print(f"{len(verdicts)} TODO task(s), {bad} not admissible. Mode: {mode}.")
+    try:
+        policies = execution.resolve(cfg, text, parse_queue(text), pins)
+        print(f"execution       : {len(policies)} explicit task profiles OK")
+    except execution.PolicyError as exc:
+        die(f"execution admission refused: {exc}")
+
+
+def cmd_lock_execution(args) -> None:
+    repo = repo_root(Path(args.repo).resolve())
+    cfg = load_config(repo)
+    text = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
+    tasks = parse_queue(text)
+    pending = {tid for tid, row in tasks.items() if row["status"] in cfg["todo_markers"]}
+    # The worker may not have written its claim yet. Dispatch already counts
+    # as started, including a DONE row undergoing review or revision.
+    active = set()
+    jp = repo / GATE_DIR / "journal.ndjson"
+    if jp.exists():
+        for line in jp.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            if event.get("event") == "attempt_start":
+                active.add(event.get("task"))
+            elif event.get("event") == "task_end":
+                active.discard(event.get("task"))
+            elif event.get("event") == "run_end":
+                active.clear()
+    try:
+        policies = execution.resolve(cfg, text, tasks, parse_task_workers(text))
+        lock = execution.freeze(repo, policies, getattr(args, "reason", None), pending - active)
+    except execution.PolicyError as exc:
+        die(str(exc))
+    print(f"execution locked: {len(policies)} tasks; sha256={lock['sha256']}")
+
+
+def reject_run_preflight(repo: Path, cfg: dict, run_id: str, stop: str, message: str) -> None:
+    report = render_report(repo, cfg, run_id, [], stop, 0) + f"\nPreflight: {message}\n"
+    (repo / GATE_DIR / "RUN-REPORT.md").write_text(report, encoding="utf-8")
+    (repo / GATE_DIR / f"RUN-REPORT-{run_id}.md").write_text(report, encoding="utf-8")
+    journal(repo, {"event": "admit_refused" if stop.startswith("admit_refused:") else "execution_refused",
+                   "run": run_id, "reason": message})
+    journal(repo, {"event": "run_end", "run": run_id, "stop": stop})
+    die(message, code=3)
 
 
 def is_quota(text: str) -> bool:
@@ -1401,6 +1448,16 @@ def spawn_worker(
         argv.append(part)
     argv[0] = exe
 
+    try:
+        requested = execution.selected(cfg, worker)
+        if requested:
+            argv = execution.arguments(argv, worker, requested)
+            journal(repo, {"event": "execution_requested", "task": cfg.get("_execution_task"),
+                           "role": cfg.get("_execution_role", "workers"), "worker": worker,
+                           "profile": requested, "profile_sha256": execution.digest(requested)})
+    except execution.PolicyError as exc:
+        return None, f"execution_policy:{exc}"
+
     # Codex reads its prompt from stdin: the Windows .cmd shim truncates a
     # multi-line argument at the first newline.
     stdin_text = prompt if worker == "codex" else None
@@ -1463,10 +1520,21 @@ def spawn_worker(
             on_beat(int(now - started), state["lines"], state["last_line"])
 
     t.join(timeout=10)
+    if not t.is_alive() and callable(getattr(proc.stdout, "close", None)):
+        proc.stdout.close()
     if log:
         log.close()
     rc = proc.returncode if proc.returncode is not None else -1
-    return WorkerResult(rc, "".join(chunks), timed_out), None
+    result = WorkerResult(rc, "".join(chunks), timed_out)
+    if requested:
+        observation = execution.observed(result.stdout, requested)
+        journal(repo, {"event": "execution_observed", "task": cfg.get("_execution_task"),
+                       "role": cfg.get("_execution_role", "workers"), "worker": worker,
+                       "requested": requested, "observed": observation})
+        result.execution_mismatch = observation["mismatch"]
+        if result.execution_mismatch:
+            result.returncode = 1
+    return result, None
 
 
 # ------------------------------------------------------------ usage probe
@@ -1521,6 +1589,9 @@ def bench_from_probe(repo: Path, cfg: dict, worker: str, reason: str, run_id: st
             "probed_run": run_id,
             "seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+    requested = execution.selected(cfg, worker)
+    if requested:
+        st[worker]["probed_profile"] = execution.digest(requested)
     set_tool_state(repo, st)
 
 
@@ -1543,7 +1614,9 @@ def ensure_probed(repo: Path, cfg: dict, worker: str, run_id: str, run_dir: Path
         return False
     if not sub_cfg(cfg, "probe").get("enabled", True):
         return True
-    if info.get("probed_run") == run_id:
+    requested = execution.selected(cfg, worker)
+    profile_ok = not requested or info.get("probed_profile") == execution.digest(requested)
+    if info.get("probed_run") == run_id and profile_ok:
         return True
     usable, reason = probe_worker(repo, cfg, worker, run_dir)
     bench_from_probe(repo, cfg, worker, reason, run_id)
@@ -1559,13 +1632,29 @@ def cmd_usage(args) -> None:
     cfg = load_config(repo)
     qpath = repo / prefixed(cfg, cfg["queue_file"])
     pins = parse_task_workers(qpath.read_text(encoding="utf-8")) if qpath.exists() else {}
+    text = qpath.read_text(encoding="utf-8") if qpath.exists() else ""
+    try:
+        policies = execution.resolve(cfg, text, parse_queue(text), pins)
+        if not policies:
+            policies = execution.resolve(cfg, "", {"usage": {"status": cfg["todo_markers"][0]}}, {})
+    except execution.PolicyError as exc:
+        die(f"usage needs explicit execution profiles before probing: {exc}")
     run_id = "usage-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     print("usage — one tiny request per CLI; quota benches for the cooldown, "
           "a probe that never reached the provider benches briefly")
-    for w in probe_candidates(cfg, pins):
-        usable, reason = probe_worker(repo, cfg, w)
-        bench_from_probe(repo, cfg, w, reason, run_id)
-        print(f"  {w:8} {'ok' if usable else 'BENCHED'}  {reason}")
+    seen_profiles = set()
+    for task, policy in policies.items():
+        for role, members in policy["profiles"].items():
+            for member, requested in members.items():
+                w = JUDGE_TOOL.get(member, member) if role == "judges" else member
+                key = (w, execution.digest(requested))
+                if key in seen_profiles:
+                    continue
+                seen_profiles.add(key)
+                probe_cfg = execution.bind(cfg, policy, task)
+                probe_cfg.update(_execution_role=role, _execution_member=member)
+                usable = ensure_probed(repo, probe_cfg, w, run_id, repo / GATE_DIR / "runs" / run_id)
+                print(f"  {w:8} {'ok' if usable else 'BENCHED'}  {requested['model']} / {requested['reasoning_effort']}")
     st = tool_state(repo)
     now = time.time()
     for w, info in st.items():
@@ -1667,10 +1756,11 @@ def judge_once(
     for member in jcfg.get("chain", []):
         template = cmds.get(member)
         tool = JUDGE_TOOL.get(member, member)
+        member_cfg = {**cfg, "_execution_role": "judges", "_execution_member": member}
         if not template:
             failures.append(f"{member}:no_contract")
             continue
-        if not ensure_probed(repo, cfg, tool, run_id, run_dir):
+        if not ensure_probed(repo, member_cfg, tool, run_id, run_dir):
             failures.append(f"{member}:benched")
             continue
         out_file = run_dir / f"{tag}.{member}.out.json"
@@ -1679,7 +1769,7 @@ def judge_once(
         pf = run_dir / f"{tag}.{member}.prompt.md"
         pf.write_text(prompt, encoding="utf-8")
         proc, err = spawn_worker(
-            repo, cfg, tool, prompt, pf,
+            repo, member_cfg, tool, prompt, pf,
             log_path=pf.with_suffix(".log"),
             template=template,
             timeout_s=jcfg.get("timeout_s", 1200),
@@ -1689,6 +1779,8 @@ def judge_once(
                 "out_file": str(out_file),
             },
         )
+        if proc is not None and getattr(proc, "execution_mismatch", False):
+            return None, "execution_mismatch"
         if proc is None:
             failures.append(f"{member}:{err}")
             continue
@@ -1763,6 +1855,8 @@ def judge_task(
         print(f"  judge round {len(rounds) + 1} for {tid} …")
         verdict, member = judge_once(repo, cfg, prompt, run_dir, tag, run_id)
         if verdict is None:
+            if member == "execution_mismatch":
+                return _escalate(repo, tid, rounds, member)
             journal(repo, {"event": "judge_skipped", "task": tid, "reason": member})
             print(f"  judge unavailable ({member}) — task stays DONE, unreviewed")
             return {"final": "skipped", "reason": member, "rounds": rounds}
@@ -1796,8 +1890,9 @@ def judge_task(
             )
 
         # Pick a usable worker other than the one that made the last commit.
-        pool = [w for w in available_workers(repo, cfg, prefer=pin)
-                if ensure_probed(repo, cfg, w, run_id, run_dir)]
+        revision_cfg = {**cfg, "_execution_role": "revisions"}
+        pool = [w for w in available_workers(repo, revision_cfg, prefer=pin)
+                if ensure_probed(repo, revision_cfg, w, run_id, run_dir)]
         others = [w for w in pool if w != worker_of_last_commit]
         if not pool:
             return _escalate(repo, tid, rounds, "no_workers_for_revision")
@@ -1831,8 +1926,10 @@ def judge_task(
                            "seconds": secs, "lines": lines, "last_line": last,
                            "phase": "revision"})
 
-        proc, err = spawn_worker(repo, cfg, worker, rprompt, pf,
+        proc, err = spawn_worker(repo, revision_cfg, worker, rprompt, pf,
                                  log_path=pf.with_suffix(".log"), on_beat=beat)
+        if proc is not None and getattr(proc, "execution_mismatch", False):
+            return _escalate(repo, tid, rounds, "execution_mismatch", final="broke_verify")
         head_after = git(repo, "rev-parse", "HEAD").strip()
         queue_after = queue_path.read_text(encoding="utf-8")
         changed_rows = queue_status_changes(queue_before, queue_after)
@@ -1916,6 +2013,7 @@ class CodexTaskSession:
         codex_dir = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
         paths += [codex_dir / "config.toml", codex_dir / "AGENTS.md"]
         digest = hashlib.sha256()
+        digest.update(execution.digest(self.cfg.get("_execution_policy")).encode())
         for path in paths:
             digest.update(str(path).encode())
             content = path.read_bytes() if path.is_file() else b"<missing>"
@@ -2084,6 +2182,7 @@ class CodexTaskSession:
 def cmd_run(args) -> None:
     repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
+    base_cfg = cfg
     projdir = repo / (cfg.get("project_prefix") or "")
     qpath = repo / prefixed(cfg, cfg["queue_file"])
 
@@ -2101,6 +2200,23 @@ def cmd_run(args) -> None:
         )
     if not qpath.exists():
         die(f"queue not found: {qpath}")
+
+    initial_text = qpath.read_text(encoding="utf-8")
+    initial_tasks = parse_queue(initial_text)
+    initial_pins = parse_task_workers(initial_text)
+    first, first_state = head_task(cfg, initial_tasks)
+    if first and first_state == "todo" and (args.strict_admit or cfg.get("strict_admit")):
+        admission = admit_verdicts(cfg, repo, initial_tasks, parse_task_files(initial_text),
+                                  initial_pins, parse_task_after(initial_text), parse_task_approved(initial_text))[first]
+        if admission["verdict"] != "admit" and not admission.get("needs_approval"):
+            reject_run_preflight(repo, cfg, run_id, f"admit_refused:{first}",
+                                 f"task {first} refused admission: {admission['reason']}")
+    try:
+        policies = execution.resolve(cfg, initial_text, parse_queue(initial_text), parse_task_workers(initial_text))
+        locked = execution.freeze(repo, policies)
+    except execution.PolicyError as exc:
+        reject_run_preflight(repo, cfg, run_id, "execution_policy",
+                             f"execution preflight refused before any inference: {exc}")
 
     workers = available_workers(repo, cfg)
     pins = parse_task_workers(qpath.read_text(encoding="utf-8"))
@@ -2133,10 +2249,7 @@ def cmd_run(args) -> None:
     # is benched before it costs a dispatch and a queue-row restore.
     run_dir = repo / GATE_DIR / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    if sub_cfg(cfg, "probe").get("enabled", True):
-        print("  probing :")
-        for w in probe_candidates(cfg, pins):
-            ensure_probed(repo, cfg, w, run_id, run_dir)
+    (run_dir / "execution.json").write_text(json.dumps(locked, indent=2) + "\n", encoding="utf-8")
 
     results: list[dict] = []
     stop_reason = "budget"
@@ -2168,6 +2281,19 @@ def cmd_run(args) -> None:
         strict = args.strict_admit or cfg.get("strict_admit", False)
         pins = parse_task_workers(qtext)
         pin = pins.get(tid)
+        try:
+            task_lock = execution.read_lock(repo)
+            policy = task_lock["tasks"][tid]
+            if policy["pin"] != pin:
+                raise execution.PolicyError(f"queue worker changed without an execution lock update: {tid}")
+            cfg = execution.bind(base_cfg, policy, tid)
+            sessions.cfg = cfg
+        except (execution.PolicyError, KeyError) as exc:
+            stop_reason = f"execution_policy:{tid}"
+            journal(repo, {"event": "execution_refused", "task": tid, "reason": str(exc)})
+            break
+        (run_dir / f"{tid}.execution.json").write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
+        journal(repo, {"event": "execution_locked", "task": tid, "sha256": execution.digest(policy)})
         files_map = parse_task_files(qtext)
         task_files = files_map.get(tid) or []
         adm = admit_verdicts(
@@ -2331,6 +2457,9 @@ def cmd_run(args) -> None:
                 break
 
             out = (proc.stdout or "") + (proc.stderr or "")  # already streamed to logp
+            if getattr(proc, "execution_mismatch", False):
+                outcome = "execution_mismatch"
+                break
             session_returncode = proc.returncode
             session_evidence = sessions.read_events(out) if session_decision["mode"] != "off" else {}
             session_head = git(repo, "rev-parse", "HEAD").strip()
@@ -2573,7 +2702,7 @@ def cmd_run(args) -> None:
     )
 
     needs_human = stop_reason.split(":", 1)[0] in (
-        "judge_escalated", "revision_broke_verify", "needs_approval"
+        "judge_escalated", "revision_broke_verify", "needs_approval", "execution_policy", "execution_mismatch"
     )
     if any(r["outcome"] != "done" for r in results) or not results or needs_human:
         raise SystemExit(3)
@@ -2760,6 +2889,11 @@ def cmd_doctor(args) -> None:
         }
         if todo_pins:
             print(f"worker pins     : {todo_pins}")
+        try:
+            policies = execution.resolve(cfg, qf.read_text(encoding="utf-8"), tasks, pins)
+            print(f"execution       : {len(policies)} explicit task profiles OK")
+        except execution.PolicyError as exc:
+            print(f"execution       : MISSING/INVALID ({exc})")
     installed, hook_mode = hook_installation(repo)
     print(f"pre-commit gate : {'INSTALLED' if installed else 'not installed'} ({hook_mode})")
     print(f"verify_cmd      : {cfg['verify_cmd']}")
@@ -2782,6 +2916,7 @@ def main() -> None:
         ("verify", cmd_verify, [("--cmd", "str")]),
         ("audit", cmd_audit, [("--last", "int")]),
         ("admit", cmd_admit, []),
+        ("lock-execution", cmd_lock_execution, [("--reason", "str")]),
         ("usage", cmd_usage, []),
         ("doctor", cmd_doctor, []),
         ("run", cmd_run, [

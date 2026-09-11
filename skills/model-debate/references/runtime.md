@@ -4,6 +4,11 @@ Read before calls. These are capability requirements and discovery hints, not
 promises about installed builds. Exact versions, availability and errors belong
 in run records.
 
+Read [quota.md](quota.md) before capability probes and model calls. Its
+`quota_guard.py` performs read-only native allowance checks and whole-remaining-
+run budget admission. Exclusions apply before probes; an account limit is not a
+reason to spend another inference on the same exhausted account.
+
 ## Discover, resolve, lock
 
 1. Read current CLI/subcommand help, version and non-secret effective model
@@ -39,6 +44,15 @@ local settings and verify usage metadata. Report inability before formal calls.
 Do not modify global defaults, upgrade CLIs or change subscriptions implicitly.
 
 ## Adapter discovery hints
+
+Freeze reasoning effort alongside each seat's model selector before the first
+probe. Include backups, synthesis and review calls; use explicit supported CLI
+flags or native-agent fields every time. Record requested and observed effort
+separately, using unknown for missing runtime metadata. A host session/global
+configuration change does not amend the seat lock. Only an explicit instruction
+about future execution permits a recorded amendment and fresh affected contexts.
+If the selected model has no applicable effort control, record not_applicable
+and the capability evidence; never invent or silently ignore an effort flag.
 
 | Adapter | Inspect locally | Establish before calls |
 |---|---|---|
@@ -136,6 +150,14 @@ retrying; never duplicate a still-running seat. Apply per-seat deadlines to the
 task-owned process tree with supported OS mechanisms; retain partial outputs as
 failed attempts, and never kill by generic process name. Individual waits stay
 short so progress is visible even when a seat runs for minutes.
+
+Distinguish exhausted account quota from a transient rate limit. Use the
+quota recovery plan for authorized replacements; recheck quota and shared-pool
+budget before every retry. Preserve historical originals, rebuild independent
+replacement research/round1, and invalidate ALL round2 results when the model
+roster changes. Existing explicit roster-change authority is sufficient; do
+not ask again for the same authorized substitution. Unknown failures require
+reconciliation/repair, not an inferred model switch.
 
 Set a retry allowance (normally one transient retry per failed seat). Preserve
 attempts and retry only failures, counting all probes/retries in the call budget.

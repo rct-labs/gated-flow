@@ -66,3 +66,27 @@ These checks neither count as model calls nor prove provider sandbox behavior.
 Keep test report, tool events and configuration fingerprints. Rerun affected
 cases after fixes; do not repeat successful costly calls without changed inputs,
 policies or unresolved concerns.
+
+## Quota and replacement acceptance
+
+Run `python -m unittest discover -s scripts -p test_debate_quota.py -v` from the
+maintenance repository. Use synthetic snapshots and fake native transports;
+never consume an owner-excluded model just to check its reported exhaustion.
+
+| Case | Observable requirement |
+|---|---|
+| Owner-excluded model/pool | No probe or inference launch for it, including aliases/helpers. |
+| 98/99 percent used; stale/missing/invalid window | Refused before inference. |
+| Two seats share one account | Full remaining research/round/retry work is aggregated; per-seat apparent headroom is insufficient. |
+| Monetary balance | Preserve currency; no percent conversion or implicit paid account. |
+| Project minimum3, generic minimum2 | Three proven distinct models required; aliases/roles do not increase quorum. |
+| Quota exhaustion after freeze | Quarantine pool; no same-pool retry; only authorized alternatives and fresh sufficient budget. |
+| Replacement after round2 partly succeeds | Preserve originals; new independent research/round1; rebuild peer index and repeat all round2. |
+| Changed context, unknown process, unverified read-only boundary | Reconcile/rebase before recovery; no automatic replay. |
+| Explicit transient Retry-After | Bounded cooldown/recheck; no inference of weekly exhaustion from a bare429. |
+| Unknown native schema or probe deadline | Typed UNKNOWN, no raw credential-bearing error output. |
+
+Independent forward-test the updated instructions with synthetic owner limits,
+shared pools and partly completed results. A native read-only account smoke
+validates quota transport only; it is not a model inference, complete debate,
+read-isolation or profitability test. Retain those distinctions in acceptance.

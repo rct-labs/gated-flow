@@ -94,6 +94,16 @@ def committed_runner_repo(root: Path, workers: list[str]) -> Path:
         json.dumps(
             {
                 "workers": workers,
+                "execution": {"defaults": {
+                    "workers": {
+                        "codex": {"model": "codex-test-model", "reasoning_effort": "medium"},
+                        "claude": {"model": "claude-test-model", "reasoning_effort": "medium"},
+                        "grok": {"model": "grok-test-model", "reasoning_effort": "not_applicable", "reasoning_note": "test adapter"},
+                        "kimi": {"model": "kimi-test-model", "reasoning_effort": "not_applicable", "reasoning_note": "test adapter"}},
+                    "judges": {
+                        "fable": {"model": "claude-test-fable", "reasoning_effort": "medium"},
+                        "opus": {"model": "claude-test-opus", "reasoning_effort": "medium"},
+                        "codex": {"model": "codex-test-model", "reasoning_effort": "medium"}}}},
                 "worker_prompt": (
                     "Execute exactly task {task}. Never select another TODO task."
                 ),

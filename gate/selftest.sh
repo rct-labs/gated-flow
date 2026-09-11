@@ -36,6 +36,9 @@ c = json.load(open(p, encoding="utf-8"))
 c["project_prefix"] = "proj"
 c["verify_cmd"] = "echo 12 passed"
 c["frozen_globs"] = ["tests/*"]
+c["workers"] = ["codex"]
+c["execution"] = {"defaults": {"workers": {"codex": {
+    "model": "codex-test-model", "reasoning_effort": "medium"}}}}
 json.dump(c, open(p, "w", encoding="utf-8"), indent=2)
 PY
 "$PY" "$GATE" install-hook --repo "$S/proj" >/dev/null

@@ -1,6 +1,6 @@
 # gate — the acceptance gate a lying commit cannot pass
 
-One file, stdlib Python, no dependencies. It exists to close one specific hole.
+Stdlib Python, no external dependencies. It exists to close one specific hole.
 
 An earlier unattended orchestrator marked roughly 60% of its tasks as done by
 committing only the queue file: the status flag plus the existence of a commit was
@@ -289,3 +289,9 @@ Ten cases, run against a synthetic repo that reproduces the fake-completion shap
 8. `--no-verify` bypass → commit succeeds, `audit` reports `FAKE_COMPLETION`
 9. `admit` report → three-state ok / REFUSE / UNDECLARED per TODO task
 10. `run --strict-admit` on an undeclared head task → stops with `admit_refused`, no worker spawned
+# Explicit task execution profiles
+
+Unattended calls require queue-bound model and reasoning profiles. See
+[the execution contract](../docs/execution.md) for defaults, per-task overrides,
+`lock-execution`, compatibility and controlled updates. Verification and
+inspection do not require a model profile; inference does.

@@ -13,3 +13,9 @@ revision: 1
 ## Decisions
 <!-- Choices made and why, one line each. Long-lived ones graduate to
      docs/adr/. -->
+
+## Execution profiles
+<!-- While queueing, declare concrete models and reasoning in execution.defaults
+     and task execution overrides. Cover workers, judges, revisions and fallbacks.
+     Record why overrides are needed and any explicit user effort cap. Freeze via
+     flow lock-execution; chat-session changes do not alter queued execution. -->

@@ -25,13 +25,13 @@ irreversible effects. The shell supervisor does not interpret findings or write 
 |---|---|---|
 | host | interactive CLI | its current model |
 | judge | headless read-only review | configured chain: fable, opus, codex |
-| worker | headless task process | CLI configuration unless explicitly pinned in worker_cmds |
+| worker | headless task process | frozen queue model and reasoning profile |
 
-Claude workers omit `--model` and inherit effective CLI settings and environment at launch
-in the project directory. This does not copy a transient model selection from another
-interactive session. The runner neither injects Opus nor forbids a model family.
-Explicit project model arguments remain authoritative. Roles are separated by permissions
-and review lifecycle. The judge commands and their explicit model pins remain unchanged.
+Workers, judges, revisions and fallbacks use explicit model and reasoning profiles
+resolved while queueing. See [execution.md](execution.md) for declarations, admission,
+persistent locks and controlled future-task updates. The host's current session and
+later global CLI settings do not select queued execution. Codex and Claude receive
+explicit model/effort flags; roles retain their permissions and review lifecycle.
 
 ## 2. Usage-aware dispatch (probe before spend)
 
@@ -39,7 +39,7 @@ Today benching is reactive: a worker is benched only after an attempt died on a 
 that costs a dispatch plus a queue-row restore. New: **probe once per run, before the first
 dispatch**, every candidate worker (run-wide list ∪ row pins ∪ judge chain CLIs).
 
-- Probe = one tiny real request (`Reply with the single word OK`) per CLI, `probe.timeout_s` (90).
+- Probe = one tiny real request (`Reply with the single word OK`) per distinct profile, `probe.timeout_s` (90).
 - Output matched against `QUOTA_PATTERNS` → bench for `quota_cooldown_s` (same as reactive).
 - Timeout / not installed / other non-zero exit → bench for `probe.retry_s` (600) only. A probe
   that never reached the provider must not occupy the quota window.

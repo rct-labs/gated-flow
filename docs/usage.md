@@ -203,3 +203,10 @@ skills, delete `~/.agents/skills/{flow,flow-run,run-queue,model-debate}` and the
 same-name junctions or copies under `~/.claude/skills` and `~/.codex/skills`.
 Project documents (CONTEXT, queue, work packages) are ordinary files; keep or
 discard them as you like.
+# Execution configuration before unattended work
+
+Declare queue-bound model IDs and reasoning effort before any usage probe or
+run. Follow [the execution contract](execution.md), then use `flow admit` and
+`flow lock-execution`. Every eligible worker, judge, revision and fallback must
+have a profile. Existing queues need this preparation before their next run;
+the tool never silently inherits a new host session's selection.

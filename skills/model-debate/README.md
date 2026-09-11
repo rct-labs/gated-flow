@@ -9,7 +9,8 @@ project without depending on that source path.
 Audit a draft, requirement, RFC, design or idea using multiple models, verify the
 evidence, and produce a revised final document. Do not make this skill a mandatory
 approval process for unrelated work. Keep it a small Markdown workflow with
-focused references, not a framework, service, API client or execution engine.
+focused references and a bounded allowance/recovery helper, not a framework,
+service or inference execution engine.
 Temporary launch/test helpers are acceptable for safe process handling. Use
 headless subscription CLIs; no API keys or paid search dependency.
 
@@ -59,3 +60,12 @@ headless subscription CLIs; no API keys or paid search dependency.
 distinct-model selection, identity drift, real access denial, claim traceability,
 failure recovery and instruction conflicts. Static validation does not establish
 live runtime isolation.
+
+13. Before inference, apply owner exclusions and fresh whole-run account budget
+    admission through scripts/quota_guard.py. Include probes, shared-pool seats
+    and retries. Unknown headroom refuses launch; declared estimates do not
+    guarantee completion. See references/quota.md for native coverage limits.
+14. Distinguish exhaustion, transient rate limits and unknown failure. Authorized
+    replacement rebuilds an independent seat, preserves only fingerprint-matched
+    valid answers, invalidates downstream peer-dependent results and rechecks
+    the stricter project model quorum. No automatic purchases or global changes.

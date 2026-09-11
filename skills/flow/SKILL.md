@@ -101,6 +101,14 @@ Optionally give the table a `worker` column (`claude` / `codex` / `kimi` /
 `grok`, empty = no pin) so each task goes to the CLI that suits it; gate
 falls through to the run-wide list when the pin is benched.
 
+Bind models and reasoning while queueing. Read `<home>/docs/execution.md` for
+`execution.defaults`, per-task `execution` comments, and `flow lock-execution`.
+Resolve every worker, judge, revision and fallback profile before probes or
+dispatch; preserve explicit user effort limits. Defaults belong to the queue,
+not to the host's later session. Run admission and freeze the profiles before
+handoff. Arena planning profiles do not automatically select implementation
+workers. On resume reuse the lock; a chat model/effort switch does not update it.
+
 A task whose declared files hit the project's `irreversible_globs`
 (migrations, `data/**`, hooks, settings) needs its own
 `<!-- task:ID approved: <who/date> -->` line. Put independent irreversible work
@@ -141,6 +149,23 @@ the same breath as the audit.
 **High-stakes uncertainty** — only when uncertainty, impact, and
 irreversibility are ALL high, suggest the `model-debate` skill. Never by
 default.
+
+**Debate admission and quota recovery** - When routing to model-debate, carry
+owner model/account exclusions, the required project model quorum, allowed
+backup order and existing replacement authority into the run constraints.
+Read that skill's quota reference and use its executable preflight before any
+inference, including probes and retries. Budget the whole remaining debate by
+shared account, not each seat separately. Existing project hard gates apply
+even when the generic high-stakes suggestion above would not trigger.
+On exhaustion, use only eligible authorized alternatives; preserve immutable
+originals, rebuild independent replacement work and invalidate peer-dependent
+rounds as the quota recovery plan requires. Missing allowance, budget or quorum
+is a resumable review gap, not a completed design. Keep the checkpoint in the
+existing work package/CONTEXT and queue; never silently lower the project gate,
+start excluded helpers, repeat an exhausted-pool call, or reset a task counter.
+The helper does not intercept unrelated CLI commands or make business actions
+safe to replay. If it is absent, report the missing capability before launch;
+do not claim automatic protection from budget prose alone.
 
 **How do I… / which command was it** — read `<home>/docs/usage.md` and
 answer plainly. Then OFFER TO RUN the command yourself instead of making the

@@ -9,6 +9,11 @@ mandatory standalone parser.
 draft/project snapshot identity, language, research/isolation mode, and budget:
 calls, retries, concurrency by subscription and deadline per seat.
 
+Record frozen requested reasoning effort and separately observed effort for
+every model reference, including backups and synthesis/review calls. Preserve
+explicit user caps. Missing runtime metadata is unknown; not_applicable needs
+capability evidence. Each invocation binds the seat's frozen model/effort pair.
+
 | Model ref | Serving provider / CLI | Requested selector | Resolved identity | Identity evidence | Subscription pool |
 |---|---|---|---|---|---|
 | model-a | chosen provider / adapter | user selector or configured default | runtime ID, family, or unknown | metadata location and assurance | local pool label |
@@ -43,6 +48,9 @@ claims.md                common claim inventory
 constraints.md           owner decisions, exclusions and provenance
 questions.md             shared and role-specific research questions
 roster.md                model locks, roles, budget and assurance
+quota-plan.json          per-pool remaining work, exclusions, estimates and quorum
+quota-<sequence>.json     fresh guard decision; new file per check
+failure-<attempt>.json   typed failure and evidence for scoped recovery
 roles/<seat>.md          per-seat role
 prompts/<stage>-<seat>.md exact prompts, host-private before release
 attempts/<stage>/<seat>/<attempt>/
@@ -142,3 +150,9 @@ Round 2: objection ID, `CONCEDE`/`REBUT`/`DEFER`, evidence, resulting change,
 prefixed new claims/objections, and the three blind-spot lists from the main skill.
 Corroboration names underlying models and source origins; repeated seats never
 supply extra independent confirmations.
+
+Quota and recovery records follow [quota.md](quota.md). Keep the original and
+revised roster fingerprints, affected seats, reused-answer fingerprints, invalid
+round2 snapshot and replacement authority in decision-log.md. No successful
+answer is relabeled as another model, and no superseded vote enters the final
+quorum merely because its file still exists.

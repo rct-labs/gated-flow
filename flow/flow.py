@@ -46,6 +46,11 @@ Real row: change TODO to `TODO` (backticks). Every task also needs a scope
 line directly below the table so admission can judge it, shaped like
 "task:WP-1 files: src/foo.py, tests/test_foo.py" inside an HTML comment
 of its own. -->
+
+<!-- Before dispatch: configure concrete model IDs and reasoning effort in
+.gate/config.json execution.defaults for workers, judges and revisions.
+Task execution JSON comments override declared defaults. Then flow admit and
+flow lock-execution; never inherit a later host session's model or effort. -->
 """
 
 # Inlined so init works standalone; flow/templates/CONTEXT.md is the
@@ -243,7 +248,7 @@ def main() -> None:
         if not AUDIT.exists():
             die(f"missing {AUDIT}")
         sys.exit(run_py(AUDIT, rest or ["."]))
-    if cmd in ("admit", "doctor", "run", "verify", "usage", "install-hook",
+    if cmd in ("admit", "doctor", "run", "verify", "usage", "lock-execution", "install-hook",
                "check-commit"):
         sys.exit(run_py(GATE, [cmd, *rest]))
     if cmd == "audit-gate":  # gate.py's history audit, distinct from tree audit
