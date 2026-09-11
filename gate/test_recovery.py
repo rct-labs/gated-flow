@@ -592,6 +592,8 @@ class RecoveredCompletionGateTests(RecoveryTestCase):
         self.assertIn("staged or modified", self.blocked(env))
 
         git(env, "checkout", "--", SOURCE)
+        self.assertIn("changed after the acceptance run", self.blocked(env))
+        self.verify(env)
         self.assertIn("recovered claim", self.check_commit(env))
 
         text = env.queue.read_text(encoding="utf-8")
@@ -911,7 +913,9 @@ class F3AcceptanceInputTests(RecoveryTestCase):
         self.stage_done(env)
         detail = self.blocked(env)
         self.assertIn("INPUTS_CHANGED", detail)
-        self.assertIn(SOURCE, detail, "the refusal must name the file that moved")
+        verdict = self.gate.read_verdict(env.repo)
+        self.assertEqual(verdict["result"], "INPUTS_CHANGED")
+        self.assertIn(SOURCE, verdict["inputs_drift"], "the verdict must name the file that moved")
 
     def test_a_file_named_like_a_gate_artifact_is_still_bound(self) -> None:
         env = build(self.root)
@@ -1249,7 +1253,9 @@ class F9AuditEvidenceTests(RecoveryTestCase):
         env = build(self.root)
         self.close_recovered(env)
         code, report = self.audit(env)
-        self.assertEqual(code, 0, report)
+        self.assertEqual(code, 1, report)
+        self.assertIn("REVIEW PENDING", report)
+        self.assertNotIn("FAKE_COMPLETION", report)
 
         # Same receipt, a second queue-only DONE elsewhere in history.
         text = env.queue.read_text(encoding="utf-8")
@@ -1387,17 +1393,40 @@ class Review2RegressionTests(RecoveredRunTests):
         self.assertFalse(recovery.done_allowance(env.repo, self.cfg(env), [TASK], [env.queue_rel])["allowed"])
         self.assertEqual(self.verify(env)["result"], "FAIL")
 
-    def test_unknown_ignored_data_is_rejected_without_reading(self):
+    def test_unknown_ignored_data_is_reported_never_read_and_refused_at_gate(self):
         env = build(self.root)
         write(env.repo / ".gitignore", "private/\n.gate/\n"); self.commit_all(env, "ignore data")
         path = env.repo / "private/production.sqlite"; write(path, "synthetic never production")
         original = Path.read_bytes
+
         def read(p):
             self.assertNotEqual(p, path, "must not read unclassified data")
             return original(p)
+
         with mock.patch.object(Path, "read_bytes", read):
-            with self.assertRaisesRegex(recovery.RecoveryError, "unclassified ignored"):
-                recovery.acceptance_inputs(env.repo, self.cfg(env))
+            inputs = recovery.acceptance_inputs(env.repo, self.cfg(env))
+        # Capture reports it and moves on: an ordinary task's verify still runs.
+        self.assertEqual(inputs["unclassified"], ["private/"])
+        self.assertNotIn("private/production.sqlite", inputs["worktree"])
+        # A recovered completion does not: every ignored input is bound or excluded.
+        self.recovered_and_verified(env)
+        detail = self.blocked(env)
+        self.assertIn("neither bound nor excluded: private/", detail)
+
+    def test_ignored_directories_classify_as_one_entry(self):
+        env = build(self.root, recovery_inputs={"include": ["vendor/"], "exclude": ["deps/"]})
+        write(env.repo / ".gitignore", "deps/\nvendor/\n.gate/\n"); self.commit_all(env, "ignore trees")
+        for i in range(300):
+            write(env.repo / "deps" / f"pkg{i}" / "index.js", f"module.exports = {i};\n")
+        write(env.repo / "vendor" / "lib" / "a.txt", "a\n")
+        write(env.repo / "vendor" / "b.txt", "b\n")
+        paths, unclassified = recovery.classify_inputs(env.repo, self.cfg(env))
+        self.assertEqual(unclassified, [])
+        self.assertFalse(any(p.startswith("deps/") for p in paths), "an excluded tree is one decision")
+        self.assertIn("vendor/lib/a.txt", paths)
+        self.assertIn("vendor/b.txt", paths)
+        self.assertEqual([e for e in recovery.ignored_entries(env.repo)
+                          if not recovery.is_gate_artifact(e)], ["deps/", "vendor/"])
 
     def test_write_restore_inside_oracle_and_restored_mtime_is_rejected(self):
         env = build(self.root); self.recover(env); self.commit_row(env)

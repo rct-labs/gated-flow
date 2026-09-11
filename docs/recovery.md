@@ -38,29 +38,36 @@ inputs are unsupported and refused. The oracle is invalidated before monitor
 startup, initial capture or any other fallible preparation; failures cannot
 leave an older PASS usable.
 
-Git ignore rules are not a declaration of irrelevance. Ignored files must be
+Git ignore rules are not a declaration of irrelevance. Ignored inputs are
 classified by the optional `recovery_inputs` contract in the existing engine
-configuration. Unclassified ignored files cause refusal **before their content
-is read**. `.gate/config.json` is always an input. The engine's exact journal,
-verdict, lock, report, run and recovery artifact paths are excluded explicitly.
-There is no arbitrary `.gate` substring exclusion.
+configuration, at the granularity a project can actually answer for: an ignored
+**directory is one entry** (`node_modules/`), listed the way
+`git ls-files --others --ignored --directory` lists it, so a dependency tree of
+two million files is one decision rather than two million refusals and a
+twenty-second scan on every acceptance run. An ordinary task's verify still
+runs with unclassified entries present: capture records them, never reads them,
+and a recovered completion is refused while any remain. `.gate/config.json` is
+always an input. The engine's exact journal, verdict, lock, report, run and
+recovery artifact paths are excluded explicitly; there is no arbitrary `.gate`
+substring exclusion.
 
 Example contract for a synthetic project:
 
 ```json
 {
   "recovery_inputs": {
-    "include": ["runtime/settings.json"],
+    "include": ["runtime/settings.json", "vendor/"],
     "exclude": ["node_modules/", "build-cache/", "private-data/"]
   }
 }
 ```
 
-`include` lists exact repository-relative ignored input files; they are hashed
-like tracked inputs. `exclude` lists exact ignored paths, or directory prefixes
-ending in `/`. Wildcards, absolute paths, parent traversal and exclusion of
-tracked/nonignored inputs are refused. This contract and acceptance globs are
-bound into receipt configuration. Changing it invalidates existing receipts.
+`include` lists exact repository-relative ignored files, or directory prefixes
+ending in `/` whose every file is then hashed like a tracked input. `exclude`
+lists exact ignored paths or directory prefixes. Wildcards, absolute paths,
+parent traversal and exclusion of tracked/nonignored inputs are refused. This
+contract and acceptance globs are bound into receipt configuration. Changing it
+invalidates existing receipts.
 
 Exclusion is a supported **oracle isolation contract**, not a claim that every
 ignored file is irrelevant. Excluded paths must be non-input outputs or external

@@ -764,7 +764,25 @@ def git_paths(repo: Path, *args: str) -> list[str]:
     return [os.fsdecode(p) for p in _git_bytes(repo, *args).split(b"\0") if p]
 
 
-def input_paths(repo: Path, cfg: dict) -> list[str]:
+def ignored_entries(repo: Path) -> list[str]:
+    """Ignored inputs at the granularity a project can actually answer for.
+
+    Directories collapse to one entry (`node_modules/`), so a dependency tree
+    of two million files is one classification, not two million refusals and
+    a twenty-second scan on every acceptance run.
+    """
+    return git_paths(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard",
+                     "--directory")
+
+
+def classify_inputs(repo: Path, cfg: dict) -> tuple[list[str], list[str]]:
+    """(paths the oracle is bound to, ignored entries nobody has classified).
+
+    Tracked and untracked files are always bound. Ignored entries are bound
+    when `recovery_inputs.include` names them, skipped when `.exclude` does,
+    and reported otherwise — capture never refuses, so an ordinary task's
+    verify keeps working; a recovered completion refuses on anything reported.
+    """
     contract = cfg.get("recovery_inputs") or {}
     include = contract.get("include", [])
     exclude = contract.get("exclude", [])
@@ -775,22 +793,39 @@ def input_paths(repo: Path, cfg: dict) -> list[str]:
                 or Path(path).is_absolute() or ".." in Path(path).parts
                 or any(c in path for c in "*?[]")):
             raise RecoveryError("recovery_inputs paths must be exact repository-relative paths")
-    def excluded(path):
-        return any(path == p.rstrip("/") or (p.endswith("/") and path.startswith(p)) for p in exclude)
+
+    def listed(path: str, entries: list[str]) -> bool:
+        return any(path == p.rstrip("/") or (p.endswith("/") and path.startswith(p))
+                   for p in entries)
+
     paths = set(git_paths(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard"))
-    if any(excluded(p) for p in paths if not is_gate_artifact(p)):
+    if any(listed(p, exclude) for p in paths if not is_gate_artifact(p)):
         raise RecoveryError("recovery_inputs exclusions may only classify ignored files")
-    ignored = git_paths(repo, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
-    for path in ignored:
-        if is_gate_artifact(path):
+    unclassified: list[str] = []
+    for entry in ignored_entries(repo):
+        if is_gate_artifact(entry) or entry.rstrip("/") == GATE_DIR:
+            # Runner-owned; its configuration is bound explicitly below.
             continue
-        if path in include or path == ".gate/config.json":
+        if listed(entry, include):
+            root = Path(repo) / entry
+            if entry.endswith("/"):
+                paths.update(
+                    str(f.relative_to(repo)).replace("\\", "/")
+                    for f in root.rglob("*") if f.is_file()
+                )
+            else:
+                paths.add(entry)
+        elif not listed(entry, exclude):
+            unclassified.append(entry)
+    for path in include:
+        if not path.endswith("/"):
             paths.add(path)
-        elif not excluded(path):
-            raise RecoveryError(f"unclassified ignored acceptance input: {path}; declare recovery_inputs include or exclude")
-    paths.update(include)
     paths.add(".gate/config.json")
-    return sorted(p for p in paths if not is_gate_artifact(p))
+    return sorted(p for p in paths if not is_gate_artifact(p)), sorted(unclassified)
+
+
+def input_paths(repo: Path, cfg: dict) -> list[str]:
+    return classify_inputs(repo, cfg)[0]
 
 
 def change_stamp(path: Path) -> list[int]:
@@ -860,7 +895,8 @@ def worktree_state(repo: Path, cfg: dict | None = None) -> dict:
 
 def acceptance_inputs(repo: Path, cfg: dict) -> dict:
     return {"head": _out(repo, "rev-parse", "HEAD"),
-            "worktree": worktree_state(repo, cfg), "verify": verify_config(cfg)}
+            "worktree": worktree_state(repo, cfg), "verify": verify_config(cfg),
+            "unclassified": classify_inputs(repo, cfg)[1]}
 
 
 class InputMonitor:
@@ -912,7 +948,9 @@ class InputMonitor:
         try:
             if handle == w.HANDLE(-1).value or not event:
                 raise OSError("opening directory monitor failed")
-            buf = ctypes.create_string_buffer(65536)
+            # Local directories accept large buffers; a dependency tree that
+            # the oracle writes into must not overflow this before it is drained.
+            buf = ctypes.create_string_buffer(4 * 1024 * 1024)
             while True:
                 ov = Overlapped(); ov.hEvent = event
                 k.ResetEvent(event)
@@ -1696,6 +1734,13 @@ def done_allowance(repo: Path, cfg: dict, flipped: list[str], staged: list[str])
         return no("the verdict did not capture its acceptance inputs; re-run the acceptance command")
     if drift or verdict.get("inputs_drift"):
         return no("the tree changed while the oracle ran: " + ", ".join(drift))
+    unclassified = verdict["inputs_after"].get("unclassified") or []
+    if unclassified:
+        return no(
+            "ignored acceptance inputs are neither bound nor excluded: " + ", ".join(unclassified)
+            + ". Declare each under recovery_inputs.include (bound and hashed) or "
+            ".exclude (accepted as outside the oracle) in .gate/config.json."
+        )
     allowed = {queue_rel}
     now = acceptance_inputs(repo, cfg)
     moved = [path for path in inputs_differences(verdict["inputs_after"], now)
