@@ -2535,7 +2535,10 @@ def _cmd_run_locked(args) -> None:
             # its attempts on claude while it was returning 529, with codex,
             # grok and kimi installed and idle. Quota benching already rotates; this covers every other
             # tool-shaped failure, which is most of them.
-            worker = pool[attempts % len(pool)]
+            # A recovered task's one revalidation dispatch goes to the preferred
+            # worker: the attempts it carries were not that CLI's failures, so
+            # rotating on them would only swap the pinned model for a fallback.
+            worker = pool[0] if recovered else pool[attempts % len(pool)]
             last_worker = worker
             dispatches += 1
             attempt_head = git(repo, "rev-parse", "HEAD").strip()
@@ -2846,6 +2849,13 @@ def _cmd_run_locked(args) -> None:
                 "recovered task needs an independent review: "
                 + ("judge disabled" if judge_info is None else judge_info["reason"]),
             )
+        if recovered and outcome != "done":
+            # The dispatch closed nothing: retire the barrier it raised, or no
+            # later run could ever start. A DONE row is never retired here —
+            # open_barriers reconstructs that obligation from the history.
+            recovery.retire_dispatch_barrier(
+                repo, cfg, tid, f"revalidation dispatch ended {outcome}; the row is not DONE"
+            )
         if recovered and judge_info and judge_info["final"] == "pass":
             rounds = judge_info["rounds"]
             recovery.clear_barrier(
@@ -3148,6 +3158,22 @@ def cmd_recover_task(args) -> None:
     )
 
 
+def cmd_renew_revalidation(args) -> None:
+    """One more revalidation dispatch for a lineage whose only dispatch passed
+    the oracle and was then refused at the gate. Evidenced, journalled, once."""
+    repo = repo_root(Path(args.repo).resolve())
+    cfg = load_config(repo)
+    if not args.task:
+        die("renew-revalidation needs --task")
+    try:
+        grant = recovery.renew_revalidation(repo, cfg, args.task, args.reason or "")
+    except recovery.RecoveryError as exc:
+        journal(repo, {"event": "renewal_refused", "task": args.task, "reason": str(exc)})
+        die(f"renewal refused: {exc}")
+    print(f"GATE: {args.task} granted one more revalidation dispatch "
+          f"(lineage {grant['implementation'][:10]}); recover the stopped claim, then run.")
+
+
 def cmd_review_task(args) -> None:
     """Independent review only, under the same lock and persistent budgets."""
     repo = repo_root(Path(args.repo).resolve())
@@ -3274,6 +3300,7 @@ def main() -> None:
             ("--dry-run", "store_true"),
         ]),
         ("review-task", cmd_review_task, [("--task", "str")]),
+        ("renew-revalidation", cmd_renew_revalidation, [("--task", "str"), ("--reason", "str")]),
         ("lock-execution", cmd_lock_execution, [("--reason", "str")]),
         ("usage", cmd_usage, []),
         ("doctor", cmd_doctor, []),

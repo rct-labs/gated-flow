@@ -122,8 +122,19 @@ or an unproven/fabricated completion.
 
 The one revalidation invocation is accounted by task and original implementation
 lineage across all receipts. Outage rotation cannot invoke another worker after
-that allowance is spent. Receipt renewal is rejected once used. Original attempt
-counts, outcomes and failure signatures remain visible. Independent review
+that allowance is spent, and the dispatch goes to the preferred (pinned) worker:
+the attempts a recovered task carries were not that CLI's failures, so they do
+not rotate it away. Receipt renewal is rejected once used. Original attempt
+counts, outcomes and failure signatures remain visible.
+
+One exception exists, and it is explicit: `renew-revalidation --task <task>
+--reason "<why>"` grants a second dispatch for a lineage whose only dispatch
+ran the canonical oracle to a recorded PASS and was then refused at the gate
+— the shape an engine defect produces, not a worker failure. It is refused
+when the oracle did not pass, when the task closed, when the run is still open,
+or when the lineage was already renewed; the reason is journalled with the
+grant. The stopped claim that dispatch left behind is then recovered from its
+own run as usual. Independent review
 retains revision invocation counts, prior scores, no-progress and cap exhaustion
 across commands; repeating review cannot renew implementation allowances.
 

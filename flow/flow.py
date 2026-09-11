@@ -250,7 +250,7 @@ def main() -> None:
             die(f"missing {AUDIT}")
         sys.exit(run_py(AUDIT, rest or ["."]))
     if cmd in ("admit", "doctor", "run", "verify", "usage", "lock-execution", "install-hook",
-               "check-commit", "recover-task", "review-task"):
+               "check-commit", "recover-task", "review-task", "renew-revalidation"):
         sys.exit(run_py(GATE, [cmd, *rest]))
     if cmd == "audit-gate":  # gate.py's history audit, distinct from tree audit
         sys.exit(run_py(GATE, ["audit", *rest]))

@@ -638,11 +638,24 @@ class RecoveredRunTests(RecoveryTestCase):
                                strict_admit=over.pop("strict_admit", False),
                                force=True, **over)
 
-    def worker(self, env, prompts: list[str], close: bool = True):
+    def worker(self, env, prompts: list[str], close: bool = True, verify_only: bool = False,
+               tools: list[str] | None = None):
         def fake_spawn(repo_arg, cfg, tool, prompt, prompt_file, **kwargs):
             prompts.append(prompt)
+            if tools is not None:
+                tools.append(tool)
             if kwargs.get("extra"):  # the judge, not the worker
                 return self.gate.WorkerResult(0, JUDGE_JSON), None
+            if verify_only:
+                text = env.queue.read_text(encoding="utf-8")
+                row = recovery.queue_row(text, TASK)
+                env.queue.write_text(
+                    text.replace(row, recovery.flipped_row(row, "TODO", "IN_PROGRESS")),
+                    encoding="utf-8", newline="")
+                git(env, "add", env.queue_rel)
+                git(env, "commit", "-q", "-m", f"claim {TASK} again")
+                self.verify(env)
+                return self.gate.WorkerResult(0, "verified, closure refused"), None
             if not close:
                 return self.gate.WorkerResult(0, "could not finish"), None
             text = env.queue.read_text(encoding="utf-8")
@@ -664,10 +677,11 @@ class RecoveredRunTests(RecoveryTestCase):
 
         return fake_spawn
 
-    def run_gate(self, env, prompts, close: bool = True, **over):
+    def run_gate(self, env, prompts, close: bool = True, verify_only: bool = False,
+                 tools: list[str] | None = None, **over):
         with mock.patch.object(self.gate, "resolve_tool", side_effect=lambda name: name), \
                 mock.patch.object(self.gate, "spawn_worker",
-                                  side_effect=self.worker(env, prompts, close)), \
+                                  side_effect=self.worker(env, prompts, close, verify_only, tools)), \
                 contextlib.redirect_stdout(io.StringIO()) as out, \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             code = 0
@@ -1300,7 +1314,7 @@ class F10BudgetTests(RecoveredRunTests):
         code, report = self.run_gate(env, prompts, close=False)
         self.assertEqual(code, 3)
         self.assertEqual(prompts, [], "no second revalidation dispatch")
-        self.assertIn("unreviewed", report)
+        self.assertIn(f"revalidation_exhausted:{TASK}", report)
 
     def test_no_progress_and_other_outcomes_are_not_recoverable(self) -> None:
         for outcome in ("no_progress", "timeout", "worker_incomplete", "blocked"):
@@ -1527,6 +1541,105 @@ class Review2RegressionTests(RecoveredRunTests):
         events=recovery.journal_events(env.repo)
         self.assertEqual([e["revision"] for e in events if e["event"]=="revision_start"], [1])
         self.assertIn(TASK,recovery.open_barriers(env.repo))
+
+
+ALLTOM_HEADER = "| # | ID | task | status | worker | passed-before | passed-after |"
+
+
+def alltom_row(status: str, before: str, after: str) -> str:
+    return (f"{ALLTOM_HEADER}\n|---|---|---|---|---|---|---|\n"
+            f"| 72 | {TASK} | Correct annual-bonus boundary taxes with official oracle "
+            f"(spec {TASK}) | `{status}` | claude | {before} | {after} |\n")
+
+
+class ClosureRefusalRegressionTests(RecoveredRunTests):
+    """What the first real run produced: a passing oracle whose closure the
+    gate refused for engine reasons, and a dispatch that ignored the pin."""
+
+    def test_baseline_placeholders_are_bookkeeping_not_requirement(self) -> None:
+        cfg = {**self.gate.DEFAULT_CONFIG, **config()}
+        placeholder = recovery.requirement_cells(
+            cfg, alltom_row("IN_PROGRESS", "measured at dispatch", "pending"), TASK)
+        filled = recovery.requirement_cells(
+            cfg, alltom_row("DONE", "12563 passed (prior full receipt)", "12563 passed"), TASK)
+        self.assertEqual(placeholder, filled)
+        self.assertEqual(placeholder, [TASK, f"Correct annual-bonus boundary taxes with "
+                                              f"official oracle (spec {TASK})"])
+        # The task text itself is still requirement.
+        renamed = recovery.requirement_cells(
+            cfg, alltom_row("DONE", "12563 passed", "12563 passed").replace(
+                "boundary taxes", "boundary rates"), TASK)
+        self.assertNotEqual(placeholder, renamed)
+        # Without a header the content heuristics still drop counts and dashes.
+        headerless = (f"| 72 | {TASK} | feature returns two | `TODO` | 1 passed | — |\n")
+        self.assertEqual(recovery.requirement_cells(cfg, headerless, TASK),
+                         [TASK, "feature returns two"])
+
+    def test_revalidation_dispatch_goes_to_the_preferred_worker(self) -> None:
+        defaults = config()["execution"]["defaults"]
+        defaults["workers"]["codex"] = {"model": "codex-test-model", "reasoning_effort": "medium"}
+        env = build(self.root, journal=stopped_journal(attempts=3), max_attempts_per_task=3,
+                    workers=["claude", "codex"], execution={"defaults": defaults},
+                    judge=self.JUDGE_ON)
+        self.recover(env)
+        self.commit_row(env)
+        tools: list[str] = []
+        code, report = self.run_gate(env, [], tools=tools)
+        self.assertEqual(code, 0, report)
+        self.assertEqual(tools[:1], ["claude"], "three carried attempts must not rotate the pin away")
+
+    def test_a_refused_passing_closure_can_be_renewed_exactly_once(self) -> None:
+        env = build(self.root, judge=self.JUDGE_ON)
+        self.recover(env)
+        self.commit_row(env)
+        code, _ = self.run_gate(env, [], verify_only=True)
+        self.assertEqual(code, 3)
+        # Nothing closed, so the dispatch barrier is retired and a later run
+        # can start; a DONE row would still be reconstructed as an obligation.
+        self.assertEqual(recovery.open_barriers(env.repo), {})
+        cfg = self.cfg(env)
+        with self.assertRaisesRegex(recovery.RecoveryError, "needs --reason"):
+            recovery.renew_revalidation(env.repo, cfg, TASK, "")
+        grant = recovery.renew_revalidation(env.repo, cfg, TASK, "gate refused a passing closure")
+        self.assertEqual(grant["event"], "revalidation_renewed")
+        with self.assertRaisesRegex(recovery.RecoveryError, "granted once"):
+            recovery.renew_revalidation(env.repo, cfg, TASK, "again")
+
+        # The claim left by that dispatch is recoverable again, from its run.
+        run_id = [e["run"] for e in recovery.journal_events(env.repo) if e["event"] == "run_end"][-1]
+        with mock.patch.object(recovery, "ownership_evidence", return_value={
+            "owner_pid": DEAD_PID, "owner_source": "journal", "supervisor": None,
+            "census_size": 3, "census_at": "test", "matched_writers": []}):
+            receipt = self.recover(env, run_id=run_id)
+        budget = recovery.revalidation_budget(env.repo, cfg, TASK, receipt)
+        self.assertEqual((budget["allowed"], budget["used"]), (2, 1))
+        self.commit_row(env)
+        prompts: list[str] = []
+        code, report = self.run_gate(env, prompts)
+        self.assertEqual(code, 0, report)
+        self.assertEqual(len([p for p in prompts if "acceptance judge" not in p]), 1)
+        self.assertEqual(
+            self.gate.parse_queue(env.queue.read_text(encoding="utf-8"))[TASK]["status"], "DONE")
+
+    def test_renewal_needs_a_passing_oracle_and_an_unclosed_task(self) -> None:
+        env = build(self.root)
+        self.recover(env)
+        self.commit_row(env)
+        cfg = self.cfg(env)
+        with self.assertRaisesRegex(recovery.RecoveryError, "granted once .* 0 dispatch"):
+            recovery.renew_revalidation(env.repo, cfg, TASK, "nothing dispatched yet")
+        code, _ = self.run_gate(env, [], close=False)     # no oracle ran
+        self.assertEqual(code, 3)
+        with self.assertRaisesRegex(recovery.RecoveryError, "no PASS from the canonical oracle"):
+            recovery.renew_revalidation(env.repo, cfg, TASK, "worker gave up")
+
+        closed = build(self.root / "closed", judge=self.JUDGE_ON)
+        self.recover(closed)
+        self.commit_row(closed)
+        code, report = self.run_gate(closed, [])
+        self.assertEqual(code, 0, report)
+        with self.assertRaisesRegex(recovery.RecoveryError, "closed after"):
+            recovery.renew_revalidation(closed.repo, self.cfg(closed), TASK, "already done")
 
 
 if __name__ == "__main__":

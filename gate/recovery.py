@@ -1124,17 +1124,41 @@ def acceptance_files(repo: Path, cfg: dict, ref: str, explicit: str | None) -> l
 REQUIREMENT_SKIP_CELL = re.compile(r"^[-–—\s]*$")
 
 
+BOOKKEEPING_HEADERS = ("status", "worker", "baseline", "passed", "count")
+
+
+def row_headers(text: str, task: str) -> list[str] | None:
+    """The header cells of the table that holds this task's row, if any."""
+    headers: list[str] | None = None
+    row_re = _g("ROW_RE")
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            continue
+        cells = [c.strip() for c in stripped.strip("|").split("|")]
+        if all(set(c) <= set("-: ") for c in cells):
+            continue
+        if _row_task_id(line) == task:
+            return headers
+        if row_re.match(line) is None:
+            headers = [c.lower().strip("*` ") for c in cells]
+    return None
+
+
 def requirement_cells(cfg: dict, text: str, task: str) -> list[str]:
     """The row's substance: everything except the bookkeeping cells.
 
-    Dropped: the leading index, the status (it is what recovery moves), any
-    count baseline, and the worker pin. What is left is the task's name and
-    description, which must not have changed under the implementation.
+    Bookkeeping is what the table header says it is: the index, the status
+    (it is what recovery moves), the worker pin, and the baseline / count
+    columns, whose placeholders ("measured at dispatch", "pending") are filled
+    in by the closing worker and are not requirement text. Without a header
+    the older content heuristics apply.
     """
     row = _parse_queue(text).get(task)
     if not row:
         raise RecoveryError(f"{task} has no queue row")
     cells = list(row["cells"])
+    headers = row_headers(text, task)
     pin_value = _parse_task_workers(text).get(task)
     count = re.compile(cfg["count_regex"])
     status_index = next((i for i, cell in enumerate(cells) if STATUS_CELL_RE.search(cell)), -1)
@@ -1142,6 +1166,11 @@ def requirement_cells(cfg: dict, text: str, task: str) -> list[str]:
     for index, cell in enumerate(cells):
         stripped = cell.strip()
         if index in (0, status_index):
+            continue
+        if headers is not None and index < len(headers) and (
+            headers[index] == "#"
+            or any(token in headers[index] for token in BOOKKEEPING_HEADERS)
+        ):
             continue
         if count.search(stripped) or REQUIREMENT_SKIP_CELL.match(stripped):
             continue
@@ -1427,7 +1456,7 @@ def plan(repo: Path, cfg: dict, task: str, implementation: str, run_id: str, rea
                      requirement_mode, requirement_path, fresh=True)
     ownership = ownership_evidence(repo, task, found["stopped_run"]["runner_pid"], stopped_pid, run_id)
     lineage = found["implementation"]["commit"]
-    if lineage_dispatches(repo, task, lineage):
+    if len(lineage_dispatches(repo, task, lineage)) > len(lineage_renewals(repo, task, lineage)):
         raise RecoveryError("revalidation allowance exhausted for original implementation lineage")
     return {
         "schema_version": SCHEMA_VERSION,
@@ -1876,17 +1905,7 @@ def open_barriers(repo: Path) -> dict[str, dict]:
     Durable on purpose: a DONE row is not evidence of review, and a crash
     between closing and judging must not become an accidental approval.
     """
-    state: dict[str, dict] = {}
-    cleared = {}
-    for event in _read_ndjson(barrier_path(repo), "review barriers"):
-        task = event.get("task")
-        if not task:
-            continue
-        if event.get("event") == "barrier_raised":
-            state[task] = event
-        elif event.get("event") == "barrier_cleared":
-            state.pop(task, None)
-            cleared[task] = event
+    state, cleared = _raw_barriers(repo, with_cleared=True)
     # Closure can happen outside the runner or without the hook. Absence of
     # a barrier event must never imply approval of a recovered DONE row.
     entries = _read_ndjson(index_path(repo), "recovery index")
@@ -1911,6 +1930,46 @@ def raise_barrier(repo: Path, task: str, receipt: str, reason: str) -> None:
         return
     _append(barrier_path(repo), {"at": _stamp(), "event": "barrier_raised", "task": task,
                                  "receipt": receipt, "reason": reason, "pid": os.getpid()})
+
+
+def _raw_barriers(repo: Path, with_cleared: bool = False):
+    """Fold the barrier log alone: raised minus cleared, no reconstruction."""
+    state: dict[str, dict] = {}
+    cleared: dict[str, dict] = {}
+    for event in _read_ndjson(barrier_path(repo), "review barriers"):
+        task = event.get("task")
+        if not task:
+            continue
+        if event.get("event") == "barrier_raised":
+            state[task] = event
+        elif event.get("event") == "barrier_cleared":
+            state.pop(task, None)
+            cleared[task] = event
+    return (state, cleared) if with_cleared else state
+
+
+def retire_dispatch_barrier(repo: Path, cfg: dict, task: str, note: str) -> bool:
+    """Retire the barrier a dispatch raised when that dispatch closed nothing.
+
+    Raised before the worker starts, the barrier guards a crash between a DONE
+    commit and its review. If the row is not DONE at HEAD or in the worktree,
+    nothing was closed and there is nothing to review; leaving it would block
+    every later run for a review no judge can ever perform. A DONE row is
+    never retired here: `open_barriers` reconstructs that obligation from the
+    recovery history whatever this record says.
+    """
+    queue_rel = _prefixed(cfg, cfg["queue_file"])
+    for text in (_blob(repo, "HEAD", queue_rel) or "",
+                 (Path(repo) / queue_rel).read_text(encoding="utf-8")):
+        if _parse_queue(text).get(task, {}).get("status") in cfg["done_markers"]:
+            return False
+    barrier = _raw_barriers(repo).get(task)
+    if not barrier:
+        return False
+    _append(barrier_path(repo), {"at": _stamp(), "event": "barrier_cleared", "task": task,
+                                 "by": "runner", "evidence": note,
+                                 "receipt": barrier.get("receipt"), "pid": os.getpid()})
+    return True
 
 
 def clear_barrier(repo: Path, task: str, by: str, evidence_note: str) -> bool:
@@ -1955,6 +2014,63 @@ def lineage_dispatches(repo: Path, task: str, implementation: str) -> list[dict]
             and (e.get("implementation") or entries.get(e.get("receipt"))) == implementation]
 
 
+def lineage_renewals(repo: Path, task: str, implementation: str) -> list[dict]:
+    return [e for e in journal_events(repo) if e.get("event") == "revalidation_renewed"
+            and e.get("task") == task and e.get("implementation") == implementation]
+
+
+def renew_revalidation(repo: Path, cfg: dict, task: str, reason: str) -> dict:
+    """Grant one more revalidation dispatch, once, on evidence, never silently.
+
+    Only for the case the protocol itself produced: the single dispatch ran
+    the canonical oracle to a PASS and the gate then refused the closure. A
+    dispatch whose oracle failed, a task that closed, or a lineage that was
+    already renewed is refused. The operator's reason is journalled with the
+    grant; there is no flag that grants without one.
+    """
+    repo = Path(repo)
+    if not reason or not reason.strip():
+        raise RecoveryError("renewal needs --reason stating why the gate refused a passing closure")
+    receipt = receipt_for(repo, cfg, task)
+    if receipt is None:
+        raise RecoveryError(f"no valid recovery receipt for {task}")
+    implementation = receipt["implementation"]["commit"]
+    dispatches = lineage_dispatches(repo, task, implementation)
+    renewals = lineage_renewals(repo, task, implementation)
+    if len(dispatches) != 1 or renewals:
+        raise RecoveryError(
+            f"renewal is granted once per implementation lineage: {len(dispatches)} dispatch(es), "
+            f"{len(renewals)} renewal(s) already"
+        )
+    events = journal_events(repo)
+    start = next(i for i, e in enumerate(events) if e == dispatches[0])
+    window = events[start:]
+    if any(e.get("event") == "task_done" and e.get("task") == task for e in window):
+        raise RecoveryError(f"{task} closed after its revalidation dispatch; nothing to renew")
+    ends = [e for e in window if e.get("event") == "task_end" and e.get("task") == task]
+    if not ends or ends[-1].get("outcome") != "not_done":
+        raise RecoveryError("the revalidation dispatch has not ended not_done")
+    if not any(e.get("event") == "run_end" for e in window):
+        raise RecoveryError("the run that dispatched the revalidation is still open")
+    passes = [e for e in window if e.get("event") == "acceptance" and e.get("result") == "PASS"
+              and e.get("cmd") == cfg["verify_cmd"]]
+    if not passes:
+        raise RecoveryError(
+            "the revalidation dispatch recorded no PASS from the canonical oracle; a failed "
+            "verification is the task's own result and is not renewed"
+        )
+    queue = repo / receipt["scope"]["queue_file"]
+    status = _parse_queue(queue.read_text(encoding="utf-8")).get(task, {}).get("status")
+    if status in cfg["done_markers"]:
+        raise RecoveryError(f"{task} is DONE; nothing to renew")
+    grant = {"event": "revalidation_renewed", "task": task, "implementation": implementation,
+             "receipt": receipt["sha256"], "reason": reason.strip(),
+             "after_dispatch": dispatches[0].get("at"), "oracle_pass_at": passes[-1].get("at"),
+             "pid": os.getpid()}
+    _journal(repo, grant)
+    return grant
+
+
 def revalidation_budget(repo: Path, cfg: dict, task: str, receipt: dict) -> dict:
     """One dispatch, named and counted — never a fresh attempt budget.
 
@@ -1977,7 +2093,7 @@ def revalidation_budget(repo: Path, cfg: dict, task: str, receipt: dict) -> dict
         "prior_attempts": len(prior),
         "prior_outcome": ends[-1].get("outcome") if ends else None,
         "prior_signature": ends[-1].get("signature") if ends else None,
-        "allowed": 1,
+        "allowed": 1 + len(lineage_renewals(repo, task, receipt["implementation"]["commit"])),
         "used": len(used),
     }
 
