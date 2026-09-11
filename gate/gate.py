@@ -3192,15 +3192,37 @@ def _cmd_review_task_locked(args, repo) -> None:
     if not args.task:
         die("review-task needs --task")
     barriers = recovery.open_barriers(repo)
-    if args.task not in barriers:
-        print(f"GATE: {args.task} has no open review barrier.")
+    receipt = None
+    if args.task in barriers:
+        receipt = recovery.receipt_for(repo, cfg, args.task)
+        if receipt is None:
+            die(f"no valid recovery receipt for {args.task}; nothing to review against")
+    elif not (args.base and args.closure):
+        print(
+            f"GATE: {args.task} has no open review barrier. To review an ordinary DONE "
+            "task whose judge was skipped, name its commits: --base <sha before the "
+            "task> --closure <its closing commit>."
+        )
         return
-    receipt = recovery.receipt_for(repo, cfg, args.task)
-    if receipt is None:
-        die(f"no valid recovery receipt for {args.task}; nothing to review against")
     jcfg = sub_cfg(cfg, "judge")
     if not jcfg.get("enabled"):
         die("judge.enabled is false; independent review is required.")
+    head = git(repo, "rev-parse", "HEAD").strip()
+    base = closure = None
+    commits: list[str] = []
+    if receipt is None:
+        # An ordinary task: the review names exactly its commits. Later tasks
+        # may already sit on top, so the range is pinned, not "since base".
+        base = git(repo, "rev-parse", "--verify", f"{args.base}^{{commit}}").strip()
+        closure = git(repo, "rev-parse", "--verify", f"{args.closure}^{{commit}}").strip()
+        if subprocess.run(["git", "merge-base", "--is-ancestor", closure, head],
+                          cwd=str(repo)).returncode != 0:
+            die("closure must be an ancestor of HEAD")
+        commits = [s for s in git(repo, "rev-list", f"{base}..{closure}").split() if s]
+        if not commits:
+            die(f"no commits in {base[:10]}..{closure[:10]}")
+        if args.task not in newly_done(repo, cfg, base, closure):
+            die(f"{args.task} does not flip to DONE between {base[:10]} and {closure[:10]}")
     run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-review"
     run_dir = repo / GATE_DIR / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -3209,8 +3231,20 @@ def _cmd_review_task_locked(args, repo) -> None:
         cfg = execution.bind(cfg, policy, args.task)
     except (execution.PolicyError, KeyError) as exc:
         die(f"execution profile for {args.task} is not locked: {exc}")
-    head = git(repo, "rev-parse", "HEAD").strip()
     text = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
+    if receipt is None:
+        journal(repo, {"event": "review_requested", "task": args.task, "base": base,
+                       "closure": closure, "commits": commits, "pid": os.getpid()})
+        info = judge_task(
+            repo, cfg, run_id, run_dir, args.task, head,
+            parse_task_files(text).get(args.task) or [],
+            "", parse_task_workers(text).get(args.task),
+            extra_commits=commits,
+        )
+        if info["final"] == "pass":
+            print(f"GATE: {args.task} reviewed: pass.")
+            return
+        die(f"{args.task} review did not pass: {info['final']} ({info['reason']})", code=3)
     info = judge_task(
         repo, cfg, run_id, run_dir, args.task, receipt["implementation"]["parent"],
         parse_task_files(text).get(args.task) or receipt["scope"]["declared_files"],
@@ -3299,7 +3333,7 @@ def main() -> None:
             ("--requirement-mode", "str"),
             ("--dry-run", "store_true"),
         ]),
-        ("review-task", cmd_review_task, [("--task", "str")]),
+        ("review-task", cmd_review_task, [("--task", "str"), ("--base", "str"), ("--closure", "str")]),
         ("renew-revalidation", cmd_renew_revalidation, [("--task", "str"), ("--reason", "str")]),
         ("lock-execution", cmd_lock_execution, [("--reason", "str")]),
         ("usage", cmd_usage, []),

@@ -639,13 +639,13 @@ class RecoveredRunTests(RecoveryTestCase):
                                force=True, **over)
 
     def worker(self, env, prompts: list[str], close: bool = True, verify_only: bool = False,
-               tools: list[str] | None = None):
+               tools: list[str] | None = None, judge_output: str | None = None):
         def fake_spawn(repo_arg, cfg, tool, prompt, prompt_file, **kwargs):
             prompts.append(prompt)
             if tools is not None:
                 tools.append(tool)
             if kwargs.get("extra"):  # the judge, not the worker
-                return self.gate.WorkerResult(0, JUDGE_JSON), None
+                return self.gate.WorkerResult(0, judge_output or JUDGE_JSON), None
             if verify_only:
                 text = env.queue.read_text(encoding="utf-8")
                 row = recovery.queue_row(text, TASK)
@@ -678,10 +678,11 @@ class RecoveredRunTests(RecoveryTestCase):
         return fake_spawn
 
     def run_gate(self, env, prompts, close: bool = True, verify_only: bool = False,
-                 tools: list[str] | None = None, **over):
+                 tools: list[str] | None = None, judge_output: str | None = None, **over):
         with mock.patch.object(self.gate, "resolve_tool", side_effect=lambda name: name), \
                 mock.patch.object(self.gate, "spawn_worker",
-                                  side_effect=self.worker(env, prompts, close, verify_only, tools)), \
+                                  side_effect=self.worker(env, prompts, close, verify_only, tools,
+                                                          judge_output)), \
                 contextlib.redirect_stdout(io.StringIO()) as out, \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             code = 0
@@ -1691,6 +1692,49 @@ class ClosureRefusalRegressionTests(RecoveredRunTests):
         self.assertEqual(code, 0, report)
         with self.assertRaisesRegex(recovery.RecoveryError, "closed after"):
             recovery.renew_revalidation(closed.repo, self.cfg(closed), TASK, "already done")
+
+
+class SkippedReviewTests(RecoveredRunTests):
+    """A judge that ran out of budget leaves an ordinary task DONE and
+    unreviewed; review-task can name its commits and review them later."""
+
+    def test_review_task_reviews_an_ordinary_task_by_commit_range(self) -> None:
+        env = build(self.root, status="TODO", judge=self.JUDGE_ON)
+        base = git(env, "rev-parse", "HEAD")
+        # The judge ran out of budget mid-review: no JSON, review skipped, task DONE.
+        code, report = self.run_gate(env, [], judge_output="Reached maximum budget ($5)")
+        self.assertEqual(code, 0, report)
+        self.assertIn("judge_skipped", [e["event"] for e in recovery.journal_events(env.repo)])
+        closure = git(env, "rev-parse", "HEAD")
+        # Later work already sits on top; the review must still name only PRA-06's commits.
+        write(env.proj / "src" / "later.py", "later = 1\n")
+        git(env, "add", "src/later.py")
+        git(env, "commit", "-q", "-m", "unrelated later commit")
+        prompts: list[str] = []
+        with mock.patch.object(self.gate, "resolve_tool", side_effect=lambda name: name), \
+                mock.patch.object(self.gate, "spawn_worker", side_effect=self.worker(env, prompts)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.gate.cmd_review_task(SimpleNamespace(repo=str(env.repo), task=TASK,
+                                                      base=base, closure=closure))
+        self.assertIn("reviewed: pass", out.getvalue())
+        judged = [p for p in prompts if "acceptance judge" in p]
+        self.assertEqual(len(judged), 1)
+        self.assertIn(closure[:10], judged[0])
+        listed = judged[0].split("Commits of this task since ")[1].split(":", 1)[1].split(".")[0]
+        self.assertNotIn(git(env, "rev-parse", "HEAD")[:10], listed)
+        self.assertIn(closure[:10], listed)
+        verdicts = [e for e in recovery.journal_events(env.repo) if e["event"] == "judge_verdict"]
+        self.assertEqual([v["task"] for v in verdicts], [TASK])
+        self.assertTrue(verdicts[-1]["passed"])
+
+    def test_review_task_refuses_a_range_that_does_not_close_the_task(self) -> None:
+        env = build(self.root, status="TODO", judge=self.JUDGE_ON)
+        base = git(env, "rev-parse", "HEAD")
+        with contextlib.redirect_stderr(io.StringIO()) as err, contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.gate.cmd_review_task(SimpleNamespace(repo=str(env.repo), task=TASK,
+                                                          base=base, closure=base))
+        self.assertIn("no commits", err.getvalue())
 
 
 if __name__ == "__main__":
