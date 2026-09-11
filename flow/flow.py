@@ -7,6 +7,7 @@ Thin dispatcher; the machinery lives elsewhere and is not duplicated here:
   home          print the checkout directory (gate scripts live in <home>/gate)
   audit         read-only tree audit                    -> flow/audit.py
   admit | doctor | run | verify | usage | install-hook | check-commit | audit-gate
+  recover-task | review-task
                 passthrough                             -> gate/gate.py
 
 Usage:
@@ -249,7 +250,7 @@ def main() -> None:
             die(f"missing {AUDIT}")
         sys.exit(run_py(AUDIT, rest or ["."]))
     if cmd in ("admit", "doctor", "run", "verify", "usage", "lock-execution", "install-hook",
-               "check-commit"):
+               "check-commit", "recover-task", "review-task"):
         sys.exit(run_py(GATE, [cmd, *rest]))
     if cmd == "audit-gate":  # gate.py's history audit, distinct from tree audit
         sys.exit(run_py(GATE, ["audit", *rest]))

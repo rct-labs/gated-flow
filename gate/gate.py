@@ -21,6 +21,9 @@ Subcommands
   verify        slow gate: run the acceptance command, record a verdict
   audit         re-derive the structural verdict over the last N commits
   admit         sweet-spot admission report for every TODO task in the queue
+  recover-task  revalidate a stopped claim's implementation, return its row to
+                TODO, and record the receipt Gate 1 needs (docs/recovery.md)
+  review-task   independently review a recovered task with persistent budgets
   usage         probe every worker / judge CLI now; bench the quota-dead ones
   doctor        report what is configured and whether it is usable
   run           unattended loop: probe → dispatch → verify → judge → revise
@@ -32,6 +35,7 @@ import argparse
 import fnmatch
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -40,6 +44,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import execution
+import recovery
 
 GATE_DIR = ".gate"
 CONFIG_NAME = "config.json"
@@ -679,7 +684,7 @@ def write_verdict(repo: Path, payload: dict) -> None:
     p = verdict_path(repo)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
     os.replace(tmp, p)
 
 
@@ -813,9 +818,7 @@ def cmd_check_commit(args) -> None:
     repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
 
-    staged = [
-        p for p in git(repo, "diff", "--cached", "--name-only").splitlines() if p.strip()
-    ]
+    staged = recovery.git_paths(repo, "diff", "--cached", "--name-only", "-z")
     if not staged:
         ok("no staged changes")
         return
@@ -858,16 +861,33 @@ def cmd_check_commit(args) -> None:
     code_paths = [
         p for p in staged if not matches_any(project_rel(cfg, p), cfg["doc_only_globs"])
     ]
-    if not code_paths:
-        fail(
-            f"fake completion — task(s) {', '.join(flipped)} flipped to DONE "
-            f"but the commit touches only documentation.",
-            "Staged paths:\n  "
-            + "\n  ".join(staged)
-            + "\n\nThis is the fake-completion pattern (measured at ~60% of tasks in the\n"
-            "orchestrator this gate replaced).\n"
-            "A task is done when the code changed, not when the queue says so.",
-        )
+    recovered = None
+    recovery_history = any(e.get("task") in flipped for e in
+                           recovery._read_ndjson(recovery.index_path(repo), "recovery index"))
+    if not code_paths or recovery_history:
+        # One exception, and it carries its own proof: a task whose
+        # implementation is already in history, recovered by `recover-task`,
+        # whose receipt is bound to those declared blobs and to a fresh PASS
+        # from the unchanged canonical oracle (docs/recovery.md). Everything
+        # below still runs — this replaces no other gate.
+        allowance = recovery.done_allowance(repo, cfg, flipped, staged)
+        if not allowance["allowed"]:
+            fail(
+                f"fake completion — task(s) {', '.join(flipped)} flipped to DONE "
+                f"but the commit touches only documentation.",
+                "Staged paths:\n  "
+                + "\n  ".join(staged)
+                + "\n\nThis is the fake-completion pattern (measured at ~60% of tasks in the\n"
+                "orchestrator this gate replaced).\n"
+                "A task is done when the code changed, not when the queue says so.\n"
+                f"\nNo supported recovery covers this commit: {allowance['detail']}",
+            )
+        recovered = allowance
+        # Record what this commit is allowed on, bound to the commit it is
+        # about to become. Nothing later may call a queue-only DONE verified
+        # on the strength of a recovery receipt alone.
+        recovery.record_completion(repo, cfg, flipped[0], allowance)
+        print(f"GATE: {allowance['detail']}")
 
     # --- Gate 2: frozen paths must not move.
     frozen = cfg.get("frozen_globs") or []
@@ -911,6 +931,12 @@ def cmd_check_commit(args) -> None:
                     "command is the fact. Fix whichever is wrong.",
                 )
 
+    if recovered:
+        ok(
+            f"task(s) {', '.join(flipped)} → DONE on recovery receipt "
+            f"{recovered['receipt'][:10]} and a fresh PASS verdict"
+        )
+        return
     ok(
         f"task(s) {', '.join(flipped)} → DONE with {len(code_paths)} code path(s) "
         f"and a fresh PASS verdict"
@@ -932,6 +958,16 @@ def cmd_verify(args) -> None:
 
 
 def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None) -> dict:
+    # Invalidate even if monitor startup, configuration or initial capture fails.
+    write_verdict(repo, {"result": "RUNNING", "cmd": cmd or cfg["verify_cmd"], "at_epoch": time.time()})
+    monitor = recovery.InputMonitor(repo, cfg).start()
+    try:
+        return _run_acceptance_monitored(repo, cfg, cmd, monitor)
+    finally:
+        monitor.finish()
+
+
+def _run_acceptance_monitored(repo: Path, cfg: dict, cmd, monitor) -> dict:
     """Run the acceptance command, write the verdict, return it. Shared by
     `verify` and by the runner's own re-check after a judge revision."""
     cmd = cmd or cfg["verify_cmd"]
@@ -941,16 +977,56 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None) -> dict:
 
     print(f"GATE: running acceptance command in {workdir}: {cmd}")
     started = time.time()
-    proc = subprocess.run(
-        cmd,
-        cwd=str(workdir),
-        shell=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=cfg["verify_timeout_s"],
-    )
+    # What the oracle is about to run over, captured before it starts. The
+    # capture doubles as the invalidation of the previous verdict: from here
+    # on there is no PASS on record, so a run that times out, is interrupted,
+    # or dies cannot leave an older success standing as evidence.
+    write_verdict(repo, {"result": "RUNNING", "cmd": cmd, "at_epoch": started})
+    inputs_before = recovery.acceptance_inputs(repo, cfg)
+
+    def record(payload: dict) -> dict:
+        """Write the verdict and say so in the append-only journal.
+
+        verdict.json is local, unsigned and writable; on its own it is a claim.
+        The journal line is what the gate cross-checks before it accepts a
+        completion that carries no code of its own, so editing one file is no
+        longer enough to invent an acceptance run."""
+        write_verdict(repo, payload)
+        journal(repo, {"event": "acceptance", "result": payload["result"],
+                       "cmd": payload["cmd"], "count": payload.get("count"),
+                       "at_epoch": payload["at_epoch"], "head": payload.get("head"),
+                       "verdict_digest": recovery.digest(payload), "pid": os.getpid()})
+        return payload
+
+    unfinished = {
+        "cmd": cmd, "count": None, "exit_code": None, "elapsed_s": None,
+        "at_epoch": time.time(), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "head": git(repo, "rev-parse", "HEAD", check=False).strip(),
+        "inputs_before": inputs_before, "inputs_after": None, "recovery": {},
+        "tail": "", "quality": None,
+    }
+    record({**unfinished, "result": "RUNNING"})
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(workdir),
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=cfg["verify_timeout_s"],
+        )
+    except subprocess.TimeoutExpired:
+        record({**unfinished, "result": "TIMEOUT",
+                "elapsed_s": round(time.time() - started, 1),
+                "tail": f"acceptance command exceeded {cfg['verify_timeout_s']}s"})
+        raise
+    except BaseException as exc:
+        record({**unfinished, "result": "INTERRUPTED",
+                "elapsed_s": round(time.time() - started, 1),
+                "tail": f"acceptance command did not finish: {exc!r}"})
+        raise
     elapsed = round(time.time() - started, 1)
     output = (proc.stdout or "") + (proc.stderr or "")
     quality = quality_phase(repo, cfg, "task")
@@ -973,6 +1049,13 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None) -> dict:
     if result == "PASS" and count == 0:
         result = "VACUOUS"
 
+    # The same capture again: a completion is bound to inputs that did not
+    # move while they were being judged.
+    inputs_after = recovery.acceptance_inputs(repo, cfg)
+    drift = sorted(set(recovery.inputs_differences(inputs_before, inputs_after) + monitor.finish()))
+    if drift:
+        result = "INPUTS_CHANGED"
+
     payload = {
         "result": result,
         "exit_code": proc.returncode,
@@ -985,8 +1068,17 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None) -> dict:
         "fingerprint": worktree_fingerprint(repo),
         "tail": tail,
         "quality": quality,
+        # The fingerprint above hashes `git status` output — which paths were
+        # dirty, not what was in them. These two capture the content the oracle
+        # actually ran over: HEAD, every changed or untracked path, and the
+        # configuration. A recovered task's completion commit carries no code
+        # of its own, so it is accepted against these instead.
+        "inputs_before": inputs_before,
+        "inputs_after": inputs_after,
+        "inputs_drift": drift,
+        "recovery": recovery.verdict_binding(repo, cfg),
     }
-    write_verdict(repo, payload)
+    record(payload)
     return payload
 
 
@@ -1017,10 +1109,16 @@ def cmd_audit(args) -> None:
         ]
         subject = git(repo, "log", "-1", "--format=%s", sha).strip()
         if not code:
-            findings.append((sha[:10], ", ".join(flipped), subject, "FAKE_COMPLETION"))
+            # A queue-only DONE is the fake-completion shape. It is legitimate
+            # only when a receipt that still revalidates, an acceptance run
+            # recorded against this very commit, and a cleared review barrier
+            # all line up; anything less stays a finding.
+            explained = recovery.audit_recovered(repo, cfg, sha, flipped)
+            label, clean = explained or ("FAKE_COMPLETION", False)
+            findings.append((sha[:10], ", ".join(flipped), subject, label, clean))
         else:
             findings.append(
-                (sha[:10], ", ".join(flipped), subject, f"ok ({len(code)} code paths)")
+                (sha[:10], ", ".join(flipped), subject, f"ok ({len(code)} code paths)", True)
             )
 
     if not findings:
@@ -1029,13 +1127,13 @@ def cmd_audit(args) -> None:
 
     print(f"GATE audit — DONE transitions in the last {n} commits:\n")
     bad = 0
-    for sha, tasks, subject, verdict in findings:
-        flag = "!!" if verdict == "FAKE_COMPLETION" else "  "
-        if verdict == "FAKE_COMPLETION":
+    for sha, tasks, subject, verdict, clean in findings:
+        flag = "  " if clean else "!!"
+        if not clean:
             bad += 1
         print(f"{flag} {sha}  {tasks:<12}  {verdict}")
         print(f"     {subject}")
-    print(f"\n{bad} fake completion(s) out of {len(findings)} DONE transition(s).")
+    print(f"\n{bad} unproven completion(s) out of {len(findings)} DONE transition(s).")
     if bad:
         raise SystemExit(1)
 
@@ -1235,7 +1333,8 @@ def reject_run_preflight(repo: Path, cfg: dict, run_id: str, stop: str, message:
     (repo / GATE_DIR / f"RUN-REPORT-{run_id}.md").write_text(report, encoding="utf-8")
     journal(repo, {"event": "admit_refused" if stop.startswith("admit_refused:") else "execution_refused",
                    "run": run_id, "reason": message})
-    journal(repo, {"event": "run_end", "run": run_id, "stop": stop})
+    journal(repo, {"event": "run_end", "run": run_id, "stop": stop,
+                   "pid": os.getpid(), "host": platform.node()})
     die(message, code=3)
 
 
@@ -1821,6 +1920,7 @@ def judge_task(
     files: list[str],
     last_worker: str,
     pin: str | None,
+    extra_commits: list[str] | None = None,
 ) -> dict:
     """Judge a closed task and iterate at most judge.max_revisions times.
 
@@ -1831,14 +1931,22 @@ def judge_task(
     """
     jcfg = sub_cfg(cfg, "judge")
     rounds: list[dict] = []
-    revisions = 0
+    history = [e for e in recovery.journal_events(repo) if e.get("task") == tid] if extra_commits else []
+    revisions = sum(e.get("event") == "revision_start" for e in history)
     worker_of_last_commit = last_worker
-    scores: list[int] = []
+    scores: list[int] = [e["score"] for e in history if e.get("event") == "judge_verdict"]
+    exhausted = any(e.get("event") == "judge_escalated" and
+                    ("no progress" in e.get("reason", "") or "revision cap" in e.get("reason", ""))
+                    for e in history)
     while True:
         head = git(repo, "rev-parse", "HEAD").strip()
         commits = [
             s[:10] for s in git(repo, "rev-list", f"{base_head}..{head}", check=False).split()
         ]
+        # A recovered task closes an implementation that landed before this
+        # run started, so it is not in the range above. Name it explicitly:
+        # the reviewer must read the code, not only the commit that closed it.
+        commits = [s[:10] for s in (extra_commits or []) if s[:10] not in commits] + commits
         v = read_verdict(repo) or {}
         prompt = cfg["judge_prompt"].format(
             task=tid,
@@ -1872,7 +1980,10 @@ def judge_task(
         scores.append(verdict["score"])
         journal(repo, {"event": "judge_verdict", "task": tid, "round": len(rounds),
                        "score": verdict["score"], "verdict": verdict["verdict"],
-                       "member": member, "findings": len(verdict["findings"])})
+                       "member": member, "findings": len(verdict["findings"]),
+                       "commit": head,
+                       "receipt": recovery.open_barriers(repo).get(tid, {}).get("receipt"),
+                       "passed": verdict["verdict"] == "pass" or verdict["score"] >= jcfg["pass_score"]})
         print(f"  judge ({member}): score {verdict['score']}, {verdict['verdict']}")
         notify(cfg, repo, f"{tid} judged {verdict['score']} ({verdict['verdict']}, {member})",
                format_findings(verdict["findings"]))
@@ -1881,7 +1992,7 @@ def judge_task(
             return {"final": "pass", "reason": "", "rounds": rounds}
         if verdict["verdict"] == "escalate":
             return _escalate(repo, tid, rounds, "judge asked for a human")
-        if revisions >= jcfg["max_revisions"]:
+        if exhausted or revisions >= jcfg["max_revisions"]:
             return _escalate(repo, tid, rounds, f"revision cap {jcfg['max_revisions']} reached")
         if len(scores) >= 2 and scores[-1] - scores[-2] < jcfg["min_gain"]:
             return _escalate(
@@ -2181,6 +2292,20 @@ class CodexTaskSession:
 
 def cmd_run(args) -> None:
     repo = repo_root(Path(args.repo).resolve())
+    try:
+        lock = recovery.EngineLock(repo, "gate run").acquire()
+    except recovery.RecoveryError as exc:
+        die(str(exc), code=3)
+    try:
+        if recovery.pending_transactions(repo):
+            die("incomplete recovery transaction; retry the original recover-task command", code=3)
+        _cmd_run_locked(args)
+    finally:
+        lock.release()
+
+
+def _cmd_run_locked(args) -> None:
+    repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
     base_cfg = cfg
     projdir = repo / (cfg.get("project_prefix") or "")
@@ -2200,6 +2325,18 @@ def cmd_run(args) -> None:
         )
     if not qpath.exists():
         die(f"queue not found: {qpath}")
+    # A recovered task owes an independent review, and a DONE row is not
+    # evidence that it got one. The barrier outlives this process.
+    barriers = recovery.open_barriers(repo)
+    if barriers:
+        first = sorted(barriers)[0]
+        journal(repo, {"event": "review_barrier", "run": run_id, "task": first,
+                       "reason": barriers[first].get("reason")})
+        die(
+            f"{first} is closed but unreviewed ({barriers[first].get('reason')}). "
+            f"Run: gate.py review-task --repo {repo} --task {first}",
+            code=3,
+        )
 
     initial_text = qpath.read_text(encoding="utf-8")
     initial_tasks = parse_queue(initial_text)
@@ -2242,7 +2379,10 @@ def cmd_run(args) -> None:
     journal(
         repo,
         {"event": "run_start", "run": run_id, "workers": workers, "pins": pins,
-         "judge": bool(jcfg.get("enabled"))},
+         "judge": bool(jcfg.get("enabled")),
+         # Who is running. A later recovery has to name a stopped owner, and
+         # an unrecorded owner is one the operator has to observe by hand.
+         "pid": os.getpid(), "host": platform.node()},
     )
 
     # Probe before spending: every candidate CLI once, so a quota-dead worker
@@ -2250,7 +2390,6 @@ def cmd_run(args) -> None:
     run_dir = repo / GATE_DIR / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "execution.json").write_text(json.dumps(locked, indent=2) + "\n", encoding="utf-8")
-
     results: list[dict] = []
     stop_reason = "budget"
     sessions = CodexTaskSession(repo, cfg, run_dir)
@@ -2327,16 +2466,47 @@ def cmd_run(args) -> None:
 
         print(f"\nGATE: task {tid} ({slot + 1}/{max_tasks})")
         head_before = git(repo, "rev-parse", "HEAD").strip()
-        attempts = 0
+        recovered = recovery.receipt_for(repo, cfg, tid)
+        if recovered is None and any(e.get("task") == tid for e in
+                                     recovery._read_ndjson(recovery.index_path(repo), "recovery index")):
+            stop_reason = f"recovery_invalid:{tid}"
+            print(f"GATE: {tid} has recovery history but no valid receipt; refusing ordinary dispatch")
+            break
+        attempt_cap = cfg["max_attempts_per_task"]
+        budget = None
+        if recovered:
+            # A recovery does not hand back a fresh attempt budget. It grants
+            # exactly one recorded revalidation dispatch on top of the attempts
+            # the task already spent, and only once per receipt.
+            budget = recovery.revalidation_budget(repo, cfg, tid, recovered)
+            if budget["used"] >= budget["allowed"]:
+                stop_reason = f"revalidation_exhausted:{tid}"
+                journal(repo, {"event": "revalidation_refused", "task": tid, **budget})
+                print(
+                    f"GATE: {tid} already spent its one revalidation dispatch "
+                    f"(receipt {recovered['sha256'][:10]}) — stopping."
+                )
+                break
+            attempt_cap = budget["prior_attempts"] + budget["allowed"]
+            print(
+                f"  {tid} carries recovery receipt {recovered['sha256'][:10]} for "
+                f"implementation {recovered['implementation']['commit'][:10]}; "
+                f"{budget['prior_attempts']} prior attempt(s) kept, "
+                f"{budget['allowed']} revalidation dispatch allowed"
+            )
+        # A recovered task carries its spent attempts and its last failure
+        # signature forward: the original limit still bounds it, and a repeat
+        # of the same failure is still no progress.
+        attempts = budget["prior_attempts"] if budget else 0
         dispatches = 0
         outcome = "unknown"
-        last_sig = None
+        last_sig = budget["prior_signature"] if budget else None
         last_worker = ""
         session_decision = {"mode": "off", "reason": "not_dispatched", "task": tid}
         session_evidence: dict = {}
         session_returncode, session_started, session_head = -1, time.time(), ""
 
-        while attempts < cfg["max_attempts_per_task"]:
+        while attempts < attempt_cap:
             attempt_queue_text = qpath.read_text(encoding="utf-8")
             attempt_tasks = parse_queue(attempt_queue_text)
             attempt_status = attempt_tasks.get(tid, {}).get("status", "<missing>")
@@ -2389,12 +2559,27 @@ def cmd_run(args) -> None:
                 else (f"fallback from {pin}" if pin else "run-wide")
             )
             print(f"  attempt {attempts + 1} via {worker} [{how}] … (live log: {logp})")
+            if recovered:
+                budget = recovery.revalidation_budget(repo, cfg, tid, recovered)
+                if budget["used"] >= budget["allowed"]:
+                    outcome = "revalidation_exhausted"
+                    break
+                # Spend the one revalidation dispatch before the worker starts,
+                # and raise the review barrier before it can close anything: a
+                # crash between here and the judge must not read as approval.
+                recovery.record_revalidation_dispatch(repo, tid, recovered, budget)
+                recovery.raise_barrier(
+                    repo, tid, recovered["sha256"],
+                    f"recovered implementation {recovered['implementation']['commit'][:10]} "
+                    "closed without a recorded judge pass",
+                )
             journal(
                 repo,
                 {
                     "event": "attempt_start",
                     "task": tid,
                     "worker": worker,
+                    "pid": os.getpid(),
                     "pin": pin,
                     "pinned": bool(pin) and worker == pin,
                     "attempt": attempts + 1,
@@ -2641,9 +2826,33 @@ def cmd_run(args) -> None:
 
         judge_info: dict | None = None
         if outcome == "done" and jcfg.get("enabled"):
+            # Named only when there is something to add, so an ordinary task's
+            # review is the same call it has always been.
+            extra = recovery.judge_extra_commits(
+                repo, recovered, git(repo, "rev-parse", "HEAD").strip()
+            )
             judge_info = judge_task(
                 repo, cfg, run_id, run_dir, tid, head_before, task_files,
-                last_worker, pin,
+                last_worker, pin, **({"extra_commits": extra} if extra else {}),
+            )
+        # Resumed code is still unreviewed code. A recovered task closes on an
+        # implementation no judge has seen, so a disabled, benched or
+        # unparsable judge is escalated here instead of passing silently.
+        if outcome == "done" and recovered and (
+            judge_info is None or judge_info["final"] == "skipped"
+        ):
+            judge_info = _escalate(
+                repo, tid, (judge_info or {}).get("rounds", []),
+                "recovered task needs an independent review: "
+                + ("judge disabled" if judge_info is None else judge_info["reason"]),
+            )
+        if recovered and judge_info and judge_info["final"] == "pass":
+            rounds = judge_info["rounds"]
+            recovery.clear_barrier(
+                repo, tid, "judge",
+                f"round {len(rounds)} scored {rounds[-1]['score']} "
+                f"({rounds[-1]['member']}) on {recovered['implementation']['commit'][:10]}"
+                if rounds else "judge passed",
             )
 
         session_info = sessions.finish(session_decision, session_evidence, outcome, judge_info,
@@ -2665,7 +2874,8 @@ def cmd_run(args) -> None:
             }
         )
         journal(repo, {"event": "task_end", "task": tid, "outcome": outcome,
-                       "judge": (judge_info or {}).get("final")})
+                       "judge": (judge_info or {}).get("final"),
+                       "attempts": attempts, "signature": last_sig})
         if outcome != "done":
             notify(
                 cfg,
@@ -2689,7 +2899,8 @@ def cmd_run(args) -> None:
     (repo / GATE_DIR / f"RUN-REPORT-{run_id}.md").write_text(report, encoding="utf-8")
     latest = repo / GATE_DIR / "RUN-REPORT.md"
     latest.write_text(report, encoding="utf-8")
-    journal(repo, {"event": "run_end", "run": run_id, "stop": stop_reason})
+    journal(repo, {"event": "run_end", "run": run_id, "stop": stop_reason,
+                   "pid": os.getpid(), "host": platform.node()})
 
     print("\n" + report)
 
@@ -2864,6 +3075,134 @@ def render_report(
     return "\n".join(lines) + "\n"
 
 
+def cmd_recover_task(args) -> None:
+    """Return one stopped claim to TODO, with the evidence that it is one.
+
+    Refuses everything it cannot prove: a live claim, an open run, a stop that
+    named another task, an implementation that is not an ancestor, changed
+    declared scope or content, staged or dirty declared source. It never
+    writes DONE, never commits, and never touches another row.
+    """
+    repo = repo_root(Path(args.repo).resolve())
+    cfg = load_config(repo)
+    missing = [
+        flag for flag, value in (
+            ("--task", args.task),
+            ("--implementation", args.implementation),
+            ("--run", args.run),
+            ("--reason", args.reason),
+        ) if not value
+    ]
+    if missing:
+        die("recover-task needs " + ", ".join(missing))
+    stopped_pid = None
+    if args.stopped_pid:
+        try:
+            stopped_pid = int(args.stopped_pid)
+        except ValueError:
+            die("--stopped-pid must be the numeric pid of the runner you observed stopped")
+    evidence_args = {
+        "stopped_pid": stopped_pid,
+        "requirement_mode": args.requirement_mode or "headings",
+        "requirement_path": args.requirement,
+    }
+    try:
+        if args.dry_run:
+            proposal = recovery.plan(
+                repo, cfg, args.task, args.implementation, args.run, args.reason,
+                **evidence_args
+            )
+            print(json.dumps(proposal, indent=2, ensure_ascii=False))
+            print(
+                f"GATE: {args.task} is recoverable "
+                f"({proposal['queue_transition']['from']} → {proposal['queue_transition']['to']}). "
+                "Nothing was written."
+            )
+            return
+        receipt = recovery.recover(
+            repo, cfg, args.task, args.implementation, args.run, args.reason,
+            args.note or "", **evidence_args
+        )
+    except recovery.RecoveryError as exc:
+        journal(repo, {"event": "recovery_refused", "task": args.task,
+                       "implementation": args.implementation, "run": args.run,
+                       "reason": str(exc), "dry_run": bool(args.dry_run)})
+        die(f"recovery refused: {exc}")
+    queue = receipt["scope"]["queue_file"]
+    print(
+        f"GATE: {args.task} {receipt['queue_transition']['from']} → "
+        f"{receipt['queue_transition']['to']} in {queue} (worktree only, not committed)"
+    )
+    print(f"  implementation : {receipt['implementation']['commit']}")
+    print(f"  declared       : {', '.join(receipt['scope']['declared_files'])}")
+    print(f"  requirement    : {', '.join(receipt['requirement']['sources']) or '(row only)'}"
+          f" [{receipt['requirement']['mode']}]")
+    print(f"  stopped owner  : pid {receipt['ownership']['owner_pid']} "
+          f"({receipt['ownership']['owner_source']}), census "
+          f"{receipt['ownership']['census_size']} process(es)")
+    print(f"  receipt        : {recovery.receipt_path(repo, receipt['sha256'])}")
+    print(
+        "  next           : commit that one row, then run the task normally. "
+        "Gate 1 will accept its queue-only DONE only after a fresh PASS from "
+        f"{cfg['verify_cmd']!r} over these same blobs."
+    )
+
+
+def cmd_review_task(args) -> None:
+    """Independent review only, under the same lock and persistent budgets."""
+    repo = repo_root(Path(args.repo).resolve())
+    try:
+        lock = recovery.EngineLock(repo, "review task").acquire()
+    except recovery.RecoveryError as exc:
+        die(str(exc), code=3)
+    try:
+        _cmd_review_task_locked(args, repo)
+    finally:
+        lock.release()
+
+
+def _cmd_review_task_locked(args, repo) -> None:
+    cfg = load_config(repo)
+    if not args.task:
+        die("review-task needs --task")
+    barriers = recovery.open_barriers(repo)
+    if args.task not in barriers:
+        print(f"GATE: {args.task} has no open review barrier.")
+        return
+    receipt = recovery.receipt_for(repo, cfg, args.task)
+    if receipt is None:
+        die(f"no valid recovery receipt for {args.task}; nothing to review against")
+    jcfg = sub_cfg(cfg, "judge")
+    if not jcfg.get("enabled"):
+        die("judge.enabled is false; independent review is required.")
+    run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-review"
+    run_dir = repo / GATE_DIR / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        policy = execution.read_lock(repo)["tasks"][args.task]
+        cfg = execution.bind(cfg, policy, args.task)
+    except (execution.PolicyError, KeyError) as exc:
+        die(f"execution profile for {args.task} is not locked: {exc}")
+    head = git(repo, "rev-parse", "HEAD").strip()
+    text = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
+    info = judge_task(
+        repo, cfg, run_id, run_dir, args.task, receipt["implementation"]["parent"],
+        parse_task_files(text).get(args.task) or receipt["scope"]["declared_files"],
+        "", parse_task_workers(text).get(args.task),
+        extra_commits=recovery.judge_extra_commits(repo, receipt, head),
+    )
+    if info["final"] == "pass":
+        rounds = info["rounds"]
+        recovery.clear_barrier(
+            repo, args.task, "judge",
+            f"round {len(rounds)} scored {rounds[-1]['score']} ({rounds[-1]['member']})"
+            if rounds else "judge passed",
+        )
+        print(f"GATE: {args.task} reviewed and cleared.")
+        return
+    die(f"{args.task} remains unreviewed: {info['final']} ({info['reason']})", code=3)
+
+
 def cmd_doctor(args) -> None:
     repo = repo_root(Path(args.repo).resolve())
     print(f"repo            : {repo}")
@@ -2905,6 +3244,13 @@ def cmd_doctor(args) -> None:
         print("last verdict    : none")
 
 
+# recovery.py needs this module's queue parsing, path resolution and journal,
+# and this module is loaded under several names (__main__ from the hook, a
+# throwaway name from importlib in the tests). Handing over the namespace binds
+# the copy that is actually running instead of importing a second one.
+recovery.bind(globals())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="gate.py", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -2916,6 +3262,18 @@ def main() -> None:
         ("verify", cmd_verify, [("--cmd", "str")]),
         ("audit", cmd_audit, [("--last", "int")]),
         ("admit", cmd_admit, []),
+        ("recover-task", cmd_recover_task, [
+            ("--task", "str"),
+            ("--implementation", "str"),
+            ("--run", "str"),
+            ("--reason", "str"),
+            ("--note", "str"),
+            ("--stopped-pid", "str"),
+            ("--requirement", "str"),
+            ("--requirement-mode", "str"),
+            ("--dry-run", "store_true"),
+        ]),
+        ("review-task", cmd_review_task, [("--task", "str")]),
         ("lock-execution", cmd_lock_execution, [("--reason", "str")]),
         ("usage", cmd_usage, []),
         ("doctor", cmd_doctor, []),
