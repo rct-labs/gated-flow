@@ -271,6 +271,27 @@ audit makes it *visible*, and neither depends on anything a model wrote.
 `frozen_globs` is empty by default; set it to `["tests/*"]` for a refactor package whose
 acceptance is "the existing tests must not move".
 
+`verify_steps` (optional) declares the same oracle as ordered pieces, and is honoured
+only when the pieces joined with ` && ` are byte-for-byte `verify_cmd` — it can split
+the oracle, never redefine it:
+
+```json
+"verify_cmd": "pnpm typecheck && pnpm vitest run",
+"verify_steps": [
+  {"name": "typecheck", "cmd": "pnpm typecheck"},
+  {"name": "tests", "cmd": "pnpm vitest run"}
+]
+```
+
+`verify` then runs the steps in order and stops at the first red one (a failed
+typecheck does not earn a ten-minute test run), recording each step's exit, time and
+tail in the verdict. `verify --step <name>` runs one step per call for shells with a
+hard per-command cap: the verdict stays `PARTIAL` (not accepted by the DONE gate)
+until every step has passed over the *same* inputs — the tree is captured before and
+after each step and compared to the chain's start, so an edit between steps yields
+`CHAIN_BROKEN` and the chain restarts from the first step. The recorded `cmd` is
+always the canonical `verify_cmd`, so receipts and allowances see one oracle.
+
 `GATE_CONFIG=<path>` points the gate at a repo without writing into it — use it to
 `audit` a project before deciding to install.
 

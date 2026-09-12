@@ -1767,5 +1767,98 @@ class ScopeRequestTests(RecoveredRunTests):
         self.assertIsNone(self.gate.worker_scope_request("| 要你决定 | 是否发布 |"))
 
 
+STEP_OK = f'"{sys.executable}" -c "print(\'typecheck ok\')"'
+STEP_TESTS = f'"{sys.executable}" -c "print(\'2 passed\')"'
+STEP_BAD = f'"{sys.executable}" -c "import sys; print(\'type error\'); sys.exit(1)"'
+
+
+class VerifyStepsTests(RecoveryTestCase):
+    """verify_steps: the canonical oracle in fail-fast, shell-cap-sized pieces."""
+
+    def stepped(self, root, typecheck=STEP_OK):
+        return build(root, status="TODO",
+                     verify_cmd=f"{typecheck} && {STEP_TESTS}",
+                     verify_steps=[{"name": "typecheck", "cmd": typecheck},
+                                   {"name": "tests", "cmd": STEP_TESTS}])
+
+    def verify_args(self, env, step=None):
+        return SimpleNamespace(repo=str(env.repo), cmd=None, step=step)
+
+    def test_full_run_executes_steps_in_order_and_records_them(self) -> None:
+        env = self.stepped(self.root)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.gate.cmd_verify(self.verify_args(env))
+        verdict = self.gate.read_verdict(env.repo)
+        self.assertEqual(verdict["result"], "PASS")
+        self.assertEqual(verdict["cmd"], self.cfg(env)["verify_cmd"])
+        self.assertEqual([s["name"] for s in verdict["steps"]], ["typecheck", "tests"])
+        self.assertEqual(verdict["count"], 2)
+
+    def test_a_red_first_step_skips_the_rest(self) -> None:
+        env = self.stepped(self.root, typecheck=STEP_BAD)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.gate.cmd_verify(self.verify_args(env))
+        verdict = self.gate.read_verdict(env.repo)
+        self.assertEqual(verdict["result"], "FAIL")
+        self.assertEqual([s["name"] for s in verdict["steps"]], ["typecheck"])
+
+    def test_step_chain_is_partial_until_complete_and_bound_to_inputs(self) -> None:
+        env = self.stepped(self.root)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.gate.cmd_verify(self.verify_args(env, step="typecheck"))
+        partial = self.gate.read_verdict(env.repo)
+        self.assertEqual(partial["result"], "PARTIAL")
+        # A partial chain is not a PASS: Gate 3 refuses a DONE on it.
+        write(env.proj / SOURCE, "def feature():\n    return 2  # touched\n")
+        self.stage_done(env)
+        git(env, "add", SOURCE)
+        self.assertIn("PARTIAL", self.blocked(env))
+        git(env, "checkout", "--", SOURCE)
+        git(env, "reset", "-q", "--", env.queue_rel)
+        git(env, "checkout", "--", env.queue_rel)
+
+        # The tree moved between steps: the chain is broken, never silently resumed.
+        write(env.proj / SOURCE, "def feature():\n    return 2  # moved\n")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.gate.cmd_verify(self.verify_args(env, step="tests"))
+        self.assertEqual(self.gate.read_verdict(env.repo)["result"], "CHAIN_BROKEN")
+
+        # Restart on the changed tree: typecheck then tests → PASS with both steps.
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.gate.cmd_verify(self.verify_args(env, step="typecheck"))
+            self.gate.cmd_verify(self.verify_args(env, step="tests"))
+        verdict = self.gate.read_verdict(env.repo)
+        self.assertEqual(verdict["result"], "PASS")
+        self.assertEqual([s["name"] for s in verdict["steps"]], ["typecheck", "tests"])
+        self.assertEqual(verdict["count"], 2)
+        self.assertEqual(verdict["cmd"], self.cfg(env)["verify_cmd"])
+        # The completed chain closes a task like any single-command verdict.
+        self.stage_done(env)
+        git(env, "add", SOURCE)
+        self.assertIn("code path(s)", self.check_commit(env))
+
+    def test_steps_that_do_not_compose_the_canonical_command_are_refused(self) -> None:
+        env = build(self.root, status="TODO", verify_cmd=f"{STEP_OK} && {STEP_TESTS}",
+                    verify_steps=[{"name": "tests", "cmd": STEP_TESTS}])
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                self.gate.cmd_verify(self.verify_args(env))
+        self.assertIn("do not compose the canonical verify_cmd", err.getvalue())
+        self.assertIsNone(self.gate.read_verdict(env.repo))
+
+    def test_an_unknown_or_out_of_order_step_is_refused(self) -> None:
+        env = self.stepped(self.root)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(SystemExit):
+                self.gate.cmd_verify(self.verify_args(env, step="lint"))
+        self.assertIn("unknown verify step", err.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                self.gate.cmd_verify(self.verify_args(env, step="tests"))
+        self.assertEqual(self.gate.read_verdict(env.repo)["result"], "CHAIN_BROKEN")
+
+
 if __name__ == "__main__":
     unittest.main()

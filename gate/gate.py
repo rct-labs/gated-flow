@@ -947,27 +947,83 @@ def cmd_verify(args) -> None:
     """Run the real acceptance command and record what it actually said."""
     repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
-    payload = run_acceptance(repo, cfg, args.cmd or cfg["verify_cmd"])
+    step = getattr(args, "step", None)
+    if step and args.cmd:
+        die("--step runs a declared verify_steps entry; it cannot be combined with --cmd")
+    payload = run_acceptance(repo, cfg, args.cmd or cfg["verify_cmd"], step=step)
+    done = [s["name"] for s in payload.get("steps", []) if s.get("result") == "PASS"]
     print(
         f"GATE: {payload['result']} exit={payload['exit_code']} "
         f"count={payload['count']} in {payload['elapsed_s']}s"
+        + (f" steps={','.join(done)}" if payload.get("steps") else "")
     )
+    if payload["result"] == "PARTIAL":
+        remaining = [s["name"] for s in verify_steps(cfg) if s["name"] not in done]
+        print(f"GATE: partial — next: flow verify --step {remaining[0]}" if remaining else "")
+        return
     if payload["result"] != "PASS":
         print(payload["tail"], file=sys.stderr)
         raise SystemExit(2)
 
 
-def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None) -> dict:
+def verify_steps(cfg: dict) -> list[dict]:
+    """The declared decomposition of verify_cmd, or [] when there is none.
+
+    A decomposition is honoured only when its steps joined with ` && ` are
+    byte-for-byte the canonical verify_cmd: steps split the oracle into
+    fail-fast, shell-cap-sized pieces, they never redefine it.
+    """
+    steps = cfg.get("verify_steps")
+    if not steps:
+        return []
+    if (not isinstance(steps, list) or not all(
+        isinstance(s, dict) and isinstance(s.get("name"), str) and s["name"].strip()
+        and isinstance(s.get("cmd"), str) and s["cmd"].strip() for s in steps
+    )):
+        die("verify_steps must be a list of {name, cmd}")
+    names = [s["name"].strip() for s in steps]
+    if len(set(names)) != len(names):
+        die("verify_steps names must be unique")
+    joined = " && ".join(s["cmd"].strip() for s in steps)
+    if joined != cfg["verify_cmd"].strip():
+        die(
+            "verify_steps do not compose the canonical verify_cmd; refusing to run a "
+            f"different oracle.\n  steps : {joined}\n  canon : {cfg['verify_cmd']}"
+        )
+    return [{"name": s["name"].strip(), "cmd": s["cmd"].strip()} for s in steps]
+
+
+def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, step: str | None = None) -> dict:
+    # A refused verify_steps declaration is a configuration error, not a run:
+    # resolve it before anything on record is invalidated.
+    _acceptance_steps(cfg, cmd or cfg["verify_cmd"], step)
+    # The record a step chain continues from, read before it is invalidated.
+    prior = read_verdict(repo) if step else None
     # Invalidate even if monitor startup, configuration or initial capture fails.
     write_verdict(repo, {"result": "RUNNING", "cmd": cmd or cfg["verify_cmd"], "at_epoch": time.time()})
     monitor = recovery.InputMonitor(repo, cfg).start()
     try:
-        return _run_acceptance_monitored(repo, cfg, cmd, monitor)
+        return _run_acceptance_monitored(repo, cfg, cmd, monitor, step, prior)
     finally:
         monitor.finish()
 
 
-def _run_acceptance_monitored(repo: Path, cfg: dict, cmd, monitor) -> dict:
+def _acceptance_steps(cfg: dict, cmd: str, step: str | None) -> tuple[list[dict], list[dict]]:
+    """(steps to run now, steps already required before them)."""
+    declared = verify_steps(cfg) if cmd == cfg["verify_cmd"] else []
+    if step is None:
+        return (declared or [{"name": "verify", "cmd": cmd}]), []
+    if not declared:
+        die("--step needs verify_steps declared in .gate/config.json")
+    names = [s["name"] for s in declared]
+    if step not in names:
+        die(f"unknown verify step {step!r}; declared: {', '.join(names)}")
+    index = names.index(step)
+    return [declared[index]], declared[:index]
+
+
+def _run_acceptance_monitored(repo: Path, cfg: dict, cmd, monitor, step: str | None = None,
+                              prior: dict | None = None) -> dict:
     """Run the acceptance command, write the verdict, return it. Shared by
     `verify` and by the runner's own re-check after a judge revision."""
     cmd = cmd or cfg["verify_cmd"]
@@ -998,37 +1054,87 @@ def _run_acceptance_monitored(repo: Path, cfg: dict, cmd, monitor) -> dict:
                        "verdict_digest": recovery.digest(payload), "pid": os.getpid()})
         return payload
 
+    to_run, required = _acceptance_steps(cfg, cmd, step)
+    # A step chain: earlier steps must already be on record as PASS over
+    # exactly these inputs, or this call is not a continuation of anything.
+    previous_steps: list[dict] = []
+    chain_start = inputs_before
+    if required:
+        prior = prior or {}
+        prior_steps = {s["name"]: s for s in prior.get("steps", []) if s.get("result") == "PASS"}
+        prior_result = prior.get("result")
+        continuous = (
+            prior.get("cmd") == cmd
+            and prior_result in ("PARTIAL", "PASS")
+            and all(s["name"] in prior_steps for s in required)
+            and not recovery.inputs_differences(prior.get("inputs_after"), inputs_before)
+            and not recovery.inputs_differences(prior.get("inputs_before"), inputs_before)
+        )
+        if not continuous:
+            broken = {
+                "cmd": cmd, "count": None, "exit_code": None, "elapsed_s": 0.0,
+                "at_epoch": time.time(), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "head": git(repo, "rev-parse", "HEAD", check=False).strip(),
+                "inputs_before": inputs_before, "inputs_after": inputs_before, "recovery": {},
+                "steps": [], "tail": (
+                    f"step {step!r} needs {', '.join(s['name'] for s in required)} to have "
+                    "passed over the same inputs first; the tree or the record changed. "
+                    f"Restart from: flow verify --step {required[0]['name']}"
+                ),
+                "quality": None, "result": "CHAIN_BROKEN",
+            }
+            record(broken)
+            return broken
+        previous_steps = [prior_steps[s["name"]] for s in required]
+        chain_start = prior.get("inputs_before")
+
     unfinished = {
         "cmd": cmd, "count": None, "exit_code": None, "elapsed_s": None,
         "at_epoch": time.time(), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "head": git(repo, "rev-parse", "HEAD", check=False).strip(),
-        "inputs_before": inputs_before, "inputs_after": None, "recovery": {},
-        "tail": "", "quality": None,
+        "inputs_before": chain_start, "inputs_after": None, "recovery": {},
+        "steps": previous_steps, "tail": "", "quality": None,
     }
     record({**unfinished, "result": "RUNNING"})
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(workdir),
-            shell=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=cfg["verify_timeout_s"],
-        )
-    except subprocess.TimeoutExpired:
-        record({**unfinished, "result": "TIMEOUT",
-                "elapsed_s": round(time.time() - started, 1),
-                "tail": f"acceptance command exceeded {cfg['verify_timeout_s']}s"})
-        raise
-    except BaseException as exc:
-        record({**unfinished, "result": "INTERRUPTED",
-                "elapsed_s": round(time.time() - started, 1),
-                "tail": f"acceptance command did not finish: {exc!r}"})
-        raise
+    output = ""
+    steps_run: list[dict] = []
+    proc = None
+    for entry in to_run:
+        step_started = time.time()
+        print(f"GATE:   step {entry['name']}: {entry['cmd']}")
+        try:
+            proc = subprocess.run(
+                entry["cmd"],
+                cwd=str(workdir),
+                shell=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=cfg["verify_timeout_s"],
+            )
+        except subprocess.TimeoutExpired:
+            record({**unfinished, "result": "TIMEOUT", "steps": previous_steps + steps_run,
+                    "elapsed_s": round(time.time() - started, 1),
+                    "tail": f"step {entry['name']} exceeded {cfg['verify_timeout_s']}s"})
+            raise
+        except BaseException as exc:
+            record({**unfinished, "result": "INTERRUPTED", "steps": previous_steps + steps_run,
+                    "elapsed_s": round(time.time() - started, 1),
+                    "tail": f"step {entry['name']} did not finish: {exc!r}"})
+            raise
+        step_output = (proc.stdout or "") + (proc.stderr or "")
+        output += step_output
+        steps_run.append({
+            "name": entry["name"], "cmd": entry["cmd"], "exit_code": proc.returncode,
+            "elapsed_s": round(time.time() - step_started, 1),
+            "result": "PASS" if proc.returncode == 0 else "FAIL",
+            "tail": "\n".join(step_output.strip().splitlines()[-8:]),
+        })
+        if proc.returncode != 0:
+            # Fail fast: a red typecheck does not earn a ten-minute test run.
+            break
     elapsed = round(time.time() - started, 1)
-    output = (proc.stdout or "") + (proc.stderr or "")
     quality = quality_phase(repo, cfg, "task")
     if quality is not None:
         output += "\n" + quality["tail"]
@@ -1041,18 +1147,35 @@ def _run_acceptance_monitored(repo: Path, cfg: dict, cmd, monitor) -> dict:
     if m:
         count = int(m.group(1))
 
+    all_steps = previous_steps + steps_run
     result = "PASS" if proc.returncode == 0 else "FAIL"
     if quality is not None and quality["result"] != "PASS":
         result = "FAIL"
 
-    # Non-vacuity: an oracle that asserts nothing is not an oracle.
+    # Non-vacuity: an oracle that asserts nothing is not an oracle. In a step
+    # chain the count comes from whichever step reports one; a chain whose
+    # last step has no count keeps the count seen earlier.
+    if count is None:
+        for earlier in previous_steps:
+            if earlier.get("count") is not None:
+                count = earlier["count"]
     if result == "PASS" and count == 0:
         result = "VACUOUS"
+    declared_names = [s["name"] for s in verify_steps(cfg)] if cmd == cfg["verify_cmd"] else []
+    passed_names = [s["name"] for s in all_steps if s["result"] == "PASS"]
+    if result == "PASS" and declared_names and passed_names != declared_names:
+        # Steps passed so far, but the oracle is not complete: nothing may
+        # close on this until the remaining steps pass over the same inputs.
+        result = "PARTIAL"
+    if steps_run and count is not None:
+        steps_run[-1]["count"] = count
 
     # The same capture again: a completion is bound to inputs that did not
     # move while they were being judged.
     inputs_after = recovery.acceptance_inputs(repo, cfg)
     drift = sorted(set(recovery.inputs_differences(inputs_before, inputs_after) + monitor.finish()))
+    if required:
+        drift = sorted(set(drift + recovery.inputs_differences(chain_start, inputs_after)))
     if drift:
         result = "INPUTS_CHANGED"
 
@@ -1073,9 +1196,10 @@ def _run_acceptance_monitored(repo: Path, cfg: dict, cmd, monitor) -> dict:
         # actually ran over: HEAD, every changed or untracked path, and the
         # configuration. A recovered task's completion commit carries no code
         # of its own, so it is accepted against these instead.
-        "inputs_before": inputs_before,
+        "inputs_before": chain_start,
         "inputs_after": inputs_after,
         "inputs_drift": drift,
+        "steps": all_steps,
         "recovery": recovery.verdict_binding(repo, cfg),
     }
     record(payload)
@@ -3356,7 +3480,7 @@ def main() -> None:
         ("init", cmd_init, [("--force", "store_true")]),
         ("install-hook", cmd_install_hook, [("--force", "store_true")]),
         ("check-commit", cmd_check_commit, []),
-        ("verify", cmd_verify, [("--cmd", "str")]),
+        ("verify", cmd_verify, [("--cmd", "str"), ("--step", "str")]),
         ("audit", cmd_audit, [("--last", "int")]),
         ("admit", cmd_admit, []),
         ("recover-task", cmd_recover_task, [
