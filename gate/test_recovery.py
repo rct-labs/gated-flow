@@ -1737,5 +1737,35 @@ class SkippedReviewTests(RecoveredRunTests):
         self.assertIn("no commits", err.getvalue())
 
 
+class ScopeRequestTests(RecoveredRunTests):
+    """A worker that stops to ask for scope is not retried identically."""
+
+    ASK = ("**结论：PRA-06 需要扩围。**\n\n| 项 | 内容 |\n|---|---|\n"
+           "| 要你决定 | 批准把 `tests/unit/extra.test.ts` 加进 PRA-06 的声明列表（改 files: 注释行） |\n")
+
+    def test_scope_request_stops_after_one_dispatch(self) -> None:
+        env = build(self.root, status="TODO", max_attempts_per_task=2)
+        prompts: list[str] = []
+
+        def asking(repo_arg, cfg, tool, prompt, prompt_file, **kwargs):
+            prompts.append(prompt)
+            return self.gate.WorkerResult(0, self.ASK), None
+
+        with mock.patch.object(self.gate, "resolve_tool", side_effect=lambda name: name), \
+                mock.patch.object(self.gate, "spawn_worker", side_effect=asking), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(SystemExit):
+                self.gate.cmd_run(self.args(env))
+        self.assertEqual(len(prompts), 1, "no identical second dispatch")
+        self.assertIn(f"scope_request:{TASK}", out.getvalue())
+        asked = [e for e in recovery.journal_events(env.repo) if e["event"] == "scope_request"]
+        self.assertEqual(asked[-1]["files"], ["tests/unit/extra.test.ts"])
+
+    def test_an_ordinary_report_with_nothing_to_decide_is_not_a_scope_request(self) -> None:
+        self.assertIsNone(self.gate.worker_scope_request(
+            "| 要你决定 | 无 |\n| 细节 | 改了 files: 里的两个文件 |"))
+        self.assertIsNone(self.gate.worker_scope_request("| 要你决定 | 是否发布 |"))
+
+
 if __name__ == "__main__":
     unittest.main()

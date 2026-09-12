@@ -1418,6 +1418,30 @@ INCOMPLETE_WORK_PATTERNS = (
 )
 
 
+# A worker that ends its turn asking the human for a scope decision — extra
+# declared files, a widened acceptance — has not failed at the work; a second
+# identical dispatch just asks the same question again for another ten
+# minutes. The "要你决定" row of the report format, when it is not 无/None, is
+# that ask; so are the English forms.
+SCOPE_REQUEST_PATTERNS = (
+    re.compile(r"要你决定\s*\|\s*(?!无\b|None\b|—|-|\s*\|)\S", re.IGNORECASE),
+    re.compile(r"\b(?:needs? your decision|awaiting (?:your )?(?:approval|decision))\b", re.IGNORECASE),
+)
+SCOPE_HINT_RE = re.compile(r"扩围|声明(?:文件|列表|范围)|declared files|files:|scope", re.IGNORECASE)
+SCOPE_PATH_RE = re.compile(r"(?<![\w/])(?:src|tests|docs|scripts)/[\w./\[\]()-]+\.[A-Za-z]{1,5}")
+
+
+def worker_scope_request(output: str) -> dict | None:
+    """Detect a worker that stopped to ask for a scope decision, and what for."""
+    if not any(p.search(output) for p in SCOPE_REQUEST_PATTERNS):
+        return None
+    if not SCOPE_HINT_RE.search(output):
+        return None
+    tail = output[-6000:]
+    files = sorted(set(SCOPE_PATH_RE.findall(tail)))
+    return {"files": files}
+
+
 def worker_incomplete_reason(output: str) -> str | None:
     """Detect a one-shot worker returning while its acceptance work is pending."""
     if any(pattern.search(output) for pattern in INCOMPLETE_WORK_PATTERNS):
@@ -2806,6 +2830,18 @@ def _cmd_run_locked(args) -> None:
                 )
                 break
 
+            asked = worker_scope_request(out)
+            if asked:
+                outcome = "scope_request"
+                print(
+                    f"  {worker} stopped to ask for a scope decision"
+                    + (": " + ", ".join(asked["files"]) if asked["files"] else "")
+                    + " — stopping without an identical retry"
+                )
+                journal(repo, {"event": "scope_request", "task": tid, "worker": worker,
+                               "files": asked["files"]})
+                break
+
             dirty_after = non_gate_worktree_state(repo)
             if dirty_after != attempt_worktree:
                 outcome = "worker_left_changes"
@@ -2923,7 +2959,8 @@ def _cmd_run_locked(args) -> None:
     )
 
     needs_human = stop_reason.split(":", 1)[0] in (
-        "judge_escalated", "revision_broke_verify", "needs_approval", "execution_policy", "execution_mismatch"
+        "judge_escalated", "revision_broke_verify", "needs_approval", "execution_policy",
+        "execution_mismatch", "scope_request",
     )
     if any(r["outcome"] != "done" for r in results) or not results or needs_human:
         raise SystemExit(3)
