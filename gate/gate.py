@@ -599,6 +599,9 @@ def task_packet(repo: Path, cfg: dict, text: str, task: str, files: list[str]) -
         "closing: stage only your own changes, flip the row to DONE, commit through "
         "the installed hook. Full-suite runs belong to the runner, not to you.",
     ]
+    spec_line = re.search(r"<!--\s*task:" + re.escape(task) + r"\s+spec:\s*(\S+)\s*-->", text)
+    if spec_line:
+        parts.append(f"spec: {spec_line.group(1)} (read its acceptance for {task} before starting)")
     if acceptance:
         parts.append("acceptance:\n" + acceptance)
     if diff_stat:
