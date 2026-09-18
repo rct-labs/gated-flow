@@ -2723,7 +2723,7 @@ def cmd_review(args) -> None:
     missing = [t for t in tasks if rows.get(t, {}).get("status") not in cfg["done_markers"]]
     if missing:
         die("not DONE in the queue: " + ", ".join(missing))
-    if not sub_cfg(cfg, "judge").get("enabled"):
+    if not sub_cfg(cfg, "judge").get("enabled") and not args.acceptance_only:
         die("judge.enabled is false for this project")
     base = args.base or git(repo, "rev-parse", "HEAD~1").strip()
     run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-review"
@@ -2733,14 +2733,18 @@ def cmd_review(args) -> None:
     files_by_task = {t: parse_task_files(text).get(t) or [] for t in tasks}
     journal(repo, {"event": "run_start", "run": run_id, "workers": [], "pins": {},
                    "judge": True, "mode": "review"})
-    info = review_package(repo, cfg, run_id, run_dir, tasks, base, files_by_task)
     acceptance = None
     stop = "queue_empty"
-    if info["final"] == "failed":
-        stop = "review_failed:" + ",".join(tasks)
-    elif info["final"] == "pass":
-        append_review_rows(repo, cfg, info, files_by_task)
-    if info["final"] != "failed" and not args.no_acceptance:
+    if args.acceptance_only:
+        # The review already passed in an earlier run; only the full oracle is redone.
+        info = None
+    else:
+        info = review_package(repo, cfg, run_id, run_dir, tasks, base, files_by_task)
+        if info["final"] == "failed":
+            stop = "review_failed:" + ",".join(tasks)
+        elif info["final"] == "pass":
+            append_review_rows(repo, cfg, info, files_by_task)
+    if (info is None or info["final"] != "failed") and not args.no_acceptance:
         print("GATE: full acceptance ...")
         acceptance = run_acceptance(repo, cfg)
         journal(repo, {"event": "full_acceptance", "run": run_id, "tasks": tasks,
@@ -2811,7 +2815,8 @@ def main() -> None:
         ("admit", cmd_admit, []),
         ("usage", cmd_usage, []),
         ("doctor", cmd_doctor, []),
-        ("review", cmd_review, [("--tasks", "str"), ("--base", "str"), ("--no-acceptance", "store_true")]),
+        ("review", cmd_review, [("--tasks", "str"), ("--base", "str"), ("--no-acceptance", "store_true"),
+                                ("--acceptance-only", "store_true")]),
         ("run", cmd_run, [
             ("--max-tasks", "int"),
             ("--force", "store_true"),

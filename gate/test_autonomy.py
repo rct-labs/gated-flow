@@ -259,7 +259,7 @@ class ReviewTests(unittest.TestCase):
             judge, calls = self._judge([verdict(88, "pass")])
             with mock.patch.dict(os.environ, {"GATE_CONFIG": ""}),                  mock.patch.object(self.gate, "judge_once", side_effect=judge):
                 self.gate.cmd_review(SimpleNamespace(repo=str(repo), tasks="EAV-2", base=base,
-                                                     no_acceptance=False))
+                                                     no_acceptance=False, acceptance_only=False))
             self.assertEqual(calls["n"], 1)
             report = (repo / ".gate" / "RUN-REPORT.md").read_text(encoding="utf-8")
             self.assertIn("| EAV-2 | pass | pass | 88 |", report)
@@ -267,7 +267,7 @@ class ReviewTests(unittest.TestCase):
             self.assertIn("EAV-2-R1", (repo / "TASK_QUEUE.md").read_text(encoding="utf-8"))
             with self.assertRaises(SystemExit):
                 self.gate.cmd_review(SimpleNamespace(repo=str(repo), tasks="EAV-3", base=base,
-                                                     no_acceptance=True))  # not DONE
+                                                     no_acceptance=True, acceptance_only=False))  # not DONE
 
     def test_oversized_packet_is_refused_not_sent(self) -> None:
         with tempfile.TemporaryDirectory() as td:
