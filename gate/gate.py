@@ -452,6 +452,13 @@ def quality_phase(repo: Path, cfg: dict, phase: str) -> dict | None:
     }
 
 
+def quality_required(cfg: dict) -> bool:
+    """Advisory quality checks are recorded, never blocking; a missing runner
+    therefore blocks only a project that declared the checks required."""
+    quality = cfg.get("quality")
+    return isinstance(quality, dict) and quality.get("mode", "required") == "required"
+
+
 def matches_any(path: str, globs: list[str]) -> bool:
     norm = path.replace("\\", "/")
     return any(fnmatch.fnmatch(norm, g) for g in globs)
@@ -888,10 +895,13 @@ def cmd_check_commit(args) -> None:
 
     quality = quality_phase(repo, cfg, "commit")
     if quality is not None and quality["result"] != "PASS":
-        fail(
-            "required continuous-quality commit checks failed.",
-            quality["tail"],
-        )
+        if quality_required(cfg):
+            fail(
+                "required continuous-quality commit checks failed.",
+                quality["tail"],
+            )
+        print("GATE WARNING: advisory continuous-quality commit checks failed:\n"
+              + quality["tail"], file=sys.stderr)
 
     has_head = git(repo, "rev-parse", "--verify", "HEAD", check=False).strip() != ""
     before = "HEAD" if has_head else None
@@ -1073,7 +1083,7 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
         count = int(m.group(1))
 
     result = "PASS" if proc.returncode == 0 else "FAIL"
-    if quality is not None and quality["result"] != "PASS":
+    if quality is not None and quality["result"] != "PASS" and quality_required(cfg):
         result = "FAIL"
 
     # Non-vacuity: an oracle that asserts nothing is not an oracle.
