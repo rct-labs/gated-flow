@@ -250,6 +250,25 @@ class ReviewTests(unittest.TestCase):
             self.assertIn("stopped because: **budget:model_calls**", report)
             self.assertEqual(calls["n"], 0)  # the review would be the second call
 
+    def test_host_driven_review_of_a_done_task(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"])
+            base = run("git", "-C", str(repo), "rev-parse", "HEAD").stdout.strip()
+            # Close EAV-2 by hand, as a worker would.
+            self._spawn([])(repo, {}, "claude", "task EAV-2", None)
+            judge, calls = self._judge([verdict(88, "pass")])
+            with mock.patch.dict(os.environ, {"GATE_CONFIG": ""}),                  mock.patch.object(self.gate, "judge_once", side_effect=judge):
+                self.gate.cmd_review(SimpleNamespace(repo=str(repo), tasks="EAV-2", base=base,
+                                                     no_acceptance=False))
+            self.assertEqual(calls["n"], 1)
+            report = (repo / ".gate" / "RUN-REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("| EAV-2 | pass | pass | 88 |", report)
+            self.assertIn("## Full acceptance", report)
+            self.assertIn("EAV-2-R1", (repo / "TASK_QUEUE.md").read_text(encoding="utf-8"))
+            with self.assertRaises(SystemExit):
+                self.gate.cmd_review(SimpleNamespace(repo=str(repo), tasks="EAV-3", base=base,
+                                                     no_acceptance=True))  # not DONE
+
     def test_oversized_packet_is_refused_not_sent(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = judged_runner_repo(Path(td), ["claude"], extra={"worker_packet_max_bytes": 120})

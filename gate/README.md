@@ -203,6 +203,12 @@ loop: the host admits one repair row.
 **Budget.** `max_model_calls` counts every model process of the run (workers,
 reviewers, probes); reaching it stops the run with `budget:model_calls`.
 
+**Host-driven review.** `gate.py review --repo <p> --tasks A,B [--base SHA]` runs the
+same package review and full acceptance for DONE tasks outside a run: after a review
+chain outage, or for tasks closed by hand. Windows note: `codex exec --sandbox read-only`
+needs its elevation helper, which cannot show a UAC prompt inside a Task Scheduler
+session (error 1223). Give the reviewer `-c windows.sandbox=unelevated` in `judge_cmds`.
+
 **Reversibility tier** (`irreversible_globs`). A TODO task whose declared files match
 is refused `needs-approval` by `admit` unless the queue carries
 `<!-- task:ID approved: <who/date> -->`; `run` stops on it with `needs_approval:<id>`

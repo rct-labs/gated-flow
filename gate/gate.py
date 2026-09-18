@@ -24,7 +24,8 @@ Subcommands
   admit         sweet-spot admission report for every TODO task in the queue
   usage         probe every worker / judge CLI now; bench the quota-dead ones
   doctor        report what is configured and whether it is usable
-  run           unattended loop: probe → dispatch → verify → judge → revise
+  run           unattended loop: probe, dispatch, verify, one review, one full acceptance
+  review        host-driven review of DONE tasks (--tasks A,B [--base SHA]) plus full acceptance
 """
 
 from __future__ import annotations
@@ -2707,6 +2708,57 @@ def render_report(
     return "\n".join(lines) + "\n"
 
 
+def cmd_review(args) -> None:
+    """Host-driven review of DONE tasks outside a run: after a review chain
+    outage, or for tasks closed by hand. Same chain, same pass rule, same
+    row appending; then the full oracle once unless --no-acceptance."""
+    repo = repo_root(Path(args.repo).resolve())
+    cfg = load_config(repo)
+    tasks = [t.strip() for t in (args.tasks or "").split(",") if t.strip()]
+    if not tasks:
+        die("--tasks ID[,ID...] is required")
+    qpath = repo / prefixed(cfg, cfg["queue_file"])
+    text = qpath.read_text(encoding="utf-8")
+    rows = parse_queue(text)
+    missing = [t for t in tasks if rows.get(t, {}).get("status") not in cfg["done_markers"]]
+    if missing:
+        die("not DONE in the queue: " + ", ".join(missing))
+    if not sub_cfg(cfg, "judge").get("enabled"):
+        die("judge.enabled is false for this project")
+    base = args.base or git(repo, "rev-parse", "HEAD~1").strip()
+    run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-review"
+    run_dir = repo / GATE_DIR / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    RUN_BUDGET.update(max=int(cfg.get("max_model_calls") or 0), calls=0)
+    files_by_task = {t: parse_task_files(text).get(t) or [] for t in tasks}
+    journal(repo, {"event": "run_start", "run": run_id, "workers": [], "pins": {},
+                   "judge": True, "mode": "review"})
+    info = review_package(repo, cfg, run_id, run_dir, tasks, base, files_by_task)
+    acceptance = None
+    stop = "queue_empty"
+    if info["final"] == "failed":
+        stop = "review_failed:" + ",".join(tasks)
+    elif info["final"] == "pass":
+        append_review_rows(repo, cfg, info, files_by_task)
+    if info["final"] != "failed" and not args.no_acceptance:
+        print("GATE: full acceptance ...")
+        acceptance = run_acceptance(repo, cfg)
+        journal(repo, {"event": "full_acceptance", "run": run_id, "tasks": tasks,
+                       "result": acceptance["result"], "count": acceptance["count"],
+                       "seconds": acceptance["elapsed_s"]})
+        if acceptance["result"] != "PASS":
+            stop = "full_acceptance_failed:" + ",".join(tasks)
+    results = [{"task": t, "outcome": "done", "attempts": 0, "dispatches": 0,
+                "worker": "", "pin": "", "checkpoint": None} for t in tasks]
+    report = render_report(repo, cfg, run_id, results, stop, 0.0, review=info, acceptance=acceptance)
+    (repo / GATE_DIR / f"RUN-REPORT-{run_id}.md").write_text(report, encoding="utf-8")
+    (repo / GATE_DIR / "RUN-REPORT.md").write_text(report, encoding="utf-8")
+    journal(repo, {"event": "run_end", "run": run_id, "stop": stop})
+    print("\n" + report)
+    if stop != "queue_empty":
+        raise SystemExit(3)
+
+
 def cmd_doctor(args) -> None:
     repo = repo_root(Path(args.repo).resolve())
     print(f"repo            : {repo}")
@@ -2759,6 +2811,7 @@ def main() -> None:
         ("admit", cmd_admit, []),
         ("usage", cmd_usage, []),
         ("doctor", cmd_doctor, []),
+        ("review", cmd_review, [("--tasks", "str"), ("--base", "str"), ("--no-acceptance", "store_true")]),
         ("run", cmd_run, [
             ("--max-tasks", "int"),
             ("--force", "store_true"),
