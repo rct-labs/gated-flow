@@ -40,9 +40,23 @@ commits, and commits for other projects in the same repo, pass untouched.
 | **fake completion** | a DONE flip whose diff contains only documentation (the fake-completion pattern) |
 | **frozen oracle** | a DONE flip that also edits a path in `frozen_globs` — weakening the test is how a loop converges on rewriting its own oracle |
 | **no verdict** | a DONE flip with no recent `gate.py verify` result |
-| **count mismatch** | the queue claims end baseline *N* while the acceptance command measured *M* |
+| **wrong task** | a task-scoped verdict (`verify --task ID`) closing a different task, or a declared file of that task edited after its local check |
+| **count mismatch** | a queue-scoped verdict whose measured count differs from the end baseline the queue claims |
 
 The first three are derived from the diff itself, so there is no field to lie in.
+
+A task may admit its own local check in the queue:
+
+```markdown
+<!-- task:WP-7 verify: {"cmd": "pytest tests/test_a.py -q", "timeout_s": 900} -->
+```
+
+`gate.py verify --task WP-7` runs that command and records a task-scoped
+verdict bound to the bytes of WP-7's declared files. The hook accepts the DONE
+commit while those bytes are unchanged; it never inspects the environment, the
+interpreter or the Git toolchain, so verifying in one shell and committing from
+another is fine. `gate.py verify --queue` runs the full `verify_cmd`; the runner
+does that once per run after the package review.
 
 ### Optional continuous quality hook
 

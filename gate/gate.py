@@ -18,7 +18,8 @@ Subcommands
   init          write .gate/config.json into a repo, with sane defaults
   install-hook  install .git/hooks/pre-commit that calls `check-commit`
   check-commit  fast structural gate, run by the pre-commit hook
-  verify        slow gate: run the acceptance command, record a verdict
+  verify        slow gate: run the acceptance command (--task ID for a task's
+                admitted local check, --queue for the full oracle), record a verdict
   audit         re-derive the structural verdict over the last N commits
   admit         sweet-spot admission report for every TODO task in the queue
   usage         probe every worker / judge CLI now; bench the quota-dead ones
@@ -571,6 +572,11 @@ def parse_task_after(text: str) -> dict[str, list[str]]:
 
 # <!-- task:WP-9 approved: 2026-09-03 user -->
 TASK_APPROVED_RE = re.compile(r"<!--\s*task:(\S+)\s+approved:\s*(.*?)\s*-->")
+# One task-local acceptance command per task, admitted in the queue itself:
+#   <!-- task:WP-7 verify: {"cmd": "pytest tests/test_a.py -q", "timeout_s": 900} -->
+# Workers run `gate.py verify --task WP-7`; the full verify_cmd runs once per
+# run, after the package review. A row without a declaration uses verify_cmd.
+TASK_VERIFY_RE = re.compile(r"<!--\s*task:([\w.-]+)\s+verify:\s*(\{.*?\})\s*-->", re.S)
 
 
 def parse_task_approved(text: str) -> dict[str, str]:
@@ -582,6 +588,24 @@ def parse_task_approved(text: str) -> dict[str, str]:
         note = m.group(2).strip()
         if note:
             out[m.group(1)] = note
+    return out
+
+
+def parse_task_verify(text: str) -> dict[str, dict]:
+    """{task_id: {"cmd": str, "timeout_s": int}} for every declared local check."""
+    out: dict[str, dict] = {}
+    for tid, raw in TASK_VERIFY_RE.findall(text):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        cmd = value.get("cmd") if isinstance(value, dict) else None
+        if not isinstance(cmd, str) or not cmd.strip():
+            continue
+        timeout = value.get("timeout_s", 900)
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+            timeout = 900
+        out[tid] = {"cmd": cmd.strip(), "timeout_s": timeout}
     return out
 
 
@@ -722,15 +746,17 @@ def read_verdict(repo: Path) -> dict | None:
         return None
 
 
-def worktree_fingerprint(repo: Path) -> str:
-    """Hash of the staged+tracked tree, so a verdict cannot outlive its code."""
-    out = git(repo, "status", "--porcelain=v1", "-uall")
-    head = git(repo, "rev-parse", "HEAD", check=False).strip()
+def files_fingerprint(repo: Path, cfg: dict, files: list[str]) -> str:
+    """Hash of the working-tree bytes of the declared files, so a task verdict
+    cannot outlive the code it measured. Staging, committing and edits to
+    other files do not change it; editing a declared file does."""
     import hashlib
 
     h = hashlib.sha256()
-    h.update(head.encode())
-    h.update(out.encode())
+    for rel in sorted(files):
+        p = repo / prefixed(cfg, rel)
+        h.update(rel.encode())
+        h.update(p.read_bytes() if p.is_file() else b"<missing>")
     return h.hexdigest()[:16]
 
 
@@ -930,15 +956,31 @@ def cmd_check_commit(args) -> None:
                 f"last verdict is {v.get('result')}, not PASS.",
                 json.dumps(v, indent=2, ensure_ascii=False),
             )
-        expected = end_baseline_for(repo, cfg, ":", flipped[0])
-        if expected is not None and v.get("count") is not None:
-            if int(v["count"]) != int(expected):
+        if v.get("scope") == "task":
+            # A task-local PASS closes exactly the task it measured, and only
+            # while the declared files still hold the bytes that were tested.
+            if v.get("task") not in flipped or len(flipped) != 1:
                 fail(
-                    f"queue declares end baseline {expected} for {flipped[0]} "
-                    f"but the acceptance run measured {v['count']}.",
-                    "The number in the queue is a claim; the number from the "
-                    "command is the fact. Fix whichever is wrong.",
+                    f"verdict is for task {v.get('task')} but this commit flips "
+                    f"{', '.join(flipped)}.",
+                    "Run: gate.py verify --task <id> for the task being closed.",
                 )
+            files = list(v.get("files") or [])
+            if files and files_fingerprint(repo, cfg, files) != v.get("fingerprint"):
+                fail(
+                    f"declared files of {v['task']} changed after its local check.",
+                    "Re-run: gate.py verify --task " + str(v["task"]),
+                )
+        else:
+            expected = end_baseline_for(repo, cfg, ":", flipped[0])
+            if expected is not None and v.get("count") is not None:
+                if int(v["count"]) != int(expected):
+                    fail(
+                        f"queue declares end baseline {expected} for {flipped[0]} "
+                        f"but the acceptance run measured {v['count']}.",
+                        "The number in the queue is a claim; the number from the "
+                        "command is the fact. Fix whichever is wrong.",
+                    )
 
     ok(
         f"task(s) {', '.join(flipped)} → DONE with {len(code_paths)} code path(s) "
@@ -946,23 +988,48 @@ def cmd_check_commit(args) -> None:
     )
 
 
+def task_verify_spec(repo: Path, cfg: dict, task: str) -> tuple[str, int, list[str]]:
+    """(command, timeout, declared files) for a task: its admitted local check
+    when the queue declares one, otherwise the full oracle."""
+    qpath = repo / prefixed(cfg, cfg["queue_file"])
+    text = qpath.read_text(encoding="utf-8") if qpath.exists() else ""
+    files = parse_task_files(text).get(task) or []
+    decl = parse_task_verify(text).get(task)
+    if decl:
+        return decl["cmd"], decl["timeout_s"], files
+    return cfg["verify_cmd"], int(cfg["verify_timeout_s"]), files
+
+
 def cmd_verify(args) -> None:
-    """Run the real acceptance command and record what it actually said."""
+    """Run the real acceptance command and record what it actually said.
+
+    `--task ID` runs that task's admitted local check (scope "task");
+    `--queue` or no flag runs the full oracle (scope "queue")."""
     repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
-    payload = run_acceptance(repo, cfg, args.cmd or cfg["verify_cmd"])
+    if args.task:
+        cmd, timeout, files = task_verify_spec(repo, cfg, args.task)
+        payload = run_acceptance(repo, cfg, args.cmd or cmd, task=args.task,
+                                 timeout_s=timeout, files=files)
+    else:
+        payload = run_acceptance(repo, cfg, args.cmd or cfg["verify_cmd"])
     print(
         f"GATE: {payload['result']} exit={payload['exit_code']} "
         f"count={payload['count']} in {payload['elapsed_s']}s"
+        + (f" [task {payload['task']}]" if payload.get("task") else "")
     )
     if payload["result"] != "PASS":
         print(payload["tail"], file=sys.stderr)
         raise SystemExit(2)
 
 
-def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None) -> dict:
-    """Run the acceptance command, write the verdict, return it. Shared by
-    `verify` and by the runner's own re-check after a judge revision."""
+def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
+                   task: str | None = None, timeout_s: int | None = None,
+                   files: list[str] | None = None) -> dict:
+    """Run an acceptance command, write the verdict, return it. Shared by
+    `verify` and by the runner's own full acceptance at the end of a run.
+    A task-scoped verdict records the task and a fingerprint of its declared
+    files; a queue-scoped one records the full oracle."""
     cmd = cmd or cfg["verify_cmd"]
     # The oracle runs where the project lives, not at the repo root — a repo
     # can host several projects.
@@ -978,7 +1045,7 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None) -> dict:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=cfg["verify_timeout_s"],
+        timeout=timeout_s or cfg["verify_timeout_s"],
     )
     elapsed = round(time.time() - started, 1)
     output = (proc.stdout or "") + (proc.stderr or "")
@@ -1011,7 +1078,10 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None) -> dict:
         "at_epoch": time.time(),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "head": git(repo, "rev-parse", "HEAD", check=False).strip(),
-        "fingerprint": worktree_fingerprint(repo),
+        "scope": "task" if task else "queue",
+        "task": task,
+        "files": sorted(files or []),
+        "fingerprint": files_fingerprint(repo, cfg, files or []) if task else "",
         "tail": tail,
         "quality": quality,
     }
@@ -2572,7 +2642,7 @@ def main() -> None:
         ("init", cmd_init, [("--force", "store_true")]),
         ("install-hook", cmd_install_hook, [("--force", "store_true")]),
         ("check-commit", cmd_check_commit, []),
-        ("verify", cmd_verify, [("--cmd", "str")]),
+        ("verify", cmd_verify, [("--cmd", "str"), ("--task", "str"), ("--queue", "store_true")]),
         ("audit", cmd_audit, [("--last", "int")]),
         ("admit", cmd_admit, []),
         ("usage", cmd_usage, []),
