@@ -291,15 +291,14 @@ class GateRunnerRecoveryTests(unittest.TestCase):
             report = (repo / ".gate" / "RUN-REPORT.md").read_text(encoding="utf-8")
             self.assertIn("worker_incomplete:EAV-2", report)
 
-    def test_partial_worktree_stops_without_handing_it_to_retry(self) -> None:
+    def test_partial_worktree_gets_one_retry_with_a_hint_then_stops(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = committed_runner_repo(Path(td), ["claude"])
-            calls = 0
+            prompts: list[str] = []
 
             def fake_spawn(repo_arg, cfg, worker, prompt, prompt_file, **kwargs):
-                nonlocal calls
-                calls += 1
-                (repo_arg / "eav2.txt").write_text("partial\n", encoding="utf-8")
+                prompts.append(prompt)
+                (repo_arg / "eav2.txt").write_text(f"partial {len(prompts)}\n", encoding="utf-8")
                 return self.gate.WorkerResult(0, "I could not finish."), None
 
             with mock.patch.dict(os.environ, {"GATE_CONFIG": ""}), mock.patch.object(
@@ -308,7 +307,9 @@ class GateRunnerRecoveryTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "3"):
                     self.gate.cmd_run(self.args(repo))
 
-            self.assertEqual(calls, 1)
+            self.assertEqual(len(prompts), 2)
+            self.assertNotIn("left uncommitted changes", prompts[0])
+            self.assertIn("left uncommitted changes for this task", prompts[1])
             report = (repo / ".gate" / "RUN-REPORT.md").read_text(encoding="utf-8")
             self.assertIn("worker_left_changes:EAV-2", report)
 

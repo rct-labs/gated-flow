@@ -1,11 +1,12 @@
-"""Regression tests for the 2026-09-03 autonomy upgrade of gate.py:
-judge chain + bounded revision loop, usage probe, reversibility approval.
+"""Regression tests for the unattended half of gate.py: one package review
+per run, usage probe, model call budget, reversibility approval.
 Design: docs/autonomy.md."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -18,20 +19,22 @@ from test_compat import GATE, committed_runner_repo, load_gate_module, run
 
 
 def judged_runner_repo(root: Path, workers: list[str], judge: dict | None = None,
-                       verify_cmd: str | None = None) -> Path:
-    """committed_runner_repo with the judge switched on and the probe off."""
+                       verify_cmd: str | None = None, max_tasks: int = 1,
+                       extra: dict | None = None) -> Path:
+    """committed_runner_repo with the review switched on and the probe off."""
     repo = committed_runner_repo(root, workers)
     cfg_path = repo / ".gate" / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    cfg["judge"] = {"enabled": True, "chain": ["fable", "opus", "codex"],
-                    "pass_score": 85, "max_revisions": 2, "min_gain": 5, "timeout_s": 60}
+    cfg["judge"] = {"enabled": True, "chain": ["fable", "opus", "codex"], "timeout_s": 60}
     if judge:
         cfg["judge"].update(judge)
     if verify_cmd:
         cfg["verify_cmd"] = verify_cmd
+    cfg["max_tasks"] = max_tasks
+    cfg.update(extra or {})
     cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
     run("git", "-C", str(repo), "add", ".gate/config.json")
-    run("git", "-C", str(repo), "commit", "-q", "-m", "judge on")
+    run("git", "-C", str(repo), "commit", "-q", "-m", "review on")
     return repo
 
 
@@ -42,61 +45,57 @@ def verdict(score: int, kind: str, findings=None, brief: str = "") -> dict:
             "revision_brief": brief}
 
 
-class JudgeLoopTests(unittest.TestCase):
-    """Judge after every task_done, bounded iteration (initial + 2 revisions),
-    worker rotation, no-progress early stop, and the runner's own re-verify
-    after a revision commit (flow-run-autonomy.md section 3)."""
+HIGH = [{"severity": "high", "file": "eav2.txt", "issue": "wrong", "fix": "redo"}]
+NAMES = {"EAV-2": "loader", "EAV-3": "diff"}
+
+
+class ReviewTests(unittest.TestCase):
+    """One package review per run gated on high findings, lesser findings
+    become queue rows, the full oracle runs once afterwards, and the model
+    call budget bounds the whole run (docs/autonomy.md)."""
 
     def setUp(self) -> None:
         self.gate = load_gate_module()
 
     @staticmethod
-    def args(repo: Path, max_tasks: int = 1) -> SimpleNamespace:
+    def args(repo: Path, max_tasks: int | None = None) -> SimpleNamespace:
         return SimpleNamespace(repo=str(repo), max_tasks=max_tasks, strict_admit=True, force=True)
 
-    def _spawn(self, workers_seen: list, revision_commits: bool = True,
-               break_file: bool = False):
-        """Fake worker: the task attempt closes EAV-2; a revision prompt
-        rewrites eav2.txt and commits (or not)."""
+    def _spawn(self, seen: list, prompts: list | None = None):
+        """Fake worker: closes whichever task the prompt names and commits."""
         gate = self.gate
 
         def fake_spawn(repo_arg, cfg, worker, prompt, prompt_file, **kwargs):
-            is_revision = "revising ONE task" in prompt
-            workers_seen.append(("rev" if is_revision else "task", worker))
-            if is_revision:
-                if revision_commits:
-                    (repo_arg / "eav2.txt").write_text("revised\n", encoding="utf-8")
-                    paths = ["eav2.txt"]
-                    if break_file:
-                        (repo_arg / "broken.txt").write_text("x\n", encoding="utf-8")
-                        paths.append("broken.txt")
-                    run("git", "-C", str(repo_arg), "add", *paths)
-                    run("git", "-C", str(repo_arg), "commit", "-q", "-m", "revise EAV-2")
-                return gate.WorkerResult(0, "revised"), None
+            tid = re.search(r"task (EAV-\d)", prompt).group(1)
+            seen.append((tid, worker))
+            if prompts is not None:
+                prompts.append(prompt)
             queue_path = repo_arg / "TASK_QUEUE.md"
             queue = queue_path.read_text(encoding="utf-8")
-            (repo_arg / "eav2.txt").write_text("done\n", encoding="utf-8")
+            path = repo_arg / f"{tid.lower().replace('-', '')}.txt"
+            path.write_text("done\n", encoding="utf-8")
             queue_path.write_text(
-                queue.replace("EAV-2 | loader | `TODO`", "EAV-2 | loader | `DONE`"),
+                queue.replace(f"{tid} | {NAMES[tid]} | `TODO`", f"{tid} | {NAMES[tid]} | `DONE`"),
                 encoding="utf-8",
             )
-            run("git", "-C", str(repo_arg), "add", "TASK_QUEUE.md", "eav2.txt")
-            run("git", "-C", str(repo_arg), "commit", "-q", "-m", "finish EAV-2")
+            run("git", "-C", str(repo_arg), "add", "TASK_QUEUE.md", path.name)
+            run("git", "-C", str(repo_arg), "commit", "-q", "-m", f"finish {tid}")
             return gate.WorkerResult(0, "done"), None
         return fake_spawn
 
     def _judge(self, verdicts: list[dict], members: list[str] | None = None):
-        calls = {"n": 0}
+        calls = {"n": 0, "prompts": []}
 
         def fake_judge_once(repo, cfg, prompt, run_dir, tag, run_id):
             i = calls["n"]
             calls["n"] += 1
+            calls["prompts"].append(prompt)
             if i >= len(verdicts):
-                raise AssertionError("judge called more often than planned")
+                raise AssertionError("review called more often than planned")
             return verdicts[i], (members or ["fable"] * len(verdicts))[i]
         return fake_judge_once, calls
 
-    def _run(self, repo, spawn, judge, expect_exit: str | None = None):
+    def _run(self, repo, spawn, judge, expect_exit: str | None = None, max_tasks=None):
         patches = [
             mock.patch.dict(os.environ, {"GATE_CONFIG": ""}),
             mock.patch.object(self.gate, "resolve_tool", side_effect=lambda name: name),
@@ -108,135 +107,133 @@ class JudgeLoopTests(unittest.TestCase):
         try:
             if expect_exit:
                 with self.assertRaisesRegex(SystemExit, expect_exit):
-                    self.gate.cmd_run(self.args(repo))
+                    self.gate.cmd_run(self.args(repo, max_tasks))
             else:
-                self.gate.cmd_run(self.args(repo))
+                self.gate.cmd_run(self.args(repo, max_tasks))
         finally:
             for p in patches:
                 p.stop()
         return (repo / ".gate" / "RUN-REPORT.md").read_text(encoding="utf-8")
 
-    def test_pass_first_round_dispatches_no_revision(self) -> None:
+    def test_two_tasks_one_review_one_full_acceptance(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            repo = judged_runner_repo(Path(td), ["claude", "codex"])
+            repo = judged_runner_repo(Path(td), ["claude", "codex"], max_tasks=2)
             seen: list = []
-            judge, calls = self._judge([verdict(92, "pass", findings=[])])
-            report = self._run(repo, self._spawn(seen), judge)
+            prompts: list = []
+            judge, calls = self._judge([verdict(80, "pass", findings=[])])
+            report = self._run(repo, self._spawn(seen, prompts), judge)
+            self.assertEqual([t for t, _ in seen], ["EAV-2", "EAV-3"])
             self.assertEqual(calls["n"], 1)
-            self.assertEqual([k for k, _ in seen], ["task"])
-            self.assertIn("| EAV-2 | pass | 1 | 92 |", report)
+            self.assertIn("EAV-2, EAV-3", calls["prompts"][0])
+            self.assertIn("| EAV-2, EAV-3 | pass | pass | 80 |", report)
+            self.assertIn("## Full acceptance", report)
+            self.assertIn("-> **PASS**", report)
             self.assertIn("stopped because: **budget**", report)
             self.assertIn("## Waiting on you\n\n- nothing", report)
+            log = run("git", "-C", str(repo), "log", "--oneline").stdout
+            self.assertIn("finish EAV-2", log)
+            self.assertIn("finish EAV-3", log)
+            for prompt in prompts:
+                self.assertLess(len(prompt.encode("utf-8")), 6000)
+                self.assertIn("[TASK PACKET]", prompt)
+                self.assertIn("verify --task EAV-", prompt)
+            events = [json.loads(ln) for ln in
+                      (repo / ".gate" / "journal.ndjson").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(sum(e["event"] == "full_acceptance" for e in events), 1)
+            self.assertEqual(sum(e["event"] == "review_start" for e in events), 1)
 
-    def test_revise_rotates_worker_then_passes(self) -> None:
+    def test_score_below_old_threshold_passes_without_high_findings(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            repo = judged_runner_repo(Path(td), ["claude", "codex"])
-            seen: list = []
-            judge, calls = self._judge([verdict(70, "revise", brief="fix x"),
-                                        verdict(90, "pass", findings=[])])
-            report = self._run(repo, self._spawn(seen), judge)
-            self.assertEqual(calls["n"], 2)
-            self.assertEqual(seen, [("task", "claude"), ("rev", "codex")])
-            self.assertIn("| EAV-2 | pass | 2 | 70 → 90 | claude, codex |", report)
-            log = run("git", "-C", str(repo), "log", "--format=%s").stdout.splitlines()
-            self.assertEqual(log[0], "revise EAV-2")
+            repo = judged_runner_repo(Path(td), ["claude"])
+            judge, _ = self._judge([verdict(72, "pass")])  # one medium finding
+            report = self._run(repo, self._spawn([]), judge)
+            self.assertIn("| EAV-2 | pass | pass | 72 |", report)
             queue = (repo / "TASK_QUEUE.md").read_text(encoding="utf-8")
-            self.assertIn("EAV-2 | loader | `DONE`", queue)
-            self.assertIn("EAV-3 | diff | `TODO`", queue)
+            self.assertIn("| EAV-2-R1 | x | `TODO` |", queue)
+            self.assertIn("<!-- task:EAV-2-R1 files: eav2.txt -->", queue)
+            self.assertIn("<!-- task:EAV-2-R1 origin: review -->", queue)
+            self.assertIn("## Waiting on you\n\n- nothing", report)
 
-    def test_revision_cap_escalates_and_stops_run(self) -> None:
+    def test_high_finding_fails_the_review_and_stops(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = judged_runner_repo(Path(td), ["claude", "codex"])
             seen: list = []
-            judge, calls = self._judge([verdict(60, "revise"), verdict(70, "revise"),
-                                        verdict(80, "revise")])
+            judge, calls = self._judge([verdict(95, "pass", findings=HIGH)])
             report = self._run(repo, self._spawn(seen), judge, expect_exit="3")
-            self.assertEqual(calls["n"], 3)
-            self.assertEqual([k for k, _ in seen], ["task", "rev", "rev"])
-            self.assertIn("judge_escalated:EAV-2", report)
-            self.assertIn("revision cap 2 reached", report)
-            self.assertIn("### EAV-2 — last findings", report)
+            self.assertEqual(len(seen), 1)  # no revision dispatch
+            self.assertIn("stopped because: **review_failed:EAV-2**", report)
+            self.assertIn("[high] eav2.txt: wrong", report)
+            self.assertNotIn("## Full acceptance", report)
+            queue = (repo / "TASK_QUEUE.md").read_text(encoding="utf-8")
+            self.assertNotIn("EAV-2-R1", queue)
 
-    def test_no_gain_stops_before_cap(self) -> None:
+    def test_revise_or_escalate_verdict_fails_the_review(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            repo = judged_runner_repo(Path(td), ["claude", "codex"])
-            seen: list = []
-            judge, calls = self._judge([verdict(60, "revise"), verdict(62, "revise")])
-            report = self._run(repo, self._spawn(seen), judge, expect_exit="3")
-            self.assertEqual(calls["n"], 2)
-            self.assertEqual([k for k, _ in seen], ["task", "rev"])
-            self.assertIn("no progress: 60 → 62", report)
+            repo = judged_runner_repo(Path(td), ["claude"])
+            judge, _ = self._judge([verdict(60, "escalate")])
+            report = self._run(repo, self._spawn([]), judge, expect_exit="3")
+            self.assertIn("review_failed:EAV-2", report)
+            self.assertIn("did not pass (verdict escalate)", report)
 
-    def test_escalate_verdict_stops_without_revision(self) -> None:
+    def test_review_unavailable_skips_loudly_and_still_accepts(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            repo = judged_runner_repo(Path(td), ["claude", "codex"])
-            seen: list = []
-            judge, calls = self._judge([verdict(50, "escalate")])
-            report = self._run(repo, self._spawn(seen), judge, expect_exit="3")
-            self.assertEqual([k for k, _ in seen], ["task"])
-            self.assertIn("judge_escalated:EAV-2", report)
-            self.assertIn("judge asked for a human", report)
+            repo = judged_runner_repo(Path(td), ["claude"])
 
-    def test_revision_that_fails_acceptance_stops_run(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            verify = (
-                f'"{sys.executable}" -c "import os,sys; print(\'1 passed\'); '
-                "sys.exit(1 if os.path.exists('broken.txt') else 0)\""
-            )
-            repo = judged_runner_repo(Path(td), ["claude", "codex"], verify_cmd=verify)
-            seen: list = []
-            judge, calls = self._judge([verdict(60, "revise"), verdict(95, "pass")])
-            report = self._run(repo, self._spawn(seen, break_file=True), judge, expect_exit="3")
-            self.assertEqual(calls["n"], 1, "a failing revision is never re-judged")
-            self.assertIn("revision_broke_verify:EAV-2", report)
-            self.assertIn("fails acceptance", report)
-            self.assertIn("Inspect `git log`", report)
-
-    def test_revision_without_commit_counts_and_rotates(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            repo = judged_runner_repo(Path(td), ["claude", "codex"])
-            seen: list = []
-            judge, calls = self._judge([verdict(60, "revise"), verdict(70, "revise"),
-                                        verdict(80, "revise")])
-            report = self._run(repo, self._spawn(seen, revision_commits=False), judge,
-                               expect_exit="3")
-            self.assertEqual(seen, [("task", "claude"), ("rev", "codex"), ("rev", "claude")])
-            self.assertIn("revision cap 2 reached", report)
-
-    def test_single_worker_revision_is_flagged_not_rotated(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            repo = judged_runner_repo(Path(td), ["codex"])
-            seen: list = []
-            judge, calls = self._judge([verdict(70, "revise"), verdict(90, "pass", findings=[])])
-            report = self._run(repo, self._spawn(seen), judge)
-            self.assertEqual(seen, [("task", "codex"), ("rev", "codex")])
-            self.assertIn("codex (not rotated), codex", report)
-            journal = (repo / ".gate" / "journal.ndjson").read_text(encoding="utf-8")
-            self.assertIn('"event": "revision_start"', journal)
-            self.assertIn('"rotated": false', journal)
-
-    def test_judge_unavailable_skips_loudly_and_continues(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            repo = judged_runner_repo(Path(td), ["claude", "codex"])
-            seen: list = []
-
-            def down(repo_, cfg, prompt, run_dir, tag, run_id):
+            def unavailable(repo_, cfg, prompt, run_dir, tag, run_id):
                 return None, "fable:quota; opus:quota; codex:not found"
-            report = self._run(repo, self._spawn(seen), down)
-            self.assertIn("| EAV-2 | skipped | 0 |", report)
-            self.assertIn("closed without a judge review", report)
-            self.assertIn("stopped because: **budget**", report)
+            report = self._run(repo, self._spawn([]), unavailable)
+            self.assertIn("| EAV-2 | skipped |", report)
+            self.assertIn("## Full acceptance", report)
+            self.assertIn("closed without a review", report)
 
-    def test_judge_disabled_by_default_changes_nothing(self) -> None:
+    def test_checkpoint_task_is_reviewed_right_after_it_closes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            repo = committed_runner_repo(Path(td), ["claude"])
-            seen: list = []
+            repo = judged_runner_repo(Path(td), ["claude"], judge={"checkpoints": ["EAV-2"]},
+                                      max_tasks=2)
+            judge, calls = self._judge([verdict(90, "pass", findings=[]),
+                                        verdict(88, "pass", findings=[])])
+            report = self._run(repo, self._spawn([]), judge)
+            self.assertEqual(calls["n"], 2)
+            self.assertIn("Tasks under review: EAV-2.", calls["prompts"][0])
+            self.assertIn("Tasks under review: EAV-3.", calls["prompts"][1])
+            self.assertIn("| EAV-2 | pass |", report)
 
-            def never(*a, **k):
-                raise AssertionError("judge must not run when disabled")
-            report = self._run(repo, self._spawn(seen), never)
-            self.assertNotIn("## Judge", report)
-            self.assertEqual([k for k, _ in seen], ["task"])
+    def test_failed_full_acceptance_needs_a_human(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"],
+                                      verify_cmd="python -c \"import sys; print('1 passed'); sys.exit(1)\"")
+            judge, _ = self._judge([verdict(90, "pass", findings=[])])
+            report = self._run(repo, self._spawn([]), judge, expect_exit="3")
+            self.assertIn("full_acceptance_failed:EAV-2", report)
+            self.assertIn("the full oracle fails", report)
+
+    def test_model_call_budget_stops_the_run(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"], max_tasks=2,
+                                      extra={"max_model_calls": 1})
+            seen: list = []
+            judge, calls = self._judge([verdict(90, "pass", findings=[])])
+            gate = self.gate
+            real = self._spawn(seen)
+
+            def counting(repo_arg, cfg, worker, prompt, prompt_file, **kw):
+                if gate.RUN_BUDGET["max"] and gate.RUN_BUDGET["calls"] >= gate.RUN_BUDGET["max"]:
+                    return None, "budget"
+                gate.RUN_BUDGET["calls"] += 1
+                return real(repo_arg, cfg, worker, prompt, prompt_file, **kw)
+            report = self._run(repo, counting, judge)
+            self.assertEqual([t for t, _ in seen], ["EAV-2"])
+            self.assertIn("stopped because: **budget:model_calls**", report)
+            self.assertEqual(calls["n"], 0)  # the review would be the second call
+
+    def test_oversized_packet_is_refused_not_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"], extra={"worker_packet_max_bytes": 120})
+            seen: list = []
+            judge, _ = self._judge([])
+            report = self._run(repo, self._spawn(seen), judge, expect_exit="3")
+            self.assertEqual(seen, [])
+            self.assertIn("prompt_too_large:EAV-2", report)
 
 
 class JudgeChainTests(unittest.TestCase):
@@ -312,12 +309,9 @@ class JudgeChainTests(unittest.TestCase):
             self.assertIsNone(self.gate.parse_judge_output(
                 "{\"score\": 300, \"verdict\": \"pass\"}", Path(td) / "none"))
 
-    def test_fable_is_judge_only_never_worker(self) -> None:
+    def test_judge_contracts_are_read_only(self) -> None:
         self.assertIn("claude-fable-5-1", self.gate.JUDGE_CMDS["fable"])
         self.assertEqual(self.gate.JUDGE_CMDS["codex"][2:4], ["--sandbox", "read-only"])
-        _, err = self.gate.ensure_worker_model(
-            "claude", ["claude", "-p", "{prompt}", "--model", "claude-fable-5-1"])
-        self.assertIsNotNone(err)
 
     def test_sub_cfg_fills_defaults_under_partial_override(self) -> None:
         cfg = dict(self.gate.DEFAULT_CONFIG)
@@ -325,7 +319,8 @@ class JudgeChainTests(unittest.TestCase):
         j = self.gate.sub_cfg(cfg, "judge")
         self.assertTrue(j["enabled"])
         self.assertEqual(j["chain"], ["fable", "opus", "codex"])
-        self.assertEqual(j["max_revisions"], 2)
+        self.assertEqual(j["checkpoints"], [])
+        self.assertEqual(j["timeout_s"], 1200)
 
 
 class ProbeTests(unittest.TestCase):

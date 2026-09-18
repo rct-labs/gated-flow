@@ -106,6 +106,15 @@ DEFAULT_CONFIG = {
     "worker_skill": "",
     "max_tasks": 3,
     "max_attempts_per_task": 2,
+    # Every model process of one run (workers, judges, probes) counts. The
+    # run stops with budget:model_calls before the call that would exceed it.
+    "max_model_calls": 40,
+    # The worker prompt is the template above plus a task packet: the queue
+    # row, declared files, the spec's acceptance section, the local check and
+    # a diff summary. Larger packets are refused, not sent.
+    "worker_packet_max_bytes": 6000,
+    # OpenRouter model id for the `pi` worker; empty means pi's own default.
+    "worker_models": {"pi": ""},
     "task_timeout_s": 5400,
     "run_timeout_s": 28800,
     "quota_cooldown_s": 21600,
@@ -136,47 +145,33 @@ DEFAULT_CONFIG = {
     # a probe that never reached the provider (timeout, not installed, other
     # error) benches it for retry_s only — it must not occupy the quota window.
     "probe": {"enabled": True, "timeout_s": 90, "retry_s": 600},
-    # Judge every closed task with a read-only headless model, then iterate at
-    # most max_revisions times (initial + 2 = 3 rounds: the point where the
-    # per-round gain of self-correction drops under 2%). The judge never edits
-    # the queue: DONE is earned by the exit-code gate and stays.
+    # One read-only package review after the tasks of a run have closed, then
+    # the full oracle once. A review passes when its verdict is "pass" and it
+    # reports no high-severity finding; the numeric score is recorded, never
+    # gated on. Lesser findings become TODO rows for the next run. Tasks in
+    # `checkpoints` are reviewed on their own right after they close.
     "judge": {
         "enabled": False,
         "chain": ["fable", "opus", "codex"],
-        "pass_score": 85,
-        "max_revisions": 2,
-        "min_gain": 5,
+        "checkpoints": [],
         "timeout_s": 1200,
     },
     "judge_prompt": (
-        "You are the acceptance judge for ONE finished task in this repository. "
-        "Task {task} was just closed by commit {commit}. Declared scope: {files}. "
-        "Commits of this task since {base}: {commits}. Last acceptance run tail:\n"
-        "{verify_tail}\n\n"
-        "Read CONTEXT.md and TASK_QUEUE.md (repo root); locate the work package under "
-        "docs/work/ whose PLAN.md or spec.md names {task} and read its acceptance for "
-        "this task. Inspect the diff (`git show <sha>`) and the tests it added or "
-        "changed. Do not modify anything.\n\n"
-        "Score 0-100 with this rubric: acceptance criteria met 40; tests are real and "
-        "would fail without the change 20; scope discipline (only declared files, no "
-        "unrelated edits, queue row untouched apart from status/counts) 15; project "
-        "conventions and code quality 15; regression risk 10.\n"
-        "verdict: 'pass' when score >= {pass_score} and no high-severity finding; "
-        "'revise' when the shortfall is fixable inside the declared scope by one worker "
-        "session; 'escalate' when the spec is ambiguous, the fix needs a human decision, "
-        "or the scope must grow. findings: concrete, file-anchored, each with a fix. "
-        "revision_brief: the exact instructions a worker needs, or empty on pass.\n"
+        "You are the read-only reviewer of finished work in this repository. "
+        "Tasks under review: {tasks}. Commits since {base}: {commits}. Declared files: "
+        "{files}. Last acceptance run tail:\n{verify_tail}\n\n"
+        "Read the queue rows of these tasks and the acceptance sections of their work "
+        "packages under docs/work/. Inspect the diff (`git diff {base}..HEAD`) and the "
+        "tests it added or changed. Do not modify anything.\n\n"
+        "Report findings that are concrete and file-anchored, each with a fix. Use "
+        "severity 'high' only for a defect that makes the work wrong, unsafe or "
+        "untested against its acceptance; 'medium' and 'low' for improvements. "
+        "verdict: 'pass' when the work meets its acceptance and nothing high remains; "
+        "'revise' when a high finding needs another worker; 'escalate' when the "
+        "acceptance itself is ambiguous or a human decision is required. score: your "
+        "0-100 overall impression, recorded but not gated on. revision_brief: one "
+        "paragraph for the host, or empty.\n"
         "Return ONLY JSON matching the schema."
-    ),
-    "revision_prompt": (
-        "You are revising ONE task in this repository after an acceptance review. "
-        "Task {task} is already DONE in the queue and must stay DONE: do not edit its "
-        "queue row or any other row. Fix exactly the findings below, inside the declared "
-        "scope {files}; do not widen scope, do not weaken or delete tests. Run the "
-        "project's acceptance command in the foreground and make it pass, then commit "
-        "only the paths you changed (never `git add -A`, never `--no-verify`, never "
-        "push). If a finding cannot be fixed within scope, leave it and say so.\n\n"
-        "Reviewer brief: {brief}\n\nFindings:\n{findings}\n"
     ),
     # Declared files matching these are irreversible for this project: the
     # task needs an explicit `<!-- task:ID approved: <who/date> -->` line or the
@@ -259,13 +254,9 @@ WORKER_CMDS: dict[str, list[str]] = {
         "codex", "exec", "--sandbox", "danger-full-access",
         "--skip-git-repo-check", "-C", "{projdir}", "-",
     ],
-    # Queue workers never run on fable: fable is the host/judge model and a
-    # headless `claude -p` would silently inherit whatever the user last set as
-    # their CLI default. Pin opus here; ensure_worker_model() below enforces the
-    # same rule on any config override.
+    # Inherits the CLI's configured model unless worker_cmds pins one.
     "claude": [
         "claude", "-p", "{prompt}",
-        "--model", "opus",
         "--permission-mode", "acceptEdits",
         "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep,TaskOutput",
         "--output-format", "text",
@@ -276,44 +267,16 @@ WORKER_CMDS: dict[str, list[str]] = {
         "--output-format", "plain", "--cwd", "{projdir}",
     ],
     "kimi": ["kimi", "-p", "{prompt}", "--output-format", "text"],
+    # Any OpenRouter model through the pi coding agent. {model} comes from
+    # worker_models.pi; pi reads OPENROUTER_API_KEY from the environment. The
+    # prompt travels as an attached file because the pnpm shim truncates a
+    # multi-line argument at its first newline.
+    "pi": [
+        "pi", "-p", "--provider", "openrouter", "--model", "{model}",
+        "--mode", "json", "--no-session", "@{prompt_file}",
+        "Carry out the task described in the attached file, then stop.",
+    ],
 }
-
-# Models that may only host and judge, never execute queue tasks. Matched
-# case-insensitively as a substring of the --model value.
-FORBIDDEN_WORKER_MODELS = ("fable",)
-DEFAULT_CLAUDE_WORKER_MODEL = "opus"
-
-
-def ensure_worker_model(worker: str, template: list[str]) -> tuple[list[str], str | None]:
-    """Enforce the worker-model policy on a resolved command template.
-
-    For the claude worker: inject ``--model opus`` when no --model is given, and
-    refuse outright when --model names a forbidden (host-only) model. Other
-    workers are returned unchanged. Returns (template, error).
-    """
-    if worker != "claude":
-        return template, None
-    argv = list(template)
-    for i, part in enumerate(argv):
-        if part == "--model" and i + 1 < len(argv):
-            value = argv[i + 1]
-            if any(bad in value.lower() for bad in FORBIDDEN_WORKER_MODELS):
-                return argv, (
-                    f"claude worker --model {value!r} is a host-only model; "
-                    f"queue tasks may run on opus/codex/kimi/grok only"
-                )
-            return argv, None
-        if part.startswith("--model="):
-            value = part.split("=", 1)[1]
-            if any(bad in value.lower() for bad in FORBIDDEN_WORKER_MODELS):
-                return argv, (
-                    f"claude worker --model {value!r} is a host-only model; "
-                    f"queue tasks may run on opus/codex/kimi/grok only"
-                )
-            return argv, None
-    # No --model at all: never inherit the CLI default, pin the worker model.
-    argv[1:1] = ["--model", DEFAULT_CLAUDE_WORKER_MODEL]
-    return argv, None
 
 # Signatures that mean "this tool is unusable right now", not "this task
 # failed". Both classes get the same treatment — bench the tool, do not spend
@@ -589,6 +552,54 @@ def parse_task_approved(text: str) -> dict[str, str]:
         if note:
             out[m.group(1)] = note
     return out
+
+
+def spec_acceptance(repo: Path, cfg: dict, text: str, task: str) -> str:
+    """The acceptance section of the work package spec that names the task,
+    found through a `<!-- task:ID spec: path -->` line or docs/work/*/spec.md.
+    Empty when there is none; the packet never guesses."""
+    m = re.search(r"<!--\s*task:" + re.escape(task) + r"\s+spec:\s*(\S+)\s*-->", text)
+    candidates = [repo / prefixed(cfg, m.group(1))] if m else sorted(
+        (repo / (cfg.get("project_prefix") or "") / "docs" / "work").glob("*/spec.md"))
+    for path in candidates:
+        try:
+            body = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if not m and task not in body:
+            continue
+        section = re.search(r"^##\s+Acceptance\s*$(.*?)(?=^##\s|\Z)", body, re.S | re.M)
+        if section:
+            return section.group(1).strip()
+    return ""
+
+
+def task_packet(repo: Path, cfg: dict, text: str, task: str, files: list[str]) -> str:
+    """What one worker needs and nothing more: its queue row, declared files,
+    local check, the spec's acceptance section and a summary of the current
+    diff. The whole queue, handoffs and history stay out of the prompt."""
+    row = next((ln for ln in text.splitlines() if _task_id_from_row(ln) == task), "")
+    cmd, timeout, _ = task_verify_spec(repo, cfg, task)
+    engine = Path(__file__).resolve().as_posix()
+    diff_stat = git(repo, "diff", "--stat", "--", *(files or ["."]), check=False).strip()
+    acceptance = spec_acceptance(repo, cfg, text, task)
+    parts = [
+        "\n\n[TASK PACKET]",
+        f"queue row: {row.strip()}",
+        f"declared files: {', '.join(files) or '(undeclared)'}",
+        f"local check: python {engine} verify --task {task} --repo {repo.as_posix()}"
+        f"  (runs: {cmd}; timeout {timeout}s)",
+        "closing: stage only your own changes, flip the row to DONE, commit through "
+        "the installed hook. Full-suite runs belong to the runner, not to you.",
+    ]
+    if acceptance:
+        parts.append("acceptance:\n" + acceptance)
+    if diff_stat:
+        parts.append("current uncommitted diff:\n" + diff_stat)
+    parts.append("Follow the installed agent-skills disciplines (incremental "
+                 "implementation, test-driven development, debugging and error "
+                 "recovery) when they are available to you.")
+    return "\n".join(parts) + "\n"
 
 
 def parse_task_verify(text: str) -> dict[str, dict]:
@@ -1376,6 +1387,29 @@ INCOMPLETE_WORK_PATTERNS = (
 )
 
 
+# A worker that ends its turn asking the human for a scope decision (extra
+# declared files, a widened acceptance) has not failed at the work; an
+# identical second dispatch asks the same question again. The first pattern is
+# the "needs your decision" row of the Chinese report format, written as
+# escapes so the source stays ASCII.
+SCOPE_REQUEST_PATTERNS = (
+    re.compile("\u8981\u4f60\u51b3\u5b9a\\s*\\|\\s*(?!\u65e0\\b|None\\b|\u2014|-|\\s*\\|)\\S", re.IGNORECASE),
+    re.compile(r"\b(?:needs? your decision|awaiting (?:your )?(?:approval|decision))\b", re.IGNORECASE),
+)
+SCOPE_HINT_RE = re.compile("\u6269\u56f4|\u58f0\u660e(?:\u6587\u4ef6|\u5217\u8868|\u8303\u56f4)|declared files|files:|scope", re.IGNORECASE)
+SCOPE_PATH_RE = re.compile(r"(?<![\w/])(?:src|tests|docs|scripts)/[\w./\[\]()-]+\.[A-Za-z]{1,5}")
+
+
+def worker_scope_request(output: str) -> dict | None:
+    """Detect a worker that stopped to ask for a scope decision, and what for."""
+    if not any(p.search(output) for p in SCOPE_REQUEST_PATTERNS):
+        return None
+    if not SCOPE_HINT_RE.search(output):
+        return None
+    files = sorted(set(SCOPE_PATH_RE.findall(output[-6000:])))
+    return {"files": files}
+
+
 def worker_incomplete_reason(output: str) -> str | None:
     """Detect a one-shot worker returning while its acceptance work is pending."""
     if any(pattern.search(output) for pattern in INCOMPLETE_WORK_PATTERNS):
@@ -1456,6 +1490,10 @@ def kill_tree(proc: subprocess.Popen) -> None:
             proc.kill()
 
 
+# Model calls made by the current run, against max_model_calls. Reset by run.
+RUN_BUDGET = {"max": 0, "calls": 0}
+
+
 class WorkerResult:
     """Just enough of CompletedProcess for the caller, plus what we streamed."""
 
@@ -1492,9 +1530,14 @@ def spawn_worker(
         template = (cfg.get("worker_cmds") or {}).get(worker) or WORKER_CMDS.get(worker)
         if not template:
             return None, f"no invocation contract for {worker}"
-        template, model_error = ensure_worker_model(worker, template)
-        if model_error:
-            return None, model_error
+    model = (cfg.get("worker_models") or {}).get(worker) or ""
+    if any("{model}" in part for part in template) and not model:
+        return None, f"worker_models.{worker} is empty; set an OpenRouter model id"
+
+    # The run's call budget: workers, judges and probes alike.
+    if RUN_BUDGET["max"] and RUN_BUDGET["calls"] >= RUN_BUDGET["max"]:
+        return None, "budget"
+    RUN_BUDGET["calls"] += 1
 
     argv = []
     for part in template:
@@ -1502,6 +1545,7 @@ def spawn_worker(
             part.replace("{projdir}", str(projdir))
             .replace("{prompt_file}", str(prompt_file))
             .replace("{prompt}", prompt)
+            .replace("{model}", model)
         )
         for key, value in (extra or {}).items():
             part = part.replace("{" + key + "}", value)
@@ -1826,161 +1870,102 @@ def format_findings(findings: list[dict]) -> str:
     )
 
 
-def judge_task(
-    repo: Path,
-    cfg: dict,
-    run_id: str,
-    run_dir: Path,
-    tid: str,
-    base_head: str,
-    files: list[str],
-    last_worker: str,
-    pin: str | None,
+def review_package(
+    repo: Path, cfg: dict, run_id: str, run_dir: Path, tasks: list[str],
+    base_head: str, files_by_task: dict[str, list[str]],
 ) -> dict:
-    """Judge a closed task and iterate at most judge.max_revisions times.
+    """One read-only review of the listed closed tasks.
 
-    Returns {"final": pass|escalated|skipped|broke_verify, "reason", "rounds":
-    [{"round","score","verdict","member","worker","findings"}]}. The queue row
-    is never touched here; a revision is an ordinary code commit that the
-    runner re-verifies itself, because check-commit only engages on DONE flips.
+    Returns {"final": pass|failed|skipped, "score", "verdict", "member",
+    "findings", "brief", "tasks"}. Passing means verdict "pass" and no
+    high-severity finding. The queue rows are never touched; lesser findings
+    are appended as TODO rows by the caller.
     """
     jcfg = sub_cfg(cfg, "judge")
-    rounds: list[dict] = []
-    revisions = 0
-    worker_of_last_commit = last_worker
-    scores: list[int] = []
-    while True:
-        head = git(repo, "rev-parse", "HEAD").strip()
-        commits = [
-            s[:10] for s in git(repo, "rev-list", f"{base_head}..{head}", check=False).split()
-        ]
-        v = read_verdict(repo) or {}
-        prompt = cfg["judge_prompt"].format(
-            task=tid,
-            commit=head[:10],
-            base=base_head[:10],
-            commits=", ".join(commits) or head[:10],
-            files=", ".join(files) or "(undeclared)",
-            verify_tail=(v.get("tail") or "")[-1500:],
-            pass_score=jcfg["pass_score"],
-        )
-        tag = f"{tid}-judge{len(rounds) + 1}"
-        journal(repo, {"event": "judge_start", "task": tid, "round": len(rounds) + 1,
-                       "commit": head})
-        print(f"  judge round {len(rounds) + 1} for {tid} …")
-        verdict, member = judge_once(repo, cfg, prompt, run_dir, tag, run_id)
-        if verdict is None:
-            journal(repo, {"event": "judge_skipped", "task": tid, "reason": member})
-            print(f"  judge unavailable ({member}) — task stays DONE, unreviewed")
-            return {"final": "skipped", "reason": member, "rounds": rounds}
-        rounds.append({
-            "round": len(rounds) + 1,
-            "score": verdict["score"],
-            "verdict": verdict["verdict"],
-            "member": member,
-            "worker": worker_of_last_commit,
-            "findings": verdict["findings"],
-            "brief": verdict["revision_brief"],
-        })
-        scores.append(verdict["score"])
-        journal(repo, {"event": "judge_verdict", "task": tid, "round": len(rounds),
-                       "score": verdict["score"], "verdict": verdict["verdict"],
-                       "member": member, "findings": len(verdict["findings"])})
-        print(f"  judge ({member}): score {verdict['score']}, {verdict['verdict']}")
-        notify(cfg, repo, f"{tid} judged {verdict['score']} ({verdict['verdict']}, {member})",
-               format_findings(verdict["findings"]))
-
-        if verdict["verdict"] == "pass" or verdict["score"] >= jcfg["pass_score"]:
-            return {"final": "pass", "reason": "", "rounds": rounds}
-        if verdict["verdict"] == "escalate":
-            return _escalate(repo, tid, rounds, "judge asked for a human")
-        if revisions >= jcfg["max_revisions"]:
-            return _escalate(repo, tid, rounds, f"revision cap {jcfg['max_revisions']} reached")
-        if len(scores) >= 2 and scores[-1] - scores[-2] < jcfg["min_gain"]:
-            return _escalate(
-                repo, tid, rounds,
-                f"no progress: {scores[-2]} → {scores[-1]} (< min_gain {jcfg['min_gain']})",
-            )
-
-        # Pick a usable worker other than the one that made the last commit.
-        pool = [w for w in available_workers(repo, cfg, prefer=pin)
-                if ensure_probed(repo, cfg, w, run_id, run_dir)]
-        others = [w for w in pool if w != worker_of_last_commit]
-        if not pool:
-            return _escalate(repo, tid, rounds, "no_workers_for_revision")
-        # Rotation: a second pass by the same model repeats its own blind
-        # spot. Fall back to the same worker only when it is the only usable
-        # one, and say so in the journal and the report.
-        rotated = bool(others)
-        worker = (others or pool)[0]
-        rounds[-1]["rotated"] = rotated
-        revisions += 1
-        rprompt = cfg["revision_prompt"].format(
-            task=tid,
-            files=", ".join(files) or "(undeclared)",
-            brief=verdict["revision_brief"] or "(none)",
-            findings=format_findings(verdict["findings"]),
-        )
-        pf = run_dir / f"{tid}-rev{revisions}.prompt.md"
-        pf.write_text(rprompt, encoding="utf-8")
-        queue_path = repo / prefixed(cfg, cfg["queue_file"])
-        queue_before = queue_path.read_text(encoding="utf-8")
-        tree_before = non_gate_worktree_state(repo)
-        head_before = head
-        journal(repo, {"event": "revision_start", "task": tid, "revision": revisions,
-                       "worker": worker, "rotated": rotated,
-                       "log": str(pf.with_suffix(".log"))})
-        print(f"  revision {revisions} via {worker}{'' if rotated else ' (same worker: no other usable)'} …")
-
-        def beat(secs: int, lines: int, last: str, _tid=tid, _w=worker) -> None:
-            print(f"    … {_tid} revising {secs // 60}m, {lines} lines | {last[:80]}")
-            journal(repo, {"event": "heartbeat", "task": _tid, "worker": _w,
-                           "seconds": secs, "lines": lines, "last_line": last,
-                           "phase": "revision"})
-
-        proc, err = spawn_worker(repo, cfg, worker, rprompt, pf,
-                                 log_path=pf.with_suffix(".log"), on_beat=beat)
-        head_after = git(repo, "rev-parse", "HEAD").strip()
-        queue_after = queue_path.read_text(encoding="utf-8")
-        changed_rows = queue_status_changes(queue_before, queue_after)
-        if changed_rows:
-            return _escalate(repo, tid, rounds, f"revision changed queue rows {changed_rows}",
-                             final="broke_verify")
-        if proc is None or getattr(proc, "timed_out", False):
-            journal(repo, {"event": "revision_end", "task": tid, "revision": revisions,
-                           "worker": worker, "outcome": "failed", "err": err or "timeout"})
-            worker_of_last_commit = worker
-            if non_gate_worktree_state(repo) != tree_before:
-                return _escalate(repo, tid, rounds, "revision left uncommitted changes",
-                                 final="broke_verify")
-            continue
-        if head_after == head_before:
-            journal(repo, {"event": "revision_end", "task": tid, "revision": revisions,
-                           "worker": worker, "outcome": "no_commit"})
-            if non_gate_worktree_state(repo) != tree_before:
-                return _escalate(repo, tid, rounds, "revision left uncommitted changes",
-                                 final="broke_verify")
-            worker_of_last_commit = worker
-            print(f"  revision {revisions} made no commit")
-            continue
-        worker_of_last_commit = worker
-        # The verdict is ours: re-run the acceptance on the revised tree.
-        payload = run_acceptance(repo, cfg)
-        journal(repo, {"event": "revision_end", "task": tid, "revision": revisions,
-                       "worker": worker, "outcome": payload["result"],
-                       "commit": head_after})
-        if payload["result"] != "PASS":
-            return _escalate(
-                repo, tid, rounds,
-                f"revision commit {head_after[:10]} fails acceptance ({payload['result']})",
-                final="broke_verify",
-            )
+    head = git(repo, "rev-parse", "HEAD").strip()
+    commits = [c[:10] for c in git(repo, "rev-list", f"{base_head}..{head}", check=False).split()]
+    files = sorted({f for t in tasks for f in files_by_task.get(t, [])})
+    v = read_verdict(repo) or {}
+    prompt = cfg["judge_prompt"].format(
+        tasks=", ".join(tasks), base=base_head[:10],
+        commits=", ".join(commits) or head[:10],
+        files=", ".join(files) or "(undeclared)",
+        verify_tail=(v.get("tail") or "")[-1500:],
+    )
+    tag = "review-" + "-".join(tasks)[:60]
+    journal(repo, {"event": "review_start", "tasks": tasks, "commit": head})
+    print(f"  review of {', '.join(tasks)} ...")
+    verdict, member = judge_once(repo, cfg, prompt, run_dir, tag, run_id)
+    if verdict is None:
+        journal(repo, {"event": "review_skipped", "tasks": tasks, "reason": member})
+        print(f"  review unavailable ({member}) - tasks stay DONE, unreviewed")
+        return {"final": "skipped", "reason": member, "tasks": tasks, "findings": [],
+                "score": None, "verdict": None, "member": None, "brief": ""}
+    high = [f for f in verdict["findings"] if f.get("severity") in ("high", "critical")]
+    passed = verdict["verdict"] == "pass" and not high
+    info = {"final": "pass" if passed else "failed", "reason": "" if passed else
+            (f"{len(high)} high finding(s)" if high else f"verdict {verdict['verdict']}"),
+            "score": verdict["score"], "verdict": verdict["verdict"], "member": member,
+            "findings": verdict["findings"], "brief": verdict["revision_brief"],
+            "tasks": tasks}
+    journal(repo, {"event": "review_verdict", "tasks": tasks, "score": verdict["score"],
+                   "verdict": verdict["verdict"], "member": member,
+                   "findings": len(verdict["findings"]), "high": len(high), "passed": passed})
+    print(f"  review ({member}): {verdict['verdict']}, score {verdict['score']}, "
+          f"{len(verdict['findings'])} finding(s), {len(high)} high")
+    notify(cfg, repo, f"review of {', '.join(tasks)}: {info['final']} ({member})",
+           format_findings(verdict["findings"]))
+    return info
 
 
-def _escalate(repo: Path, tid: str, rounds: list[dict], reason: str, final: str = "escalated") -> dict:
-    journal(repo, {"event": "judge_escalated", "task": tid, "reason": reason, "final": final})
-    print(f"  {tid} needs you: {reason}")
-    return {"final": final, "reason": reason, "rounds": rounds}
+def append_review_rows(repo: Path, cfg: dict, review: dict, files_by_task: dict[str, list[str]]) -> list[str]:
+    """Turn a passing review's lesser findings into TODO rows of the same
+    package. The row shape follows the last row of the queue table; scope is
+    the finding's file or the reviewed tasks' files. Admission decides later
+    whether each row is small and isolated enough to run."""
+    findings = [f for f in review.get("findings", []) if f.get("severity") not in ("high", "critical")]
+    if not findings:
+        return []
+    qpath = repo / prefixed(cfg, cfg["queue_file"])
+    lines = qpath.read_text(encoding="utf-8").splitlines()
+    rows = [i for i, ln in enumerate(lines) if ROW_RE.match(ln) and not _is_separator_row(ln.split("|"))]
+    if not rows:
+        return []
+    last = lines[rows[-1]]
+    cells = last.split("|")
+    numbers = [int(m.group(1)) for ln in lines for m in [re.match(r"^\s*\|\s*(\d+)\s*\|", ln)] if m]
+    number = max(numbers or [0])
+    existing = set(parse_queue("\n".join(lines)))
+    human_re = re.compile(cfg["human_decision_regex"], re.IGNORECASE)
+    base = "-".join(review["tasks"])[:24]
+    added: list[str] = []
+    new_rows: list[str] = []
+    scope_lines: list[str] = []
+    for f in findings:
+        number += 1
+        n = 1
+        while f"{base}-R{n}" in existing:
+            n += 1
+        tid = f"{base}-R{n}"
+        existing.add(tid)
+        name = human_re.sub("", f.get("issue", "review finding")).replace("|", "/").strip()[:90]
+        row = list(cells)
+        row[1] = f" {number} "
+        row[2] = f" {tid} "
+        row[3] = f" {name or 'review finding'} "
+        row[4] = " `TODO` "
+        for i in range(5, len(row) - 1):
+            row[i] = " "
+        new_rows.append("|".join(row))
+        scope = [f["file"]] if f.get("file") else sorted({x for t in review["tasks"] for x in files_by_task.get(t, [])})
+        scope_lines.append(f"<!-- task:{tid} files: {', '.join(scope)} -->")
+        scope_lines.append(f"<!-- task:{tid} origin: review -->")
+        added.append(tid)
+    lines[rows[-1] + 1:rows[-1] + 1] = new_rows
+    text = "\n".join(lines).rstrip("\n") + "\n" + "\n".join(scope_lines) + "\n"
+    qpath.write_text(text, encoding="utf-8")
+    journal(repo, {"event": "review_rows_added", "tasks": added})
+    return added
 
 
 def cmd_run(args) -> None:
@@ -1992,6 +1977,7 @@ def cmd_run(args) -> None:
     run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     started = time.time()
     max_tasks = args.max_tasks or cfg["max_tasks"]
+    RUN_BUDGET.update(max=int(cfg.get("max_model_calls") or 0), calls=0)
 
     # ---- preflight: refuse to start blind ------------------------------
     hook_ok, hook_mode = hook_installation(repo)
@@ -2022,7 +2008,8 @@ def cmd_run(args) -> None:
     print(f"  workers : {', '.join(workers) or '(none run-wide)'}")
     if pins:
         print("  pinned  : " + ", ".join(f"{t}={w}" for t, w in pins.items()))
-    print(f"  budget  : {max_tasks} task(s), {cfg['run_timeout_s']}s")
+    print(f"  budget  : {max_tasks} task(s), {cfg['run_timeout_s']}s, "
+          f"{RUN_BUDGET['max'] or 'unlimited'} model calls")
     jcfg = sub_cfg(cfg, "judge")
     print(f"  judge   : {'on — ' + ' → '.join(jcfg['chain']) if jcfg.get('enabled') else 'off'}")
     journal(
@@ -2042,10 +2029,18 @@ def cmd_run(args) -> None:
 
     results: list[dict] = []
     stop_reason = "budget"
+    run_base = git(repo, "rev-parse", "HEAD").strip()
+    files_by_task: dict[str, list[str]] = {}
+    review_info: dict | None = None
+    acceptance: dict | None = None
 
     for slot in range(max_tasks):
         if time.time() - started > cfg["run_timeout_s"]:
             stop_reason = "run_timeout"
+            break
+        if RUN_BUDGET["max"] and RUN_BUDGET["calls"] >= RUN_BUDGET["max"]:
+            stop_reason = "budget:model_calls"
+            print(f"GATE: {RUN_BUDGET['calls']} model calls made, limit reached - stopping.")
             break
 
         qtext = qpath.read_text(encoding="utf-8")
@@ -2071,6 +2066,7 @@ def cmd_run(args) -> None:
         pin = pins.get(tid)
         files_map = parse_task_files(qtext)
         task_files = files_map.get(tid) or []
+        files_by_task[tid] = task_files
         adm = admit_verdicts(
             cfg, repo, tasks, files_map, pins, parse_task_after(qtext),
             parse_task_approved(qtext),
@@ -2107,6 +2103,8 @@ def cmd_run(args) -> None:
         outcome = "unknown"
         last_sig = None
         last_worker = ""
+        dirty_retries = 0
+        hint = ""
 
         while attempts < cfg["max_attempts_per_task"]:
             attempt_queue_text = qpath.read_text(encoding="utf-8")
@@ -2146,7 +2144,15 @@ def cmd_run(args) -> None:
             prompt = cfg["worker_prompt"].format(
                 skill=cfg.get("worker_skill") or "the project's next-session",
                 task=tid,
-            )
+            ) + hint + task_packet(repo, cfg, attempt_queue_text, tid, task_files)
+            cap = int(cfg.get("worker_packet_max_bytes") or 0)
+            if cap and len(prompt.encode("utf-8")) > cap:
+                outcome = "prompt_too_large"
+                print(f"  prompt for {tid} is {len(prompt.encode('utf-8'))} bytes > {cap}; "
+                      "shorten the spec acceptance or the declared scope")
+                journal(repo, {"event": "prompt_too_large", "task": tid,
+                               "bytes": len(prompt.encode("utf-8")), "limit": cap})
+                break
             pf = repo / GATE_DIR / "runs" / run_id / f"{tid}-a{dispatches}.prompt.md"
             pf.parent.mkdir(parents=True, exist_ok=True)
             pf.write_text(prompt, encoding="utf-8")
@@ -2211,7 +2217,7 @@ def cmd_run(args) -> None:
                     attempts += 1
                     outcome = "timeout"
                     continue
-                outcome = "worker_error"
+                outcome = "budget" if err == "budget" else "worker_error"
                 break
 
             out = (proc.stdout or "") + (proc.stderr or "")  # already streamed to logp
@@ -2370,13 +2376,35 @@ def cmd_run(args) -> None:
                 )
                 break
 
+            asked = worker_scope_request(out)
+            if asked:
+                outcome = "scope_request"
+                print(f"  {worker} stopped to ask for a scope decision"
+                      + (": " + ", ".join(asked["files"]) if asked["files"] else "")
+                      + " - stopping without an identical retry")
+                journal(repo, {"event": "scope_request", "task": tid, "worker": worker,
+                               "files": asked["files"]})
+                break
+
             dirty_after = non_gate_worktree_state(repo)
-            if dirty_after != attempt_worktree:
+            if dirty_after != attempt_worktree or dirty_retries:
+                # Partial work is not a failure. The next attempt continues on
+                # the dirty tree with a hint; a second attempt that still does
+                # not close the task stops the run for a human to read the log.
+                journal(repo, {"event": "worker_left_changes", "task": tid, "worker": worker,
+                               "retry": dirty_retries == 0})
+                if dirty_retries == 0 and attempts < cfg["max_attempts_per_task"]:
+                    dirty_retries = 1
+                    hint = ("\n\nThe previous attempt left uncommitted changes for this task "
+                            "in the working tree. Continue from them; do not discard or "
+                            "redo them. Finish, verify and commit.")
+                    outcome = "worker_left_changes"
+                    print(f"  {worker} exited without closing {tid} and left changes - "
+                          "one retry on the current tree")
+                    continue
                 outcome = "worker_left_changes"
-                print(
-                    f"  {worker} exited without closing {tid} and changed the worktree — "
-                    "stopping instead of dispatching another worker into partial work"
-                )
+                print(f"  {worker} exited without closing {tid} and changed the worktree "
+                      "again - stopping for a human")
                 break
 
             sig = f"{proc.returncode}:{out.strip().splitlines()[-1][:120] if out.strip() else ''}"
@@ -2391,12 +2419,11 @@ def cmd_run(args) -> None:
                 f"(exit={proc.returncode}, commit {'moved' if advanced else 'unchanged'})"
             )
 
-        judge_info: dict | None = None
-        if outcome == "done" and jcfg.get("enabled"):
-            judge_info = judge_task(
-                repo, cfg, run_id, run_dir, tid, head_before, task_files,
-                last_worker, pin,
-            )
+        checkpoint: dict | None = None
+        if outcome == "done" and jcfg.get("enabled") and tid in (jcfg.get("checkpoints") or []):
+            checkpoint = review_package(repo, cfg, run_id, run_dir, [tid], head_before, files_by_task)
+            if checkpoint["final"] == "pass":
+                append_review_rows(repo, cfg, checkpoint, files_by_task)
 
 
         results.append(
@@ -2408,11 +2435,11 @@ def cmd_run(args) -> None:
                 "run": run_id,
                 "worker": last_worker,
                 "pin": pin or "",
-                "judge": judge_info,
+                "checkpoint": checkpoint,
             }
         )
         journal(repo, {"event": "task_end", "task": tid, "outcome": outcome,
-                       "judge": (judge_info or {}).get("final")})
+                       "checkpoint": (checkpoint or {}).get("final")})
         if outcome != "done":
             notify(
                 cfg,
@@ -2422,17 +2449,36 @@ def cmd_run(args) -> None:
             )
 
         if outcome != "done":
-            stop_reason = f"{outcome}:{tid}"
+            stop_reason = "budget:model_calls" if outcome == "budget" else f"{outcome}:{tid}"
             break
-        if judge_info and judge_info["final"] == "escalated":
-            stop_reason = f"judge_escalated:{tid}"
-            break
-        if judge_info and judge_info["final"] == "broke_verify":
-            stop_reason = f"revision_broke_verify:{tid}"
+        if checkpoint and checkpoint["final"] == "failed":
+            stop_reason = f"review_failed:{tid}"
             break
 
+    # ---- closeout: one review of what closed, then the full oracle once -----
+    done_tasks = [r["task"] for r in results if r["outcome"] == "done"]
+    clean_stop = stop_reason in ("budget", "queue_empty", "run_timeout", "budget:model_calls")
+    if done_tasks and clean_stop:
+        unreviewed = [t for t in done_tasks if not any(
+            r["task"] == t and r.get("checkpoint") for r in results)]
+        if jcfg.get("enabled") and unreviewed and stop_reason != "budget:model_calls":
+            review_info = review_package(repo, cfg, run_id, run_dir, unreviewed, run_base, files_by_task)
+            if review_info["final"] == "failed":
+                stop_reason = "review_failed:" + ",".join(unreviewed)
+            elif review_info["final"] == "pass":
+                append_review_rows(repo, cfg, review_info, files_by_task)
+        if not stop_reason.startswith("review_failed"):
+            print("GATE: full acceptance after the run ...")
+            acceptance = run_acceptance(repo, cfg)
+            journal(repo, {"event": "full_acceptance", "run": run_id, "tasks": done_tasks,
+                           "result": acceptance["result"], "count": acceptance["count"],
+                           "seconds": acceptance["elapsed_s"]})
+            if acceptance["result"] != "PASS":
+                stop_reason = "full_acceptance_failed:" + ",".join(done_tasks)
+
     elapsed = round(time.time() - started, 1)
-    report = render_report(repo, cfg, run_id, results, stop_reason, elapsed)
+    report = render_report(repo, cfg, run_id, results, stop_reason, elapsed,
+                           review=review_info, acceptance=acceptance)
     (repo / GATE_DIR / f"RUN-REPORT-{run_id}.md").write_text(report, encoding="utf-8")
     latest = repo / GATE_DIR / "RUN-REPORT.md"
     latest.write_text(report, encoding="utf-8")
@@ -2449,14 +2495,23 @@ def cmd_run(args) -> None:
     )
 
     needs_human = stop_reason.split(":", 1)[0] in (
-        "judge_escalated", "revision_broke_verify", "needs_approval"
+        "review_failed", "full_acceptance_failed", "needs_approval", "scope_request",
+        "prompt_too_large",
     )
     if any(r["outcome"] != "done" for r in results) or not results or needs_human:
         raise SystemExit(3)
 
 
+def review_reason(results: list[dict], review: dict | None) -> str:
+    for j in [review] + [r.get("checkpoint") for r in results]:
+        if j and j.get("final") == "failed":
+            return j.get("reason") or "failed"
+    return "failed"
+
+
 def render_report(
-    repo: Path, cfg: dict, run_id: str, results: list[dict], stop: str, elapsed: float
+    repo: Path, cfg: dict, run_id: str, results: list[dict], stop: str, elapsed: float,
+    review: dict | None = None, acceptance: dict | None = None,
 ) -> str:
     lines = [
         f"# Run report {run_id}",
@@ -2476,32 +2531,31 @@ def render_report(
     if not results:
         lines.append("| — | nothing ran | 0 | 0 |")
 
-    # Judge: rounds, scores, and what each round's worker was. A skipped
-    # judge is printed loudly — quality silently switched off is the failure.
-    judged = [r for r in results if r.get("judge")]
-    if judged:
-        lines += ["", "## Judge", "",
-                  "| task | final | rounds | scores | workers | reason |",
-                  "|---|---|---:|---|---|---|"]
-        for r in judged:
-            j = r["judge"]
-            scores = " → ".join(str(x["score"]) for x in j["rounds"]) or "—"
-            workers_used = ", ".join(
-                x["worker"] + ("" if x.get("rotated", True) else " (not rotated)")
-                for x in j["rounds"]
-            ) or "—"
-            lines.append(
-                f"| {r['task']} | {j['final']} | {len(j['rounds'])} | {scores} | "
-                f"{workers_used} | {j.get('reason', '')} |"
-            )
-        for r in judged:
-            j = r["judge"]
-            if j["final"] in ("escalated", "broke_verify") and j["rounds"]:
-                last = j["rounds"][-1]
-                lines += ["", f"### {r['task']} — last findings (round {last['round']}, "
-                          f"{last['member']})", "", format_findings(last["findings"])]
-                if last.get("brief"):
-                    lines += ["", f"Brief: {last['brief']}"]
+    # Review: one package review per run plus any checkpoint reviews. A
+    # skipped review is printed loudly - quality silently switched off is
+    # the failure.
+    reviews = [(", ".join(review["tasks"]), review)] if review else []
+    reviews += [(r["task"], r["checkpoint"]) for r in results if r.get("checkpoint")]
+    if reviews:
+        lines += ["", "## Review", "",
+                  "| tasks | final | verdict | score | member | findings | reason |",
+                  "|---|---|---|---:|---|---:|---|"]
+        for label, j in reviews:
+            lines.append(f"| {label} | {j['final']} | {j.get('verdict') or '-'} | "
+                         f"{j.get('score') if j.get('score') is not None else '-'} | "
+                         f"{j.get('member') or '-'} | {len(j.get('findings') or [])} | "
+                         f"{j.get('reason', '')} |")
+        for label, j in reviews:
+            if j.get("findings"):
+                lines += ["", f"### {label} - findings ({j.get('member')})", "",
+                          format_findings(j["findings"])]
+                if j.get("brief"):
+                    lines += ["", f"Brief: {j['brief']}"]
+    if acceptance:
+        lines += ["", "## Full acceptance", "",
+                  f"- `{acceptance['cmd']}` -> **{acceptance['result']}** "
+                  f"(exit {acceptance['exit_code']}, count {acceptance.get('count')}, "
+                  f"{acceptance['elapsed_s']}s)"]
 
     st = tool_state(repo)
     now = time.time()
@@ -2548,25 +2602,35 @@ def render_report(
             f"- **{tid}** touches an irreversible path. Review its scope, then add "
             f"`<!-- task:{tid} approved: <who/date> -->` to the queue and start another run."
         )
-    if stop.startswith("judge_escalated:"):
-        tid = stop.split(":", 1)[1]
+    if stop.startswith("review_failed:"):
+        tids = stop.split(":", 1)[1]
         waiting.append(
-            f"- **{tid}** is DONE by the acceptance gate but the judge could not get it to "
-            "the pass score. Read the Judge section; decide fix / accept / re-shape."
+            f"- **{tids}**: DONE by the acceptance gate, but the review did not pass "
+            f"({review_reason(results, review)}). Read the Review section; admit one "
+            "repair task or accept the risk."
         )
-    if stop.startswith("revision_broke_verify:"):
-        tid = stop.split(":", 1)[1]
+    if stop.startswith("full_acceptance_failed:"):
+        tids = stop.split(":", 1)[1]
         waiting.append(
-            f"- **{tid}**: a judge-driven revision left the tree failing acceptance or "
-            "dirty. Inspect `git log`/`git status` before any further run."
+            f"- **{tids}** closed on their local checks, but the full oracle fails. "
+            "Read the Full acceptance section and admit one repair task."
         )
+    if stop.startswith("scope_request:"):
+        tid = stop.split(":", 1)[1]
+        waiting.append(f"- **{tid}**: the worker asked for a scope decision. Read its log, "
+                       "then widen the declared files or re-shape the task.")
+    if stop.startswith("prompt_too_large:"):
+        tid = stop.split(":", 1)[1]
+        waiting.append(f"- **{tid}**: its worker packet exceeds worker_packet_max_bytes. "
+                       "Shorten the spec acceptance section or split the task.")
+    if review and review["final"] == "skipped":
+        waiting.append(f"- **{', '.join(review['tasks'])}** closed without a review "
+                       f"({review.get('reason')}). Not blocking; spot-check them.")
     for r in results:
-        j = r.get("judge")
+        j = r.get("checkpoint")
         if j and j["final"] == "skipped":
-            waiting.append(
-                f"- **{r['task']}** closed without a judge review ({j.get('reason')}). "
-                "Not blocking; spot-check it."
-            )
+            waiting.append(f"- **{r['task']}** closed without its checkpoint review "
+                           f"({j.get('reason')}). Not blocking; spot-check it.")
     lines += ["", "## Waiting on you", ""]
     lines += waiting or ["- nothing"]
 
