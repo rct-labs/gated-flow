@@ -1870,6 +1870,15 @@ def format_findings(findings: list[dict]) -> str:
     )
 
 
+def review_prompt_template(cfg: dict) -> str:
+    """The project's judge_prompt, unless it is a per-task template from
+    before package review ({task}, {commit}, {pass_score}); then the default."""
+    prompt = cfg.get("judge_prompt") or ""
+    if "{tasks}" in prompt and not any(k in prompt for k in ("{task}", "{commit}", "{pass_score}")):
+        return prompt
+    return DEFAULT_CONFIG["judge_prompt"]
+
+
 def review_package(
     repo: Path, cfg: dict, run_id: str, run_dir: Path, tasks: list[str],
     base_head: str, files_by_task: dict[str, list[str]],
@@ -1886,7 +1895,11 @@ def review_package(
     commits = [c[:10] for c in git(repo, "rev-list", f"{base_head}..{head}", check=False).split()]
     files = sorted({f for t in tasks for f in files_by_task.get(t, [])})
     v = read_verdict(repo) or {}
-    prompt = cfg["judge_prompt"].format(
+    template = review_prompt_template(cfg)
+    if template is not cfg.get("judge_prompt"):
+        journal(repo, {"event": "judge_prompt_reset",
+                       "reason": "project judge_prompt predates package review"})
+    prompt = template.format(
         tasks=", ".join(tasks), base=base_head[:10],
         commits=", ".join(commits) or head[:10],
         files=", ".join(files) or "(undeclared)",
@@ -1936,6 +1949,7 @@ def append_review_rows(repo: Path, cfg: dict, review: dict, files_by_task: dict[
     numbers = [int(m.group(1)) for ln in lines for m in [re.match(r"^\s*\|\s*(\d+)\s*\|", ln)] if m]
     number = max(numbers or [0])
     existing = set(parse_queue("\n".join(lines)))
+    checks = parse_task_verify("\n".join(lines))
     human_re = re.compile(cfg["human_decision_regex"], re.IGNORECASE)
     base = "-".join(review["tasks"])[:24]
     added: list[str] = []
@@ -1960,11 +1974,23 @@ def append_review_rows(repo: Path, cfg: dict, review: dict, files_by_task: dict[
         scope = [f["file"]] if f.get("file") else sorted({x for t in review["tasks"] for x in files_by_task.get(t, [])})
         scope_lines.append(f"<!-- task:{tid} files: {', '.join(scope)} -->")
         scope_lines.append(f"<!-- task:{tid} origin: review -->")
+        # The same local check as the reviewed task that owns the file, so a
+        # review row never falls back to the full suite during implementation.
+        owner = next((t for t in review["tasks"] if f.get("file") in files_by_task.get(t, [])), None)
+        check = checks.get(owner) or next((checks[t] for t in review["tasks"] if t in checks), None)
+        if check:
+            scope_lines.append(f"<!-- task:{tid} verify: {json.dumps(check)} -->")
         added.append(tid)
     lines[rows[-1] + 1:rows[-1] + 1] = new_rows
     text = "\n".join(lines).rstrip("\n") + "\n" + "\n".join(scope_lines) + "\n"
     qpath.write_text(text, encoding="utf-8")
     journal(repo, {"event": "review_rows_added", "tasks": added})
+    # A queue-only commit flips nothing to DONE, so the hook lets it through;
+    # the next run then starts from a clean tree instead of a dirty queue.
+    rel = prefixed(cfg, cfg["queue_file"])
+    git(repo, "add", "--", rel, check=False)
+    git(repo, "commit", "-q", "-m", "chore(gate): review findings as tasks " + ", ".join(added),
+        "--", rel, check=False)
     return added
 
 
@@ -2651,8 +2677,14 @@ def render_report(
         )
     elif stop == "queue_empty":
         lines.append("- Nothing left to do. The queue has no eligible task.")
-    elif stop in ("budget", "run_timeout"):
+    elif stop in ("budget", "run_timeout", "budget:model_calls"):
         lines.append("- Budget reached. Start another run to continue.")
+    elif stop.startswith("review_failed:"):
+        lines.append("- The tasks are DONE and committed; the review, not the work, stopped "
+                     "the run. Admit one repair row for the findings above, then run again.")
+    elif stop.startswith("full_acceptance_failed:"):
+        lines.append("- Local checks passed but the full oracle did not. Admit one repair "
+                     "row with the failing test as its local check, then run again.")
     else:
         lines.append(
             "- A task did not close. Its prompt and full worker log are under "
@@ -2690,6 +2722,9 @@ def cmd_doctor(args) -> None:
     installed, hook_mode = hook_installation(repo)
     print(f"pre-commit gate : {'INSTALLED' if installed else 'not installed'} ({hook_mode})")
     print(f"verify_cmd      : {cfg['verify_cmd']}")
+    if review_prompt_template(cfg) is not cfg.get("judge_prompt"):
+        print("judge_prompt    : per-task template from an older engine; the default "
+              "package-review prompt will be used (delete the key to silence this)")
     v = read_verdict(repo)
     if v:
         age = int(time.time() - float(v.get("at_epoch", 0)))

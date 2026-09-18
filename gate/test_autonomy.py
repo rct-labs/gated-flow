@@ -153,6 +153,30 @@ class ReviewTests(unittest.TestCase):
             self.assertIn("<!-- task:EAV-2-R1 files: eav2.txt -->", queue)
             self.assertIn("<!-- task:EAV-2-R1 origin: review -->", queue)
             self.assertIn("## Waiting on you\n\n- nothing", report)
+            # The queue commit leaves a clean tree for the next run.
+            self.assertEqual(run("git", "-C", str(repo), "status", "--porcelain",
+                                 "--", "TASK_QUEUE.md").stdout.strip(), "")
+            self.assertIn("review findings as tasks", run("git", "-C", str(repo), "log",
+                                                            "--oneline", "-1").stdout)
+
+    def test_review_rows_inherit_the_local_check_and_old_prompts_are_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"], extra={
+                "judge_prompt": "Judge task {task} at {commit}; pass at {pass_score}."})
+            queue = repo / "TASK_QUEUE.md"
+            queue.write_text(queue.read_text(encoding="utf-8")
+                             + '<!-- task:EAV-2 verify: {"cmd": "python -c \\"print(\'2 passed\')\\"", "timeout_s": 30} -->\n',
+                             encoding="utf-8")
+            run("git", "-C", str(repo), "add", "TASK_QUEUE.md")
+            run("git", "-C", str(repo), "commit", "-q", "-m", "local check")
+            judge, calls = self._judge([verdict(70, "pass")])
+            self._run(repo, self._spawn([]), judge)
+            self.assertIn("Tasks under review: EAV-2.", calls["prompts"][0])
+            text = queue.read_text(encoding="utf-8")
+            self.assertIn('<!-- task:EAV-2-R1 verify: {"cmd": "python -c', text)
+            events = [json.loads(ln) for ln in
+                      (repo / ".gate" / "journal.ndjson").read_text(encoding="utf-8").splitlines()]
+            self.assertTrue(any(e["event"] == "judge_prompt_reset" for e in events))
 
     def test_high_finding_fails_the_review_and_stops(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -308,6 +332,15 @@ class JudgeChainTests(unittest.TestCase):
             self.assertEqual((v["score"], v["verdict"]), (40, "revise"))
             self.assertIsNone(self.gate.parse_judge_output(
                 "{\"score\": 300, \"verdict\": \"pass\"}", Path(td) / "none"))
+
+    def test_scope_request_detection(self) -> None:
+        ask = self.gate.worker_scope_request
+        self.assertIsNone(ask("Implemented and committed. Done."))
+        self.assertEqual(ask("Blocked: this needs your decision on the declared files; "
+                             "I would also touch src/extra.py"), {"files": ["src/extra.py"]})
+        chinese = "| \u8981\u4f60\u51b3\u5b9a | \u6269\u56f4 tests/test_new.py |"
+        self.assertEqual(ask(chinese), {"files": ["tests/test_new.py"]})
+        self.assertIsNone(ask("| \u8981\u4f60\u51b3\u5b9a | \u65e0 |"))
 
     def test_judge_contracts_are_read_only(self) -> None:
         self.assertIn("claude-fable-5-1", self.gate.JUDGE_CMDS["fable"])
