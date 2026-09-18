@@ -1,136 +1,130 @@
-# flow-run autonomy — judge chain, usage-aware dispatch, bounded iteration, reversibility tiers
+# flow-run autonomy: probe, one review per run, one full acceptance, bounded spend
 
-> Design contract for the 2026-09-03 upgrade of `gate/gate.py` + the `flow-run` / `run-queue`
-> skills (`skills/flow-run`, `skills/run-queue`). Config keys below are the SSOT; `gate/README.md`
-> documents mechanics, `docs/usage.md` the human view. Design decision (2026-09-03): `$flow`
-> settles the requirement interactively; `$flow-run` runs it unattended. This document only
-> covers the unattended half.
+> Design contract for the unattended half of `gate/gate.py` and the
+> `flow-run` / `run-queue` skills. Config keys below are the single source of
+> truth; `gate/README.md` documents mechanics, `docs/usage.md` the human view.
+> `$flow` settles the requirement interactively; `$flow-run` runs it unattended.
 
 ## 0. Goal
 
-One `$flow-run` should end in one of two states, without a human in the loop in between:
+One `$flow-run` ends in one of two states, without a human in between:
 
-1. every admitted task closed **and judged acceptable**, or
-2. a short list of things that genuinely need the user: an escalated task with the judge's
-   findings, or an irreversible task waiting for approval.
+1. every admitted task closed, reviewed once as a package, and the full
+   oracle green; or
+2. a short list of things that genuinely need the user: a review with a high
+   finding, a failing full oracle, a scope request, or an irreversible task
+   waiting for approval.
 
-Everything else — worker choice, quota outages, one or two quality iterations — is handled by
-the runner.
+Everything else (worker choice, quota outages, a worker that stopped halfway)
+is handled by the runner. The runner's own machinery must cost less than the
+work it supervises: no evidence caches, no receipts, no environment hashing,
+no revision loops.
 
-## 1. Roles and model sets (unchanged, now mechanised)
+## 1. Roles
 
-| role | who | model chain |
+| role | who | model |
 |---|---|---|
-| host | the interactive CLI running `$flow-run` | fable 5.1 → opus 5 → codex (skill rule; the host cannot switch itself, it says which it is) |
-| **judge** | headless process the runner spawns after every `task_done` | `judge.chain` = `["fable", "opus", "codex"]`, tried in order, next on outage / unparsable output |
-| worker | headless process per task attempt | opus / codex / kimi / grok only — fable forbidden (`ensure_worker_model`) |
+| host | the interactive CLI running `$flow-run`: inspects, decides, writes the queue | whatever the user is talking to |
+| worker | one headless process per task attempt | `workers` list and row pins; `worker_cmds` / `worker_models` in `.gate/config.json` |
+| reviewer | one read-only headless process per run (plus checkpoints) | `judge.chain`, tried in order, next member on outage or unparsable output |
 
-The model names above are the authors' defaults, not a fixed contract: the judge chain, the
-worker list and the forbidden-worker list are configuration (`judge.chain`, `judge_cmds`,
-`workers`, `worker_cmds` in `.gate/config.json`, and `FORBIDDEN_WORKER_MODELS` in `gate.py`),
-and another deployment may pin different models.
+Model names in the shipped defaults are the authors' choices, not a contract.
+The `pi` worker runs any OpenRouter model (`worker_models.pi`); pi reads
+`OPENROUTER_API_KEY` from the environment.
 
-The judge path (`spawn_judge`) is separate from `spawn_worker`; the fable prohibition applies to
-workers only. Verified on the authors' installation at the time (2026-09-03): `claude -p --model
-claude-fable-5-1 --output-format json --json-schema …` returned `structured_output`; `codex exec
---sandbox read-only --output-schema f -o out -` wrote the JSON to `out`. Re-check these flags
-against the CLI versions you actually have installed.
+## 2. Probe before spend
 
-## 2. Usage-aware dispatch (probe before spend)
+At run start every candidate CLI (run-wide list, row pins, review chain) gets
+one tiny real request. A quota-shaped answer benches it for `quota_cooldown_s`;
+a probe that never reached the provider benches it for `probe.retry_s` only.
+State lives in `.gate/tool-status.json`; `gate.py usage` prints it on demand.
+Probes count against `max_model_calls`.
 
-Today benching is reactive: a worker is benched only after an attempt died on a quota error, and
-that costs a dispatch plus a queue-row restore. New: **probe once per run, before the first
-dispatch**, every candidate worker (run-wide list ∪ row pins ∪ judge chain CLIs).
+## 3. Dispatch
 
-- Probe = one tiny real request (`Reply with the single word OK`) per CLI, `probe.timeout_s` (90).
-- Output matched against `QUOTA_PATTERNS` → bench for `quota_cooldown_s` (same as reactive).
-- Timeout / not installed / other non-zero exit → bench for `probe.retry_s` (600) only. A probe
-  that never reached the provider must not occupy the quota window.
-- Benched-by-probe state lives in `.gate/tool-status.json` with `reason: probe:<why>`; the run
-  report lists it. `gate.py usage --repo` prints the same table on demand.
-- Never probe per task. A worker whose cooldown expires mid-run is re-probed once before it is
-  dispatched again.
+- The worker prompt is `worker_prompt` plus a **task packet**: the queue row,
+  declared files, the local check command, the acceptance section of the work
+  package spec, and `git diff --stat`. A packet over `worker_packet_max_bytes`
+  is refused (`prompt_too_large:<id>`), never trimmed silently.
+- A worker that exits with uncommitted changes and no DONE gets one retry on
+  the same tree with a one-line hint. A second attempt that still does not
+  close the task stops the run (`worker_left_changes:<id>`).
+- A worker that stops to ask for a scope decision stops the run
+  (`scope_request:<id>`) instead of being asked the same question again.
+- Two identical failures stop the task (`no_progress`). Tool outages bench
+  the CLI and restore the row without spending an attempt.
 
-Worker **choice by task kind** stays with the host (it writes the `worker` column). Rule table
-in the `flow-run` skill; the runner only honours pins and falls through.
+## 4. Verification
 
-## 3. Judge after every task (not at the end)
+- `gate.py verify --task ID` runs the task's admitted local command
+  (`<!-- task:ID verify: {"cmd": ..., "timeout_s": N} -->`) and records a
+  task-scoped verdict bound to the bytes of the declared files. The commit
+  hook accepts the DONE flip of that task while those bytes are unchanged.
+- `gate.py verify --queue` runs the full `verify_cmd`. The runner does this
+  once after the review, journals `full_acceptance`, and stops with
+  `full_acceptance_failed:<ids>` when it fails. Nothing is rolled back.
+- No verdict cache. Re-running a local check is the cheap path.
 
-Why per task: later tasks build on earlier ones; a defect found at run end means the whole chain
-is suspect. Evidence for bounded iteration: first correction gives the bulk of the gain
-(~62 → 70 %), the third and later attempts add < 2 % each and mostly recycle the previous diff
-(self-correcting agent studies, 2026; Socratic-SWE plateaus by iteration 4–5).
+## 5. One review per run
 
-Sequence after `task_done`:
+When `judge.enabled` is true, after the last task of the run closes the
+runner spawns the review chain once with `judge_prompt` (tasks, commit range,
+declared files, verify tail). Rows listed in `judge.checkpoints` are reviewed
+on their own right after they close.
 
-1. `judge_start` — spawn the chain with `judge_prompt` (task id, commit, declared files, verify
-   tail). The judge reads the owning spec's acceptance, the diff, the tests, and returns strict
-   JSON `{score 0–100, verdict pass|revise|escalate, findings[], revision_brief}`.
-   Rubric in the prompt: acceptance met 40 · tests real + mutation-checked 20 · scope discipline
-   15 · conventions/quality 15 · regression risk 10.
-2. `judge_verdict` journaled with score + verdict + chain member used.
-3. `pass` or `score ≥ judge.pass_score` (85) → next task. **The judge never touches the queue
-   row; DONE was earned by the exit-code gate and stays.**
-4. `revise` → a **revision attempt** if all hold:
-   - revisions so far `< judge.max_revisions` (2 → at most 3 rounds total: initial + 2),
-   - not the second revision with score gain `< judge.min_gain` (5) — no-progress early stop,
-   - a usable worker exists; one **other than** the last committer is preferred (rotation;
-     the same model repeats its own blind spot). When the last committer is the only usable
-     worker it is reused, and the journal (`revision_start.rotated: false`) and the report
-     (`(not rotated)`) say so. No usable worker at all → escalate `no_workers_for_revision`.
-     Projects should therefore list at least two CLIs in `workers`.
-   Revision prompt: fix exactly these findings, code only, never edit the queue row, run the
-   acceptance, commit. After it returns the runner re-runs the acceptance itself
-   (`cmd_verify` internals): HEAD moved + FAIL → stop `revision_broke_verify:<id>` (no auto
-   reset); HEAD unchanged → failed revision, counts against the cap; then re-judge.
-   Same `non_gate_worktree_state` / `queue_status_changes` guards as a normal attempt.
-5. `escalate`, cap reached, or no-progress → stop the run `judge_escalated:<id>`; the report
-   carries score history and the last findings. The task stays DONE.
-6. Judge chain entirely down or every member returns unparsable JSON → `judge_skipped`, the
-   run continues, the report says so in its own section. A judge outage is not a task failure,
-   and must not silently switch quality off — visibility is the substitute.
+- Pass: verdict `pass` and no `high` finding. The score is recorded, never
+  gated on. A single-model score varies by several points between rounds; a
+  threshold on it is a coin flip, and the five-round revise loop it produced
+  on a real project is why this design exists.
+- Medium and low findings on a passing review become TODO rows of the same
+  package (`<!-- task:ID origin: review -->`, scope from the finding's file),
+  admitted like any other row on the next run.
+- Fail: stop with `review_failed:<ids>` and the findings in the report. The
+  host admits one repair task; the runner never revises on its own.
+- Chain down or unparsable: `review_skipped`, the run continues to full
+  acceptance, the report says so. Visibility replaces a silent quality-off.
 
-Cost caps: claude judge/worker entries carry `--max-budget-usd`; codex has no equivalent, so
-`judge.timeout_s` (1200) is its cap. Total per task ≤ 3 rounds.
+## 6. Spend
 
-## 4. Reversibility tiers
+Two numbers: `max_model_calls` (workers, reviewers and probes of one run)
+and `run_timeout_s`. Reaching either stops the run with `budget:model_calls`
+or `run_timeout`. No persistent ledger; a new run is a new budget by design,
+and the host decides whether to start one.
+
+## 7. Reversibility tiers
 
 | tier | examples | runner behaviour |
 |---|---|---|
-| read-only | tsc, vitest, git diff, code-graph queries | free |
-| reversible | src edits, local commits, test.db | free; every commit is logged in the journal |
-| external | `git push`, broadcasts | worker prompt forbids; the **host** does it after the run if CONTEXT/user allowed, with `rev-list 0/0` re-verification |
-| **irreversible** | `irreversible_globs`: migrations, `data/**`, hooks, `.claude/settings*`, `--force` | needs `<!-- task:ID approved: <date or who> -->`; `admit` reports `needs-approval`; `run` stops with `needs_approval:<id>` **even in advisory mode** |
+| read-only | tests, git diff, code queries | free |
+| reversible | src edits, local commits | free; every commit is in the journal |
+| external | `git push`, broadcasts | worker prompt forbids; the host does it after the run when allowed |
+| irreversible | `irreversible_globs`: migrations, `data/**`, hooks, settings | needs `<!-- task:ID approved: <who/date> -->`; `run` stops with `needs_approval:<id>` even in advisory mode |
 
-Approval is per task id and single-use by construction. The host places such tasks at the queue
-tail so the run finishes everything else first and the user approves once, not mid-run.
-
-## 5. Config keys (defaults)
+## 8. Config keys (defaults)
 
 ```json
 "probe": { "enabled": true, "timeout_s": 90, "retry_s": 600 },
-"judge": { "enabled": false, "chain": ["fable", "opus", "codex"], "pass_score": 85,
-           "max_revisions": 2, "min_gain": 5, "timeout_s": 1200 },
+"judge": { "enabled": false, "chain": ["fable", "opus", "codex"], "checkpoints": [], "timeout_s": 1200 },
 "judge_cmds": { "fable": [...], "opus": [...], "codex": [...] },
-"judge_prompt": "<generic template; {task} {commit} {files} {verify_tail}>",
-"revision_prompt": "<generic template; {task} {findings} {brief}>",
+"judge_prompt": "<template; {tasks} {base} {commits} {files} {verify_tail}>",
+"max_model_calls": 40,
+"worker_packet_max_bytes": 6000,
+"worker_models": { "pi": "" },
 "irreversible_globs": ["drizzle/**", "data/**", ".git/hooks/**", ".claude/settings*", "scripts/apply-*"]
 ```
 
-`judge.enabled` defaults to **false** so existing projects are unchanged until they opt in;
-projects opt in per `.gate/config.json`. `workers` / `max_task_files` / admission thresholds
-are untouched.
+## 9. Journal events and stop reasons
 
-## 6. Journal events and stop reasons added
+Events: `probe`, `attempt_start`, `heartbeat`, `task_done`, `worker_left_changes`,
+`scope_request`, `prompt_too_large`, `review_start`, `review_verdict`,
+`review_skipped`, `review_rows_added`, `full_acceptance`, `needs_approval`,
+`task_end`, `tool_disabled`, `run_end`.
 
-Events: `probe`, `judge_start`, `judge_verdict`, `judge_skipped`, `revision_start`,
-`revision_end`, `judge_escalated`, `needs_approval`.
-Stop reasons: `judge_escalated:<id>`, `revision_broke_verify:<id>`, `needs_approval:<id>`.
-Both skills' watcher regex must list the new events, or the narrator goes silent on exactly the
-new behaviour.
+Stop reasons that need a human: `review_failed:<ids>`, `full_acceptance_failed:<ids>`,
+`scope_request:<id>`, `prompt_too_large:<id>`, `needs_approval:<id>`.
 
-## 7. What the user sees at the end
+## 10. What the user reads
 
-`RUN-REPORT.md` gains a **Judge** section (per task: rounds, scores, final verdict, worker per
-round) and a **Waiting on you** section that is empty on a clean run. That last section is the
-only thing the user has to read.
+`RUN-REPORT.md`: the task table, a **Review** section, a **Full acceptance**
+line, and **Waiting on you**, which is empty on a clean run and is the only
+section the user has to read.

@@ -135,3 +135,16 @@ an audit is a separate, human-approved batch.
   that the gate contract requires of a worker.
 - No independent model as the acceptance authority; acceptance is a command
   and its exit code.
+
+## 9. Removed on 2026-09-18, and why
+
+Between 2026-09-08 and 2026-09-17 the engine grew a per-task judge with a
+score threshold and revision loop, execution profile freezing, receipt-based
+recovery of stopped tasks, an acceptance cache keyed on environment hashes, a
+persistent cost ledger and 130 KB of policy prose. On the one real project
+that ran it, throughput fell from 0.34 hours per closed task to two hours,
+then to zero, with most runs stopping because the machinery refused finished
+work. All of it is gone. What replaced it: task-local verify bound to file
+bytes, one package review per run gated on high findings, a flat call budget,
+one retry on a dirty tree, and a bounded worker packet. The archive branch
+`archive/codex-rework-20260918` keeps the removed code for reference.

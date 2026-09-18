@@ -26,7 +26,7 @@ Unattended agents converge on a specific lie: a commit that flips a task to
 DONE while touching only the queue file. The engine in `gate/` closes that hole
 mechanically — a git `pre-commit` hook derives the verdict from the diff and the
 acceptance command's exit code, so there is no field to lie in. Everything else
-here (admission control, journal narration, judge chain, session handoff) is
+here (admission control, journal narration, one package review per run) is
 built on that one property. `docs/design.md` is the contract.
 
 ## How the pieces fit
@@ -128,10 +128,11 @@ stop reasons and troubleshooting.
 - The engine itself is portable Python; `gate/selftest.sh` and the unit tests
   run under Git Bash. A foreground or `nohup python gate/gate.py run …` on
   macOS/Linux runs the same loop but has not been exercised by the authors.
-- Worker and judge model names (`opus`, `codex`, `kimi`, `grok`, `fable`) are
+- Worker and reviewer model names (`codex`, `kimi`, `grok`, `fable`) are
   configuration defaults in `.gate/config.json` (`workers`, `worker_cmds`,
-  `judge.chain`, `judge_cmds`); pin whatever your subscriptions serve. Every
-  headless call is a real request against your own CLI subscriptions.
+  `judge.chain`, `judge_cmds`); pin whatever your subscriptions serve. The
+  `pi` worker runs any OpenRouter model named in `worker_models.pi`. Every
+  headless call is a real request against your own subscriptions.
 - `model-debate` resolves model identities at runtime from CLI metadata and
   requires two provably distinct models; see `skills/model-debate/README.md`.
 - The command is named `flow`. If another `flow` (for example Facebook's Flow
@@ -142,13 +143,12 @@ stop reasons and troubleshooting.
 
 ```bash
 python scripts/verify_repository.py      # whitelist, English-only, paths, links, frontmatter, parse checks
-bash gate/selftest.sh                    # 10 gate cases in a throwaway repo
+bash gate/selftest.sh                    # 11 gate cases in a throwaway repo
 python -m unittest discover -s gate -p "test_*.py" -q
 python examples/model-debate/evidence.py
 ```
 
-CI runs the same checks. `gate/smoke_sessions.py` is an opt-in live pilot
-that uses your installed Codex account; it is never run automatically.
+CI runs the same checks. No test makes a real model call.
 
 ## Maintenance
 

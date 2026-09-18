@@ -78,9 +78,8 @@ code 127 and a required check blocks — so leave `quality` out of
 `.gate/config.json` unless you provide a runner with that contract.
 
 Run `python -m unittest discover -s gate -p "test_*.py" -q` from the repository
-root for regression coverage, including resume, invalidation, revision, and
-partial-work stopping. Change session policy separately from verification
-policy when comparing performance.
+root for regression coverage: hook gates, task-local verify, package review,
+budget and partial-work retry.
 
 ## Admission — before a task ever enters the loop
 
@@ -168,49 +167,49 @@ Codex `workspace-write` intentionally protects `.git/**` as read-only while the
 gate contract requires workers to create claim and completion commits. Projects
 may pin or override this under `worker_cmds.codex` in `.gate/config.json`.
 
-## Autonomy: probe, judge, revise, approve (2026-09-03)
+## Autonomy: probe, review once, accept once, approve
 
-Design: `../docs/autonomy.md`. Four additions to `run`, all config-gated:
+Design: `../docs/autonomy.md`. Config-gated additions to `run`:
 
-**Usage probe** (`probe`, default on). At run start every candidate CLI — the run-wide
-list, row pins, and the judge chain's tools — gets one tiny real request
-(`gate.py usage --repo <project>` does the same on demand). A quota-shaped reply
-benches it for `quota_cooldown_s`; a probe that never reached the provider (timeout,
-not installed, other error) benches it for `probe.retry_s` (600) only, so a local
-failure cannot occupy the quota window. One probe per CLI per run, lazily repeated
-when a cooldown expires mid-run. `tool-status.json` records `reason: probe:<why>`.
+**Usage probe** (`probe`, default on). At run start every candidate CLI (run-wide
+list, row pins, review chain) gets one tiny real request; `gate.py usage` does the
+same on demand. A quota-shaped reply benches it for `quota_cooldown_s`; a probe that
+never reached the provider benches it for `probe.retry_s` only.
 
-**Judge after every task** (`judge`, default **off**; opt in per project). After
-`task_done` the runner spawns a read-only judge — chain `fable → opus → codex`, next
-member on outage or unparsable output — with the task's declared files, commits, and
-acceptance tail. The chain members and their command lines are configuration defaults
-(`judge.chain`, `judge_cmds`), not a fixed contract; replace them as models change.
-It scores 0–100 against the owning spec (acceptance 40 · real tests
-20 · scope discipline 15 · conventions 15 · regression risk 10) and returns strict JSON
-(`score`, `verdict` pass|revise|escalate, `findings[]`, `revision_brief`).
-The judge never touches the queue row: DONE was earned by the exit-code gate and stays.
+**Task packet.** Each worker prompt carries the queue row, declared files, the local
+check command, the spec's acceptance section and `git diff --stat`, capped at
+`worker_packet_max_bytes` (6000). A larger packet stops the run with
+`prompt_too_large:<id>` instead of being sent.
 
-**Bounded revision.** `revise` dispatches a fix to a worker *other than* the one that
-made the last commit (rotation), at most `judge.max_revisions` (2) times — initial + 2
-= 3 rounds, where self-correction's per-round gain drops under 2% — and stops early
-when the score gains less than `judge.min_gain` (5). A revision commit is not a DONE
-flip, so `check-commit` does not engage; the runner re-runs the acceptance command
-itself. HEAD moved + FAIL → `revision_broke_verify:<id>`, nothing is auto-reset.
-`escalate`, cap, or no progress → `judge_escalated:<id>`; the report carries the score
-history and last findings. Whole chain down → `judge_skipped`, run continues, report
-says so under **Waiting on you**.
+**Partial work.** A worker that exits with uncommitted changes gets one retry on the
+same tree with a hint; a second attempt that still does not close the task stops the
+run with `worker_left_changes:<id>`. A worker that asks for a scope decision stops the
+run with `scope_request:<id>`.
+
+**One review per run** (`judge`, default off). After the last task closes, the review
+chain (`judge.chain`, next member on outage or unparsable output) reads the run's
+commits once and returns strict JSON (`score`, `verdict`, `findings[]`,
+`revision_brief`). Pass means verdict `pass` and no `high` finding; the score is
+recorded only. Medium and low findings are appended to the queue as TODO rows with
+`<!-- task:ID origin: review -->`. A failed review stops with `review_failed:<ids>`;
+a chain outage journals `review_skipped` and the run continues. Rows in
+`judge.checkpoints` are reviewed alone right after they close. There is no revision
+loop: the host admits one repair row.
+
+**Full acceptance once.** After a passing (or skipped) review the runner runs
+`verify_cmd` once, journals `full_acceptance`, and stops with
+`full_acceptance_failed:<ids>` when it fails. Nothing is rolled back.
+
+**Budget.** `max_model_calls` counts every model process of the run (workers,
+reviewers, probes); reaching it stops the run with `budget:model_calls`.
 
 **Reversibility tier** (`irreversible_globs`). A TODO task whose declared files match
-(migrations, `data/**`, hooks, `.claude/settings*`, apply scripts) is refused
-`needs-approval` by `admit` (printed `APPROVAL`) unless the queue carries
-`<!-- task:ID approved: <who/date> -->`. `run` stops on it with `needs_approval:<id>`
-**even in advisory mode**. Approval is per task id and therefore single-use.
+is refused `needs-approval` by `admit` unless the queue carries
+`<!-- task:ID approved: <who/date> -->`; `run` stops on it with `needs_approval:<id>`
+even in advisory mode.
 
-Exit code 3 now also covers `judge_escalated`, `revision_broke_verify` and
-`needs_approval`. Journal events added: `probe`, `judge_start`, `judge_verdict`,
-`judge_skipped`, `revision_start`, `revision_end`, `judge_escalated`, `needs_approval`.
-Regression suite: `python -m unittest test_autonomy` (20 cases, each mutation-checked:
-strip the feature, its test goes red).
+Exit code 3 covers every stop that needs a human: `review_failed`,
+`full_acceptance_failed`, `scope_request`, `prompt_too_large`, `needs_approval`.
 
 ## What it checks, after the fact
 

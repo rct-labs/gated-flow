@@ -138,6 +138,19 @@ else
   echo "FAIL  10 strict admission did not stop the run:"; echo "$RUN"; fail=$((fail+1))
 fi
 
+# ---- task-local verify (case 11) -------------------------------------------
+# WP-3 admits its own check; a task-scoped verdict closes exactly that row.
+cat >> proj/TASK_QUEUE.md <<'EOF'
+<!-- task:WP-3 verify: {"cmd": "echo 3 passed", "timeout_s": 60} -->
+EOF
+git add proj/TASK_QUEUE.md
+git commit -q --no-verify -m "declare WP-3 local check"
+echo "def wp3(): pass" >> proj/src/app.py
+"$PY" "$GATE" verify --repo proj --task WP-3 >/dev/null 2>&1
+sed -i 's/| 4 | WP-3 | small isolated task | `TODO`/| 4 | WP-3 | small isolated task | `DONE`/' proj/TASK_QUEUE.md
+git add proj/TASK_QUEUE.md proj/src/app.py
+expect_allow "11 task-local verdict closes its own task" "feat: WP-3"
+
 echo
 echo "$pass passed, $fail failed   (workdir: $S)"
 [ "$fail" -eq 0 ]
