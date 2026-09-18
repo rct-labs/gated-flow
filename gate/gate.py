@@ -2378,6 +2378,18 @@ def cmd_run(args) -> None:
                         "seconds": took,
                     },
                 )
+                # Scope drift: files the worker committed during this task
+                # that are neither declared nor documentation. Not a stop;
+                # the report names them so the host can look.
+                touched = [p for p in git(repo, "diff", "--name-only", f"{head_before}..{head_after}",
+                                          check=False).splitlines() if p.strip()]
+                declared = {prefixed(cfg, f) for f in task_files}
+                drift = sorted(p for p in touched if p not in declared
+                               and not matches_any(project_rel(cfg, p), cfg["doc_only_globs"]))
+                if drift:
+                    journal(repo, {"event": "scope_drift", "task": tid, "worker": worker, "files": drift})
+                    print(f"  note: {tid} also committed undeclared paths: {', '.join(drift[:6])}"
+                          + (" ..." if len(drift) > 6 else ""))
                 vv = read_verdict(repo)
                 notify(
                     cfg,
@@ -2542,6 +2554,23 @@ def cmd_run(args) -> None:
         raise SystemExit(3)
 
 
+def _journal_tail(repo: Path, run_id: str) -> list[dict]:
+    """Events of this run, from run_start on. Bounded read of the journal."""
+    path = repo / GATE_DIR / "journal.ndjson"
+    if not path.exists():
+        return []
+    events: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            e = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if e.get("event") == "run_start" and e.get("run") == run_id:
+            events = []
+        events.append(e)
+    return events
+
+
 def review_reason(results: list[dict], review: dict | None) -> str:
     for j in [review] + [r.get("checkpoint") for r in results]:
         if j and j.get("final") == "failed":
@@ -2666,6 +2695,10 @@ def render_report(
     if review and review["final"] == "skipped":
         waiting.append(f"- **{', '.join(review['tasks'])}** closed without a review "
                        f"({review.get('reason')}). Not blocking; spot-check them.")
+    drifted = [e for e in _journal_tail(repo, run_id) if e.get("event") == "scope_drift"]
+    for e in drifted:
+        waiting.append(f"- **{e['task']}** committed undeclared paths: {', '.join(e['files'][:8])}. "
+                       "Not blocking; check they belong.")
     for r in results:
         j = r.get("checkpoint")
         if j and j["final"] == "skipped":

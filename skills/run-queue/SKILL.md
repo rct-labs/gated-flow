@@ -71,6 +71,7 @@ Then watch the journal: append-only NDJSON at `<repo>/.gate/journal.ndjson`.
 | `heartbeat` | still alive: elapsed seconds, lines, last output line |
 | `task_done` | the runner verified it: commit sha and duration |
 | `worker_left_changes` | worker stopped with uncommitted work; `retry` says whether it gets another go |
+| `scope_drift` | the task's commits touched undeclared paths; listed under Waiting on you, not a stop |
 | `scope_request` / `prompt_too_large` | needs the host; run stops |
 | `review_start` / `review_verdict` / `review_skipped` | the one package review (or a checkpoint) |
 | `review_rows_added` | lesser findings appended as TODO rows |

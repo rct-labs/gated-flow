@@ -115,7 +115,7 @@ and the host decides whether to start one.
 
 ## 9. Journal events and stop reasons
 
-Events: `probe`, `attempt_start`, `heartbeat`, `task_done`, `worker_left_changes`,
+Events: `probe`, `attempt_start`, `heartbeat`, `task_done`, `scope_drift`, `worker_left_changes`,
 `scope_request`, `prompt_too_large`, `review_start`, `review_verdict`,
 `review_skipped`, `review_rows_added`, `full_acceptance`, `needs_approval`,
 `task_end`, `tool_disabled`, `run_end`.
