@@ -40,40 +40,6 @@ def new_repo(root: Path) -> Path:
     return repo
 
 
-def fake_quality_runner(root: Path) -> Path:
-    """A stand-in for the external continuous-quality runner.
-
-    It honours the contract gate.py relies on: `check --repo R --phase P` runs the
-    configured commands for that phase and exits non-zero only when the project
-    config says `mode: required`. The real runner is not part of this repository,
-    so the tests must not depend on one being installed on the machine.
-    """
-    runner = root / "quality_runner.py"
-    runner.write_text(
-        "import argparse, json, subprocess, sys\n"
-        "from pathlib import Path\n"
-        "ap = argparse.ArgumentParser()\n"
-        "sub = ap.add_subparsers(dest='cmd')\n"
-        "chk = sub.add_parser('check')\n"
-        "chk.add_argument('--repo', required=True)\n"
-        "chk.add_argument('--phase', required=True)\n"
-        "args = ap.parse_args()\n"
-        "cfg = json.loads((Path(args.repo) / '.gate' / 'config.json').read_text(encoding='utf-8'))['quality']\n"
-        "failed = 0\n"
-        "for cmd in cfg.get('commands', []):\n"
-        "    if args.phase in cmd.get('phases', []):\n"
-        "        rc = subprocess.call(cmd['command'], shell=True, cwd=args.repo)\n"
-        "        if rc != 0:\n"
-        "            failed += 1\n"
-        "            print(f\"quality check {cmd['id']} failed ({rc})\")\n"
-        "if failed and cfg.get('mode') == 'required':\n"
-        "    sys.exit(1)\n"
-        "print('quality checks: advisory failure' if failed else 'quality checks: ok')\n",
-        encoding="utf-8",
-    )
-    return runner
-
-
 def committed_runner_repo(root: Path, workers: list[str]) -> Path:
     repo = new_repo(root)
     run("git", "-C", str(repo), "config", "user.name", "Gate Test")
@@ -94,16 +60,6 @@ def committed_runner_repo(root: Path, workers: list[str]) -> Path:
         json.dumps(
             {
                 "workers": workers,
-                "execution": {"defaults": {
-                    "workers": {
-                        "codex": {"model": "codex-test-model", "reasoning_effort": "medium"},
-                        "claude": {"model": "claude-test-model", "reasoning_effort": "medium"},
-                        "grok": {"model": "grok-test-model", "reasoning_effort": "not_applicable", "reasoning_note": "test adapter"},
-                        "kimi": {"model": "kimi-test-model", "reasoning_effort": "not_applicable", "reasoning_note": "test adapter"}},
-                    "judges": {
-                        "fable": {"model": "claude-test-fable", "reasoning_effort": "medium"},
-                        "opus": {"model": "claude-test-opus", "reasoning_effort": "medium"},
-                        "codex": {"model": "codex-test-model", "reasoning_effort": "medium"}}}},
                 "worker_prompt": (
                     "Execute exactly task {task}. Never select another TODO task."
                 ),
@@ -170,9 +126,7 @@ class FlowGateCompatibilityTests(unittest.TestCase):
             (gate_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
             (repo / "file.txt").write_text("change\n", encoding="utf-8")
             run("git", "-C", str(repo), "add", "file.txt")
-            runner = fake_quality_runner(Path(td))
-            with mock.patch.dict(os.environ, {"CONTINUOUS_QUALITY_SCRIPT": str(runner)}):
-                result = run(sys.executable, str(GATE), "check-commit", "--repo", str(repo))
+            result = run(sys.executable, str(GATE), "check-commit", "--repo", str(repo))
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("continuous-quality", result.stderr)
 
@@ -204,9 +158,7 @@ class FlowGateCompatibilityTests(unittest.TestCase):
             (gate_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
             (repo / "file.txt").write_text("change\n", encoding="utf-8")
             run("git", "-C", str(repo), "add", "file.txt")
-            runner = fake_quality_runner(Path(td))
-            with mock.patch.dict(os.environ, {"CONTINUOUS_QUALITY_SCRIPT": str(runner)}):
-                result = run(sys.executable, str(GATE), "check-commit", "--repo", str(repo))
+            result = run(sys.executable, str(GATE), "check-commit", "--repo", str(repo))
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("no task flipped to DONE", result.stdout)
 

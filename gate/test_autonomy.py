@@ -312,31 +312,12 @@ class JudgeChainTests(unittest.TestCase):
             self.assertIsNone(self.gate.parse_judge_output(
                 "{\"score\": 300, \"verdict\": \"pass\"}", Path(td) / "none"))
 
-    def test_judge_models_remain_explicit(self) -> None:
+    def test_fable_is_judge_only_never_worker(self) -> None:
         self.assertIn("claude-fable-5-1", self.gate.JUDGE_CMDS["fable"])
-        self.assertIn("opus", self.gate.JUDGE_CMDS["opus"])
         self.assertEqual(self.gate.JUDGE_CMDS["codex"][2:4], ["--sandbox", "read-only"])
-
-    def test_worker_model_inheritance_and_explicit_pins(self) -> None:
-        for flags in [None, [], ["--model", "opus"], ["--model", "claude-fable-5-1"], ["--model=custom"]]:
-            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as td:
-                repo = Path(td)
-                cfg = dict(self.gate.DEFAULT_CONFIG)
-                if flags is not None:
-                    cfg["worker_cmds"] = {"claude": ["claude", "-p", "{prompt}", *flags]}
-                proc = SimpleNamespace(stdout=["ok\n"], poll=lambda: 0, returncode=0)
-                with mock.patch.object(self.gate, "resolve_tool", return_value="claude"), mock.patch.object(self.gate.subprocess, "Popen", return_value=proc) as spawn:
-                    result, error = self.gate.spawn_worker(repo, cfg, "claude", "test prompt", repo / "prompt.txt")
-                self.assertIsNone(error)
-                self.assertIsNotNone(result)
-                argv = spawn.call_args.args[0]
-                if flags is None:
-                    self.assertFalse(any(arg == "--model" or arg.startswith("--model=") for arg in argv))
-                    self.assertIn("acceptEdits", argv)
-                else:
-                    self.assertEqual(argv, ["claude", "-p", "test prompt", *flags])
-                self.assertEqual(spawn.call_args.kwargs["cwd"], str(repo))
-                self.assertNotIn("env", spawn.call_args.kwargs)
+        _, err = self.gate.ensure_worker_model(
+            "claude", ["claude", "-p", "{prompt}", "--model", "claude-fable-5-1"])
+        self.assertIsNotNone(err)
 
     def test_sub_cfg_fills_defaults_under_partial_override(self) -> None:
         cfg = dict(self.gate.DEFAULT_CONFIG)

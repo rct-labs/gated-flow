@@ -27,6 +27,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "publish-manifest.json"
 EXCLUDED = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache"}
+# Operator artifacts: local state and work packages of this checkout. They are
+# never published, so they are neither listed nor scanned.
+OPERATOR_ARTIFACTS = {".gate", ".gitnexus", ".gitnexusignore", "CONTEXT.md", "docs/work"}
 TEXT_SUFFIXES = {".md", ".json", ".py", ".sh", ".ps1", ".svg", ".txt", ".yml", ".yaml", ".toml"}
 TEXT_NAMES = {"LICENSE", ".gitignore", ".gitattributes"}
 HAN = re.compile(r"[\u3400-\u9fff\uf900-\ufaff\U00020000-\U0002fa1f]")
@@ -66,9 +69,14 @@ def main() -> int:
     errors: list[str] = []
     forbidden = load_forbidden(args.forbidden)
 
+    def operator_artifact(rel: Path) -> bool:
+        posix = rel.as_posix()
+        return any(posix == a or posix.startswith(a + "/") for a in OPERATOR_ARTIFACTS)
+
     files = sorted(
         p for p in ROOT.rglob("*")
         if p.is_file() and not EXCLUDED.intersection(p.relative_to(ROOT).parts)
+        and not operator_artifact(p.relative_to(ROOT))
     )
     rels = {p.relative_to(ROOT).as_posix() for p in files}
 

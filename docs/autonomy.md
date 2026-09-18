@@ -11,27 +11,30 @@
 One `$flow-run` should end in one of two states, without a human in the loop in between:
 
 1. every admitted task closed **and judged acceptable**, or
-2. a concrete unresolved condition: missing authorization/information, an unavailable external
-   dependency, or a cause with no supported correction after bounded diagnosis.
+2. a short list of things that genuinely need the user: an escalated task with the judge's
+   findings, or an irreversible task waiting for approval.
 
-The runner owns deterministic attempts, verification, review caps and stop evidence. The host
-owns diagnosis and admission of in-scope repairs between stopped runs. A request to finish
-authorizes such repairs without another confirmation; it does not authorize new external or
-irreversible effects. The shell supervisor does not interpret findings or write repair tasks.
+Everything else — worker choice, quota outages, one or two quality iterations — is handled by
+the runner.
 
-## 1. Roles and model selection
+## 1. Roles and model sets (unchanged, now mechanised)
 
-| role | who | model selection |
+| role | who | model chain |
 |---|---|---|
-| host | interactive CLI | its current model |
-| judge | headless read-only review | configured chain: fable, opus, codex |
-| worker | headless task process | frozen queue model and reasoning profile |
+| host | the interactive CLI running `$flow-run` | fable 5.1 → opus 5 → codex (skill rule; the host cannot switch itself, it says which it is) |
+| **judge** | headless process the runner spawns after every `task_done` | `judge.chain` = `["fable", "opus", "codex"]`, tried in order, next on outage / unparsable output |
+| worker | headless process per task attempt | opus / codex / kimi / grok only — fable forbidden (`ensure_worker_model`) |
 
-Workers, judges, revisions and fallbacks use explicit model and reasoning profiles
-resolved while queueing. See [execution.md](execution.md) for declarations, admission,
-persistent locks and controlled future-task updates. The host's current session and
-later global CLI settings do not select queued execution. Codex and Claude receive
-explicit model/effort flags; roles retain their permissions and review lifecycle.
+The model names above are the authors' defaults, not a fixed contract: the judge chain, the
+worker list and the forbidden-worker list are configuration (`judge.chain`, `judge_cmds`,
+`workers`, `worker_cmds` in `.gate/config.json`, and `FORBIDDEN_WORKER_MODELS` in `gate.py`),
+and another deployment may pin different models.
+
+The judge path (`spawn_judge`) is separate from `spawn_worker`; the fable prohibition applies to
+workers only. Verified on the authors' installation at the time (2026-09-03): `claude -p --model
+claude-fable-5-1 --output-format json --json-schema …` returned `structured_output`; `codex exec
+--sandbox read-only --output-schema f -o out -` wrote the JSON to `out`. Re-check these flags
+against the CLI versions you actually have installed.
 
 ## 2. Usage-aware dispatch (probe before spend)
 
@@ -39,7 +42,7 @@ Today benching is reactive: a worker is benched only after an attempt died on a 
 that costs a dispatch plus a queue-row restore. New: **probe once per run, before the first
 dispatch**, every candidate worker (run-wide list ∪ row pins ∪ judge chain CLIs).
 
-- Probe = one tiny real request (`Reply with the single word OK`) per distinct profile, `probe.timeout_s` (90).
+- Probe = one tiny real request (`Reply with the single word OK`) per CLI, `probe.timeout_s` (90).
 - Output matched against `QUOTA_PATTERNS` → bench for `quota_cooldown_s` (same as reactive).
 - Timeout / not installed / other non-zero exit → bench for `probe.retry_s` (600) only. A probe
   that never reached the provider must not occupy the quota window.
@@ -82,15 +85,7 @@ Sequence after `task_done`:
    reset); HEAD unchanged → failed revision, counts against the cap; then re-judge.
    Same `non_gate_worktree_state` / `queue_status_changes` guards as a normal attempt.
 5. `escalate`, cap reached, or no-progress → stop the run `judge_escalated:<id>`; the report
-   carries score history and the last findings. The task stays DONE. This ends the runner,
-   not the host's existing completion authorization. The host preserves that evidence, reads
-   the failure and workspace state, and admits one supported in-scope follow-up before
-   dependent tasks. A new run must pass normal admission, verification and independent
-   review under unchanged thresholds/caps. No hand-run judge loop or blind retry.
-   Repeated same-cause failure without progress gets one bounded diagnostic pass; another
-   repair requires a materially different evidence-backed correction. Otherwise report the
-   exact unresolved condition, asking only for actually missing information or authorization.
-   See `skills/run-queue/SKILL.md` for the host recovery procedure.
+   carries score history and the last findings. The task stays DONE.
 6. Judge chain entirely down or every member returns unparsable JSON → `judge_skipped`, the
    run continues, the report says so in its own section. A judge outage is not a task failure,
    and must not silently switch quality off — visibility is the substitute.
@@ -107,10 +102,8 @@ Cost caps: claude judge/worker entries carry `--max-budget-usd`; codex has no eq
 | external | `git push`, broadcasts | worker prompt forbids; the **host** does it after the run if CONTEXT/user allowed, with `rev-list 0/0` re-verification |
 | **irreversible** | `irreversible_globs`: migrations, `data/**`, hooks, `.claude/settings*`, `--force` | needs `<!-- task:ID approved: <date or who> -->`; `admit` reports `needs-approval`; `run` stops with `needs_approval:<id>` **even in advisory mode** |
 
-Approval evidence is recorded per task id. An already-approved concrete implementation scope
-can cover its necessary repair; the host records that original authorization and scope mapping
-for the new ID, rather than copying a marker or asking again. New effects require authorization.
-The host places independent irreversible work at the tail, preserving required dependencies.
+Approval is per task id and single-use by construction. The host places such tasks at the queue
+tail so the run finishes everything else first and the user approves once, not mid-run.
 
 ## 5. Config keys (defaults)
 
@@ -139,6 +132,5 @@ new behaviour.
 ## 7. What the user sees at the end
 
 `RUN-REPORT.md` gains a **Judge** section (per task: rounds, scores, final verdict, worker per
-round) and a **Waiting on you** section that is empty on a clean run. That heading is raw runner
-output; the host first diagnoses whether it can repair the issue within existing scope. Report
-what passed, what failed, the automatic recovery taken, and only decisions truly left to the user.
+round) and a **Waiting on you** section that is empty on a clean run. That last section is the
+only thing the user has to read.

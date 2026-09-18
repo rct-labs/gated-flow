@@ -1,6 +1,6 @@
 # gate — the acceptance gate a lying commit cannot pass
 
-Stdlib Python, no external dependencies. It exists to close one specific hole.
+One file, stdlib Python, no dependencies. It exists to close one specific hole.
 
 An earlier unattended orchestrator marked roughly 60% of its tasks as done by
 committing only the queue file: the status flag plus the existence of a commit was
@@ -62,45 +62,6 @@ This repository does not ship that runner. Gate looks for it at
 `quality` and no runner is found, the phase is recorded as `FAIL` with exit
 code 127 and a required check blocks — so leave `quality` out of
 `.gate/config.json` unless you provide a runner with that contract.
-
-## Related Codex tasks: optional session reuse
-
-Enable per project with `"session_reuse": {"enabled": true}`. Defaults are
-`max_tasks: 3`, `max_input_tokens: 1000000`, and
-`context_files: ["AGENTS.md", "CLAUDE.md"]`. Add any other shared rule files to
-`context_files` (project-relative paths). Aggregate input tokens include cached
-tokens across calls: this is a conservative work budget, not context occupancy.
-
-Explicitly group only adjacent, related Codex tasks:
-
-```markdown
-<!-- task:WP-1 session: docs/work/widget -->
-<!-- task:WP-2 session: docs/work/widget -->
-```
-
-`docs/work/widget/spec.md` must exist. One CLI process still executes one task.
-The next process resumes the exact ID from Codex JSON events only after fresh
-PASS evidence and a passing independent judge without revision. Reuse also
-requires a first-attempt success, unchanged shared instructions, matching HEAD
-and dirty-file contents, and remaining budgets. Missing metadata, custom Codex
-commands, irreversible tasks, retries, and non-Codex workers use fresh sessions
-or the existing dispatch path. A disabled/skipped judge cannot seed a checkpoint.
-
-The runner compares file contents, not status flags. Background includes the
-package spec, configured context/rules, project gate config, and Codex config.
-On Python 3.11+, TOML normalization ignores newly registered `trusted` project
-entries (Codex adds these at startup), while retaining `untrusted` entries and
-all other settings. Older Python uses conservative raw-file hashing.
-An unchanged pre-existing dirty file is allowed; a second edit invalidates reuse.
-Markers express shared background, not authority to skip admission or tests.
-Queue scope and authorization rules still apply to each task independently.
-
-State is in memory during a run. `.gate/runs/<run>/session.json` is an audit
-snapshot, never a recovery input; a new run always starts fresh. The journal
-adds `session_checkpoint`, and RUN-REPORT contains Sessions with input/cache
-counts. No benefit is inferred when telemetry is absent. Long command output
-belongs in task-specific `.gate` logs with exit status and useful excerpts
-returned to the model; this is prompt guidance, not a command-output interceptor.
 
 Run `python -m unittest discover -s gate -p "test_*.py" -q` from the repository
 root for regression coverage, including resume, invalidation, revision, and
@@ -271,27 +232,6 @@ audit makes it *visible*, and neither depends on anything a model wrote.
 `frozen_globs` is empty by default; set it to `["tests/*"]` for a refactor package whose
 acceptance is "the existing tests must not move".
 
-`verify_steps` (optional) declares the same oracle as ordered pieces, and is honoured
-only when the pieces joined with ` && ` are byte-for-byte `verify_cmd` — it can split
-the oracle, never redefine it:
-
-```json
-"verify_cmd": "pnpm typecheck && pnpm vitest run",
-"verify_steps": [
-  {"name": "typecheck", "cmd": "pnpm typecheck"},
-  {"name": "tests", "cmd": "pnpm vitest run"}
-]
-```
-
-`verify` then runs the steps in order and stops at the first red one (a failed
-typecheck does not earn a ten-minute test run), recording each step's exit, time and
-tail in the verdict. `verify --step <name>` runs one step per call for shells with a
-hard per-command cap: the verdict stays `PARTIAL` (not accepted by the DONE gate)
-until every step has passed over the *same* inputs — the tree is captured before and
-after each step and compared to the chain's start, so an edit between steps yields
-`CHAIN_BROKEN` and the chain restarts from the first step. The recorded `cmd` is
-always the canonical `verify_cmd`, so receipts and allowances see one oracle.
-
 `GATE_CONFIG=<path>` points the gate at a repo without writing into it — use it to
 `audit` a project before deciding to install.
 
@@ -310,9 +250,3 @@ Ten cases, run against a synthetic repo that reproduces the fake-completion shap
 8. `--no-verify` bypass → commit succeeds, `audit` reports `FAKE_COMPLETION`
 9. `admit` report → three-state ok / REFUSE / UNDECLARED per TODO task
 10. `run --strict-admit` on an undeclared head task → stops with `admit_refused`, no worker spawned
-# Explicit task execution profiles
-
-Unattended calls require queue-bound model and reasoning profiles. See
-[the execution contract](../docs/execution.md) for defaults, per-task overrides,
-`lock-execution`, compatibility and controlled updates. Verification and
-inspection do not require a model profile; inference does.

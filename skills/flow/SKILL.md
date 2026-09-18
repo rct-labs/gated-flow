@@ -35,9 +35,8 @@ no-oracle until they set one; never invent an oracle for them.
 - `docs/work/<work-id>/brief.md` + `spec.md` (+ `evidence.md`; `prototype/`
   only when a repository-held prototype is explicitly needed) — one vertical
   work package per feature. Templates: `<home>/flow/templates/`.
-- The queue configured in `.gate/config.json` (default `TASK_QUEUE.md`) is the
-  ONLY task list, in gate format. All `TASK_QUEUE.md` mentions below mean that
-  configured path; preserve its existing name/extension, never create a second queue.
+- `TASK_QUEUE.md` — the ONLY task list (gate.py format). Never create
+  tasks.yaml / tasks.json / a second queue.
 
 ## Route by intent
 
@@ -101,23 +100,11 @@ Optionally give the table a `worker` column (`claude` / `codex` / `kimi` /
 `grok`, empty = no pin) so each task goes to the CLI that suits it; gate
 falls through to the run-wide list when the pin is benched.
 
-Bind models and reasoning while queueing. Read `<home>/docs/execution.md` for
-`execution.defaults`, per-task `execution` comments, and `flow lock-execution`.
-Resolve every worker, judge, revision and fallback profile before probes or
-dispatch; preserve explicit user effort limits. Defaults belong to the queue,
-not to the host's later session. Run admission and freeze the profiles before
-handoff. Arena planning profiles do not automatically select implementation
-workers. On resume reuse the lock; a chat model/effort switch does not update it.
-
 A task whose declared files hit the project's `irreversible_globs`
-(migrations, `data/**`, hooks, settings) needs its own
-`<!-- task:ID approved: <who/date> -->` line. Put independent irreversible work
-at the tail; preserve dependency order, including repairs before their dependents.
-Write approval evidence only when the user's authorization covers this exact
-scope. An approved concrete implementation package can cover a necessary repair:
-record the original instruction and its scope mapping to this task ID, never
-blindly copy another task's approval. Missing authorization for new effects still
-requires the user; `admit` reports `APPROVAL` until it is recorded. Every closed task is then
+(migrations, `data/**`, hooks, settings) goes to the **tail** of the queue and
+is dispatched only with its own `<!-- task:ID approved: <who/date> -->` line.
+Write that line only when the user said yes to that task; otherwise `admit`
+shows `APPROVAL` and the run stops there for them. Every closed task is then
 scored by the read-only judge chain when the project enables `judge.enabled`;
 its acceptance in `spec.md` is what the judge reads, so write acceptance the
 judge can check.
@@ -149,23 +136,6 @@ the same breath as the audit.
 **High-stakes uncertainty** — only when uncertainty, impact, and
 irreversibility are ALL high, suggest the `model-debate` skill. Never by
 default.
-
-**Debate admission and quota recovery** - When routing to model-debate, carry
-owner model/account exclusions, the required project model quorum, allowed
-backup order and existing replacement authority into the run constraints.
-Read that skill's quota reference and use its executable preflight before any
-inference, including probes and retries. Budget the whole remaining debate by
-shared account, not each seat separately. Existing project hard gates apply
-even when the generic high-stakes suggestion above would not trigger.
-On exhaustion, use only eligible authorized alternatives; preserve immutable
-originals, rebuild independent replacement work and invalidate peer-dependent
-rounds as the quota recovery plan requires. Missing allowance, budget or quorum
-is a resumable review gap, not a completed design. Keep the checkpoint in the
-existing work package/CONTEXT and queue; never silently lower the project gate,
-start excluded helpers, repeat an exhausted-pool call, or reset a task counter.
-The helper does not intercept unrelated CLI commands or make business actions
-safe to replay. If it is absent, report the missing capability before launch;
-do not claim automatic protection from budget prose alone.
 
 **How do I… / which command was it** — read `<home>/docs/usage.md` and
 answer plainly. Then OFFER TO RUN the command yourself instead of making the

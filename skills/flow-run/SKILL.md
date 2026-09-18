@@ -50,17 +50,26 @@ Say one line before doing work: `host: <this CLI> · worker: <id>`.
 
 Unknown name → list the four ids and stop. Do not guess.
 
-### Queue-bound models and reasoning
+### Model roles (hard rule)
 
-The host uses its current model, separately from the queue. Read
-`<home>/docs/execution.md` before queueing or launching: declare concrete model
-IDs and reasoning effort for workers, judges, revisions and every eligible
-fallback. Resolve once while queueing and persist with `flow lock-execution`.
-Never inherit a later host session or global CLI selection. Explicit user
-package/task effort limits apply to all covered calls, including revisions.
-Existing queues without profiles require deliberate profile preparation before
-their next launch; do not silently snapshot today's host as their intended model.
-Report configured and observed selections separately; missing metadata is unknown.
+Two roles, two model sets. They never cross. The names below are the
+authors' defaults; a deployment changes them in `.gate/config.json`
+(`judge.chain`, `judge_cmds`, `workers`, `worker_cmds`) and in
+`FORBIDDEN_WORKER_MODELS` in `gate.py`, not in this skill.
+
+| role | who | model |
+|---|---|---|
+| host / judge | the CLI running this skill: inspect, decide, audit, write the queue | the strongest model available (`fable` first); if quota is short, fall back to `opus`, then `codex` — and say so in one line |
+| worker | the process `gate.py run` spawns per task | `opus`, `codex`, `kimi`, `grok` only. The host/judge model (`fable`) is **forbidden** as a worker |
+
+Why: the host/judge model is the judgement model and the most expensive; a
+headless `claude -p` inherits whatever the user last set as their CLI
+default, which may be that model. `gate.py` enforces this — its built-in
+`claude` worker pins `--model opus`, and `ensure_worker_model()` injects
+`opus` into any `worker_cmds.claude` override that omits `--model` and
+refuses one that names a forbidden model. When you write
+`worker_cmds.claude` yourself, still write `--model opus` explicitly; do not
+rely on the injection.
 
 Audits and surveys: gather with cheaper subagents where the host supports
 them, judge with the host model. Never run a whole-project audit's data
@@ -71,8 +80,7 @@ collection on the host model.
 Cwd is the project. Read, do not invent:
 
 1. `CONTEXT.md` (create via `flow init --repo .` only if missing)
-2. The queue configured in `.gate/config.json` (default `TASK_QUEUE.md`);
-   use that same path throughout this skill, never create a second queue.
+2. `TASK_QUEUE.md`
 3. `git status` + `git log --oneline -10`
 4. `.gate/journal.ndjson` tail and `.gate/RUN-REPORT.md` if they exist
 5. `flow doctor --repo .` and `flow admit --repo .`
@@ -81,11 +89,9 @@ Tell the user, in their language, five facts: goal, now, last checkpoint,
 next step, anything still waiting on a human. Then continue — this skill
 does not stop at the report.
 
-**Do not launch into an unsafe state:** a missing pre-commit hook, head task
-`BLOCKED` or `IN_PROGRESS`, or conflicting worktree changes. Inspect ownership
-and the recorded reason first. Use run-queue's host recovery procedure for an
-in-scope blocker; never take over `IN_PROGRESS` or overwrite another session.
-Ask only for information or authorization that is actually missing.
+**Stop instead of running** if: pre-commit hook missing, head task
+`BLOCKED` or `IN_PROGRESS`, or another session has this worktree dirty in a
+way you did not make. Report and wait.
 
 No verify command → do not invent one. Say admission will refuse code tasks
 until the user sets `flow init --verify-cmd`. You may still write brief/spec.
@@ -113,8 +119,7 @@ minimum. `--no-web` only for a purely internal repo question.
 
 ## 3. Queue
 
-Append `TODO` rows to the configured queue in gate format (`TASK_QUEUE.md`
-throughout this document is an alias for that path). Each row needs a
+Append `TODO` rows to `TASK_QUEUE.md` in gate format. Each row needs a
 scope line. ≤6 files, no overlap with other TODOs, no human-decision wording
 in the name (`human_decision_regex`: design / decide / choose and their
 Chinese equivalents by default). English for ids and names.
@@ -143,8 +148,7 @@ unknown id.
 
 ### Assign workers by usage and task kind
 
-Declare execution profiles from local capability discovery first, then run
-`flow usage --repo .`. It sends a tiny request per distinct configured profile and
+Run `flow usage --repo .` first. It sends one tiny request per CLI and
 benches the quota-dead ones in `.gate/tool-status.json` (a probe that never
 reached the provider is benched briefly, not for the cooldown). Then fill the
 `worker` column from this table, skipping benched CLIs. Put the reasoning in
@@ -153,35 +157,13 @@ the package `spec.md`.
 | task kind (from the scope line) | first choice | fallback |
 |---|---|---|
 | mechanical implementation inside one module, tests included | `codex` | `claude` |
-| cross-package change, tricky semantics, security / permission logic | `claude` (declared model/effort) | `codex` |
+| cross-package change, tricky semantics, security / permission logic | `claude` (opus) | `codex` |
 | docs, manual-test checklists, config, small text edits | `kimi` | `codex` |
 | UI polish against a design spec | `codex` | `claude` |
 
 Leave the cell empty when two rows are equally good; the run-wide list decides.
-All runnable profiles need explicit model and reasoning settings. Choose routine
-defaults from the approved constraints and task needs; do not ask the user to
-fill a model matrix. Worker and judge roles may use the same model family.
+Never pin the host/judge model — the runner refuses it as a worker.
 
-### Related Codex tasks may share a session
-
-When `session_reuse.enabled` is true, explicitly group adjacent Codex tasks
-that share code/background with `<!-- task:ID session: docs/work/<package> -->`.
-The package must contain `spec.md`. Omit the marker for unrelated work; do not
-reorder tasks or change their worker merely to preserve a session.
-
-Gate still dispatches one task per process and checks it separately. It resumes
-the previous session only after a first-attempt success, fresh PASS evidence,
-and a passing independent judge with no revision. Changed background or workspace,
-retries, irreversible paths, custom Codex commands, and task/input budgets force
-a fresh session or the existing non-reuse path. Checkpoints are local to one run;
-the runner never resumes an old run or uses `--last`.
-
-On a resumed task, read its current acceptance and newly relevant source; reuse
-unchanged shared background already in the conversation. Keep confirmed decisions
-and code entry points in the existing work package, not a second memory system.
-Use task-specific `.gate` files for long command output, surface exit codes and
-failure excerpts, and read the full log when needed. Report the Sessions table
-alongside the task results; input counts are aggregate usage, not context occupancy.
 
 ### Reversibility tiers
 
@@ -189,25 +171,19 @@ Every declared file is classified by `.gate/config.json` `irreversible_globs`
 (migrations, `data/**`, hooks, `.claude/settings*`, apply scripts). A task that
 touches one:
 
-- goes to the **tail** only when independent; preserve dependency order and
-  keep required repairs before their dependents;
+- goes to the **tail** of the queue, so the run finishes everything reversible
+  first and the user approves once, not mid-run;
 - needs its own line `<!-- task:ID approved: <who/date> -->` before the runner
   will dispatch it. Without it `admit` prints `APPROVAL` and `run` stops with
   `needs_approval:<id>` even in advisory mode. Approval is per task id; never
   copy one forward.
 
-Write each task's approval line only when current conversation authorization
-covers its concrete scope. A named, already-approved implementation package may
-cover an in-scope repair: record the original user instruction and why it covers
-this task ID; never blindly copy another task's approval. New irreversible effects
-or scope require authorization. List only genuinely unapproved tasks as waiting.
+You write the approval line only when the user said yes to *that* task in this
+conversation. Otherwise leave it out and list the task under "waiting on you".
 
 External actions (`git push`, broadcasts) are never a task: the host does them
 after the run when CONTEXT or the user already allowed it, with the
 `git rev-list --left-right --count origin/main...main` 0/0 re-check.
-
-Prepare per-task defaults/overrides now; freeze after finalizing the worker and
-judge lists below. A chat setting switch does not change queue execution.
 
 Baselines must match the live oracle (`flow verify` / whatever
 `.gate/config.json` `verify_cmd` is). Then `flow admit --repo .`. A `REFUSE`
@@ -215,10 +191,7 @@ or `UNDECLARED` head task is split or declared now, not argued with later.
 
 ## 4. Pin the worker and launch
 
-Prepare `.gate/config.json` `workers` (and `worker_cmds` when needed) before
-freezing queue execution. Preserve existing frozen defaults when no new worker
-instruction was given; the host CLI default applies only to unconfigured queues.
-Preserve the project's `session_reuse` policy; it is not a per-run tuning knob:
+Edit `.gate/config.json` `workers` (and `worker_cmds` when needed).
 
 - `workers`: `[ "<id>" ]` — the pin from step 0, one id. This is the
   **run-wide default**. Precedence, top wins: row `worker` column > this
@@ -231,18 +204,12 @@ Preserve the project's `session_reuse` policy; it is not a per-run tuning knob:
   if missing (`kimi provider list --json` prints the valid ids). Do not strip
   other keys.
 
-After finalizing dispatch lists and profiles, run `flow lock-execution --repo .`.
-For an explicit change to future tasks, use `--reason` with the actual instruction;
-preserve started tasks and prior receipts. New calls use explicit flags from the lock.
-
 Check whether `judge.enabled` is `true` for this project. When it is,
 every closed task is reviewed by the judge chain (`judge.chain`, read-only)
-and revised at most `judge.max_revisions` (2) times, preferably by a different
-worker. If only one authorized worker is usable, the runner may reuse it and
-records `rotated: false`; report that limitation. The run then either moves on (score ≥ `pass_score`) or stops with
+and revised at most `judge.max_revisions` (2) times by a *different* worker
+before the run either moves on (score ≥ `pass_score`) or stops with
 `judge_escalated:<id>`. Do not raise `max_revisions` or lower `pass_score`
-to get a task through. A stop triggers host diagnosis and an admitted repair,
-not a weaker quality threshold. Design:
+to get a task through; that is the user's call. Design:
 `<home>/docs/autonomy.md`.
 
 Leave `max_tasks` alone; pass `--MaxTasks` at launch. Count remaining
@@ -262,36 +229,28 @@ push unless CONTEXT or the user already allowed it.
 
 Read `RUN-REPORT.md` bottom-up: **Waiting on you** first (empty on a clean
 run), then **Judge** (rounds, scores, worker per round), then the task table.
-Interpret those sections using the recovery procedure below. Report the actual
-remaining user decision, if any, plus verified results and automatic recovery.
+Relay those two sections to the user in their language; they are the only
+thing they have to read.
 
 User-facing updates: follow the user's format, lead with a measured result or
 the current blocking fact, and omit repeated process narration. Do not add a
 separate rewriting model or a second draft. Preserve paths, numbers, errors,
 and uncertainty.
 
-When the user authorized completion, a stopped runner does not revoke that
-scope. Apply **run-queue → Host recovery after a stopped run** before deciding
-whether human input is needed. The host reads the evidence, prepares an admitted
-repair when justified, and automatically launches the next run. Announce the
-reason and repair; do not ask again for the same authorized work.
+- `judge_escalated:<id>` — the task is DONE by the acceptance gate but not to
+  standard. Read the last findings in the report. If they are within the
+  task's declared scope and clearly right, queue one follow-up task with the
+  findings as its spec; if they need a decision or scope growth, put them in
+  CONTEXT §5 and stop. Never re-run the judge loop by hand.
+- `revision_broke_verify:<id>` — inspect `git log` / `git status` yourself
+  before anything else runs; a revision commit may need reverting (ask).
+- `needs_approval:<id>` — show the user the task's scope line and ask for a
+  yes; on yes, add the approval line and relaunch.
+- `skipped` judge rows are not blocking; mention them once.
 
-For `judge_escalated`, keep the original DONE row and adverse judge history;
-put one scoped follow-up before dependent TODOs, with the findings and regression
-acceptance. It must earn a fresh gate verdict and independent review. Do not
-manually repeat the judge loop, accept a subthreshold result, or create endless
-renamed copies of the same unsuccessful repair. For `revision_broke_verify`,
-inspect commits and changes first; prefer a scoped forward repair, preserve
-unrelated work, and ask only if a necessary destructive action lacks approval.
-For `needs_approval`, check existing scope authorization before asking and record
-any valid approval for that exact task ID. Mention skipped judge rows once;
-do not call unreviewed work independently approved.
-
-Rebuild `CONTEXT.md` with the stop evidence, recovery decision, and remaining work.
-Continue authorized TODOs through normal admission, launch, and monitoring until
-complete, explicitly cancelled, or blocked on genuinely unavailable information,
-authorization, or an external condition. Run-queue defines the bounded recovery
-and no-progress rules; the shell supervisor does not diagnose or write repairs.
+Rebuild `CONTEXT.md`. If the user asked to finish everything and TODOs
+remain for a reason other than `blocked` / `no_workers`, say so plainly;
+do not silently start a second run.
 
 ## Host notes (all four CLIs)
 

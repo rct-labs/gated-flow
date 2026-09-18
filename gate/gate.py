@@ -21,9 +21,6 @@ Subcommands
   verify        slow gate: run the acceptance command, record a verdict
   audit         re-derive the structural verdict over the last N commits
   admit         sweet-spot admission report for every TODO task in the queue
-  recover-task  revalidate a stopped claim's implementation, return its row to
-                TODO, and record the receipt Gate 1 needs (docs/recovery.md)
-  review-task   independently review a recovered task with persistent budgets
   usage         probe every worker / judge CLI now; bench the quota-dead ones
   doctor        report what is configured and whether it is usable
   run           unattended loop: probe → dispatch → verify → judge → revise
@@ -35,16 +32,11 @@ import argparse
 import fnmatch
 import json
 import os
-import platform
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import execution
-import recovery
 
 GATE_DIR = ".gate"
 CONFIG_NAME = "config.json"
@@ -95,8 +87,6 @@ DEFAULT_CONFIG = {
     # ---- unattended run -------------------------------------------------
     # Writers are tried in order; a quota-dead one is skipped for a cooldown.
     "workers": ["codex", "claude", "grok"],
-    # Filled while queueing, never inferred from a later host session.
-    "execution": {"defaults": {"workers": {}, "judges": {}}},
     # What one worker is asked to do. It should execute exactly one task and
     # stop — the loop belongs to this script, not to the model.
     "worker_prompt": (
@@ -124,13 +114,6 @@ DEFAULT_CONFIG = {
     # How often a still-running worker writes a heartbeat, so a long task and a
     # hung one look different from the outside.
     "heartbeat_s": 300,
-    # Opt-in, explicit queue groups only. Checkpoints never survive a run.
-    "session_reuse": {
-        "enabled": False,
-        "max_tasks": 3,
-        "max_input_tokens": 1000000,
-        "context_files": ["AGENTS.md", "CLAUDE.md"],
-    },
     # ---- admission ------------------------------------------------------
     # The third leg of the design: exit-code verdicts and the diff
     # guard catch a bad attempt, admission keeps out-of-sweet-spot tasks
@@ -233,8 +216,8 @@ JUDGE_SCHEMA = {
     "additionalProperties": False,
 }
 
-# Read-only judge contracts with explicit model pins, independent of workers.
-# {schema} is the inline JSON schema,
+# Read-only judge contracts. The chain is fable → opus → codex; fable is allowed
+# here because the judge only reads. {schema} is the inline JSON schema,
 # {schema_file} / {out_file} are paths for CLIs that take files.
 JUDGE_CMDS: dict[str, list[str]] = {
     "fable": [
@@ -275,9 +258,13 @@ WORKER_CMDS: dict[str, list[str]] = {
         "codex", "exec", "--sandbox", "danger-full-access",
         "--skip-git-repo-check", "-C", "{projdir}", "-",
     ],
-    # Inherit the effective CLI model unless the project explicitly pins one.
+    # Queue workers never run on fable: fable is the host/judge model and a
+    # headless `claude -p` would silently inherit whatever the user last set as
+    # their CLI default. Pin opus here; ensure_worker_model() below enforces the
+    # same rule on any config override.
     "claude": [
         "claude", "-p", "{prompt}",
+        "--model", "opus",
         "--permission-mode", "acceptEdits",
         "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep,TaskOutput",
         "--output-format", "text",
@@ -289,6 +276,43 @@ WORKER_CMDS: dict[str, list[str]] = {
     ],
     "kimi": ["kimi", "-p", "{prompt}", "--output-format", "text"],
 }
+
+# Models that may only host and judge, never execute queue tasks. Matched
+# case-insensitively as a substring of the --model value.
+FORBIDDEN_WORKER_MODELS = ("fable",)
+DEFAULT_CLAUDE_WORKER_MODEL = "opus"
+
+
+def ensure_worker_model(worker: str, template: list[str]) -> tuple[list[str], str | None]:
+    """Enforce the worker-model policy on a resolved command template.
+
+    For the claude worker: inject ``--model opus`` when no --model is given, and
+    refuse outright when --model names a forbidden (host-only) model. Other
+    workers are returned unchanged. Returns (template, error).
+    """
+    if worker != "claude":
+        return template, None
+    argv = list(template)
+    for i, part in enumerate(argv):
+        if part == "--model" and i + 1 < len(argv):
+            value = argv[i + 1]
+            if any(bad in value.lower() for bad in FORBIDDEN_WORKER_MODELS):
+                return argv, (
+                    f"claude worker --model {value!r} is a host-only model; "
+                    f"queue tasks may run on opus/codex/kimi/grok only"
+                )
+            return argv, None
+        if part.startswith("--model="):
+            value = part.split("=", 1)[1]
+            if any(bad in value.lower() for bad in FORBIDDEN_WORKER_MODELS):
+                return argv, (
+                    f"claude worker --model {value!r} is a host-only model; "
+                    f"queue tasks may run on opus/codex/kimi/grok only"
+                )
+            return argv, None
+    # No --model at all: never inherit the CLI default, pin the worker model.
+    argv[1:1] = ["--model", DEFAULT_CLAUDE_WORKER_MODEL]
+    return argv, None
 
 # Signatures that mean "this tool is unusable right now", not "this task
 # failed". Both classes get the same treatment — bench the tool, do not spend
@@ -684,7 +708,7 @@ def write_verdict(repo: Path, payload: dict) -> None:
     p = verdict_path(repo)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, p)
 
 
@@ -818,7 +842,9 @@ def cmd_check_commit(args) -> None:
     repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
 
-    staged = recovery.git_paths(repo, "diff", "--cached", "--name-only", "-z")
+    staged = [
+        p for p in git(repo, "diff", "--cached", "--name-only").splitlines() if p.strip()
+    ]
     if not staged:
         ok("no staged changes")
         return
@@ -861,33 +887,16 @@ def cmd_check_commit(args) -> None:
     code_paths = [
         p for p in staged if not matches_any(project_rel(cfg, p), cfg["doc_only_globs"])
     ]
-    recovered = None
-    recovery_history = any(e.get("task") in flipped for e in
-                           recovery._read_ndjson(recovery.index_path(repo), "recovery index"))
-    if not code_paths or recovery_history:
-        # One exception, and it carries its own proof: a task whose
-        # implementation is already in history, recovered by `recover-task`,
-        # whose receipt is bound to those declared blobs and to a fresh PASS
-        # from the unchanged canonical oracle (docs/recovery.md). Everything
-        # below still runs — this replaces no other gate.
-        allowance = recovery.done_allowance(repo, cfg, flipped, staged)
-        if not allowance["allowed"]:
-            fail(
-                f"fake completion — task(s) {', '.join(flipped)} flipped to DONE "
-                f"but the commit touches only documentation.",
-                "Staged paths:\n  "
-                + "\n  ".join(staged)
-                + "\n\nThis is the fake-completion pattern (measured at ~60% of tasks in the\n"
-                "orchestrator this gate replaced).\n"
-                "A task is done when the code changed, not when the queue says so.\n"
-                f"\nNo supported recovery covers this commit: {allowance['detail']}",
-            )
-        recovered = allowance
-        # Record what this commit is allowed on, bound to the commit it is
-        # about to become. Nothing later may call a queue-only DONE verified
-        # on the strength of a recovery receipt alone.
-        recovery.record_completion(repo, cfg, flipped[0], allowance)
-        print(f"GATE: {allowance['detail']}")
+    if not code_paths:
+        fail(
+            f"fake completion — task(s) {', '.join(flipped)} flipped to DONE "
+            f"but the commit touches only documentation.",
+            "Staged paths:\n  "
+            + "\n  ".join(staged)
+            + "\n\nThis is the fake-completion pattern (measured at ~60% of tasks in the\n"
+            "orchestrator this gate replaced).\n"
+            "A task is done when the code changed, not when the queue says so.",
+        )
 
     # --- Gate 2: frozen paths must not move.
     frozen = cfg.get("frozen_globs") or []
@@ -931,12 +940,6 @@ def cmd_check_commit(args) -> None:
                     "command is the fact. Fix whichever is wrong.",
                 )
 
-    if recovered:
-        ok(
-            f"task(s) {', '.join(flipped)} → DONE on recovery receipt "
-            f"{recovered['receipt'][:10]} and a fresh PASS verdict"
-        )
-        return
     ok(
         f"task(s) {', '.join(flipped)} → DONE with {len(code_paths)} code path(s) "
         f"and a fresh PASS verdict"
@@ -947,83 +950,17 @@ def cmd_verify(args) -> None:
     """Run the real acceptance command and record what it actually said."""
     repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
-    step = getattr(args, "step", None)
-    if step and args.cmd:
-        die("--step runs a declared verify_steps entry; it cannot be combined with --cmd")
-    payload = run_acceptance(repo, cfg, args.cmd or cfg["verify_cmd"], step=step)
-    done = [s["name"] for s in payload.get("steps", []) if s.get("result") == "PASS"]
+    payload = run_acceptance(repo, cfg, args.cmd or cfg["verify_cmd"])
     print(
         f"GATE: {payload['result']} exit={payload['exit_code']} "
         f"count={payload['count']} in {payload['elapsed_s']}s"
-        + (f" steps={','.join(done)}" if payload.get("steps") else "")
     )
-    if payload["result"] == "PARTIAL":
-        remaining = [s["name"] for s in verify_steps(cfg) if s["name"] not in done]
-        print(f"GATE: partial — next: flow verify --step {remaining[0]}" if remaining else "")
-        return
     if payload["result"] != "PASS":
         print(payload["tail"], file=sys.stderr)
         raise SystemExit(2)
 
 
-def verify_steps(cfg: dict) -> list[dict]:
-    """The declared decomposition of verify_cmd, or [] when there is none.
-
-    A decomposition is honoured only when its steps joined with ` && ` are
-    byte-for-byte the canonical verify_cmd: steps split the oracle into
-    fail-fast, shell-cap-sized pieces, they never redefine it.
-    """
-    steps = cfg.get("verify_steps")
-    if not steps:
-        return []
-    if (not isinstance(steps, list) or not all(
-        isinstance(s, dict) and isinstance(s.get("name"), str) and s["name"].strip()
-        and isinstance(s.get("cmd"), str) and s["cmd"].strip() for s in steps
-    )):
-        die("verify_steps must be a list of {name, cmd}")
-    names = [s["name"].strip() for s in steps]
-    if len(set(names)) != len(names):
-        die("verify_steps names must be unique")
-    joined = " && ".join(s["cmd"].strip() for s in steps)
-    if joined != cfg["verify_cmd"].strip():
-        die(
-            "verify_steps do not compose the canonical verify_cmd; refusing to run a "
-            f"different oracle.\n  steps : {joined}\n  canon : {cfg['verify_cmd']}"
-        )
-    return [{"name": s["name"].strip(), "cmd": s["cmd"].strip()} for s in steps]
-
-
-def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, step: str | None = None) -> dict:
-    # A refused verify_steps declaration is a configuration error, not a run:
-    # resolve it before anything on record is invalidated.
-    _acceptance_steps(cfg, cmd or cfg["verify_cmd"], step)
-    # The record a step chain continues from, read before it is invalidated.
-    prior = read_verdict(repo) if step else None
-    # Invalidate even if monitor startup, configuration or initial capture fails.
-    write_verdict(repo, {"result": "RUNNING", "cmd": cmd or cfg["verify_cmd"], "at_epoch": time.time()})
-    monitor = recovery.InputMonitor(repo, cfg).start()
-    try:
-        return _run_acceptance_monitored(repo, cfg, cmd, monitor, step, prior)
-    finally:
-        monitor.finish()
-
-
-def _acceptance_steps(cfg: dict, cmd: str, step: str | None) -> tuple[list[dict], list[dict]]:
-    """(steps to run now, steps already required before them)."""
-    declared = verify_steps(cfg) if cmd == cfg["verify_cmd"] else []
-    if step is None:
-        return (declared or [{"name": "verify", "cmd": cmd}]), []
-    if not declared:
-        die("--step needs verify_steps declared in .gate/config.json")
-    names = [s["name"] for s in declared]
-    if step not in names:
-        die(f"unknown verify step {step!r}; declared: {', '.join(names)}")
-    index = names.index(step)
-    return [declared[index]], declared[:index]
-
-
-def _run_acceptance_monitored(repo: Path, cfg: dict, cmd, monitor, step: str | None = None,
-                              prior: dict | None = None) -> dict:
+def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None) -> dict:
     """Run the acceptance command, write the verdict, return it. Shared by
     `verify` and by the runner's own re-check after a judge revision."""
     cmd = cmd or cfg["verify_cmd"]
@@ -1033,108 +970,18 @@ def _run_acceptance_monitored(repo: Path, cfg: dict, cmd, monitor, step: str | N
 
     print(f"GATE: running acceptance command in {workdir}: {cmd}")
     started = time.time()
-    # What the oracle is about to run over, captured before it starts. The
-    # capture doubles as the invalidation of the previous verdict: from here
-    # on there is no PASS on record, so a run that times out, is interrupted,
-    # or dies cannot leave an older success standing as evidence.
-    write_verdict(repo, {"result": "RUNNING", "cmd": cmd, "at_epoch": started})
-    inputs_before = recovery.acceptance_inputs(repo, cfg)
-
-    def record(payload: dict) -> dict:
-        """Write the verdict and say so in the append-only journal.
-
-        verdict.json is local, unsigned and writable; on its own it is a claim.
-        The journal line is what the gate cross-checks before it accepts a
-        completion that carries no code of its own, so editing one file is no
-        longer enough to invent an acceptance run."""
-        write_verdict(repo, payload)
-        journal(repo, {"event": "acceptance", "result": payload["result"],
-                       "cmd": payload["cmd"], "count": payload.get("count"),
-                       "at_epoch": payload["at_epoch"], "head": payload.get("head"),
-                       "verdict_digest": recovery.digest(payload), "pid": os.getpid()})
-        return payload
-
-    to_run, required = _acceptance_steps(cfg, cmd, step)
-    # A step chain: earlier steps must already be on record as PASS over
-    # exactly these inputs, or this call is not a continuation of anything.
-    previous_steps: list[dict] = []
-    chain_start = inputs_before
-    if required:
-        prior = prior or {}
-        prior_steps = {s["name"]: s for s in prior.get("steps", []) if s.get("result") == "PASS"}
-        prior_result = prior.get("result")
-        continuous = (
-            prior.get("cmd") == cmd
-            and prior_result in ("PARTIAL", "PASS")
-            and all(s["name"] in prior_steps for s in required)
-            and not recovery.inputs_differences(prior.get("inputs_after"), inputs_before)
-            and not recovery.inputs_differences(prior.get("inputs_before"), inputs_before)
-        )
-        if not continuous:
-            broken = {
-                "cmd": cmd, "count": None, "exit_code": None, "elapsed_s": 0.0,
-                "at_epoch": time.time(), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "head": git(repo, "rev-parse", "HEAD", check=False).strip(),
-                "inputs_before": inputs_before, "inputs_after": inputs_before, "recovery": {},
-                "steps": [], "tail": (
-                    f"step {step!r} needs {', '.join(s['name'] for s in required)} to have "
-                    "passed over the same inputs first; the tree or the record changed. "
-                    f"Restart from: flow verify --step {required[0]['name']}"
-                ),
-                "quality": None, "result": "CHAIN_BROKEN",
-            }
-            record(broken)
-            return broken
-        previous_steps = [prior_steps[s["name"]] for s in required]
-        chain_start = prior.get("inputs_before")
-
-    unfinished = {
-        "cmd": cmd, "count": None, "exit_code": None, "elapsed_s": None,
-        "at_epoch": time.time(), "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "head": git(repo, "rev-parse", "HEAD", check=False).strip(),
-        "inputs_before": chain_start, "inputs_after": None, "recovery": {},
-        "steps": previous_steps, "tail": "", "quality": None,
-    }
-    record({**unfinished, "result": "RUNNING"})
-    output = ""
-    steps_run: list[dict] = []
-    proc = None
-    for entry in to_run:
-        step_started = time.time()
-        print(f"GATE:   step {entry['name']}: {entry['cmd']}")
-        try:
-            proc = subprocess.run(
-                entry["cmd"],
-                cwd=str(workdir),
-                shell=True,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=cfg["verify_timeout_s"],
-            )
-        except subprocess.TimeoutExpired:
-            record({**unfinished, "result": "TIMEOUT", "steps": previous_steps + steps_run,
-                    "elapsed_s": round(time.time() - started, 1),
-                    "tail": f"step {entry['name']} exceeded {cfg['verify_timeout_s']}s"})
-            raise
-        except BaseException as exc:
-            record({**unfinished, "result": "INTERRUPTED", "steps": previous_steps + steps_run,
-                    "elapsed_s": round(time.time() - started, 1),
-                    "tail": f"step {entry['name']} did not finish: {exc!r}"})
-            raise
-        step_output = (proc.stdout or "") + (proc.stderr or "")
-        output += step_output
-        steps_run.append({
-            "name": entry["name"], "cmd": entry["cmd"], "exit_code": proc.returncode,
-            "elapsed_s": round(time.time() - step_started, 1),
-            "result": "PASS" if proc.returncode == 0 else "FAIL",
-            "tail": "\n".join(step_output.strip().splitlines()[-8:]),
-        })
-        if proc.returncode != 0:
-            # Fail fast: a red typecheck does not earn a ten-minute test run.
-            break
+    proc = subprocess.run(
+        cmd,
+        cwd=str(workdir),
+        shell=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=cfg["verify_timeout_s"],
+    )
     elapsed = round(time.time() - started, 1)
+    output = (proc.stdout or "") + (proc.stderr or "")
     quality = quality_phase(repo, cfg, "task")
     if quality is not None:
         output += "\n" + quality["tail"]
@@ -1147,37 +994,13 @@ def _run_acceptance_monitored(repo: Path, cfg: dict, cmd, monitor, step: str | N
     if m:
         count = int(m.group(1))
 
-    all_steps = previous_steps + steps_run
     result = "PASS" if proc.returncode == 0 else "FAIL"
     if quality is not None and quality["result"] != "PASS":
         result = "FAIL"
 
-    # Non-vacuity: an oracle that asserts nothing is not an oracle. In a step
-    # chain the count comes from whichever step reports one; a chain whose
-    # last step has no count keeps the count seen earlier.
-    if count is None:
-        for earlier in previous_steps:
-            if earlier.get("count") is not None:
-                count = earlier["count"]
+    # Non-vacuity: an oracle that asserts nothing is not an oracle.
     if result == "PASS" and count == 0:
         result = "VACUOUS"
-    declared_names = [s["name"] for s in verify_steps(cfg)] if cmd == cfg["verify_cmd"] else []
-    passed_names = [s["name"] for s in all_steps if s["result"] == "PASS"]
-    if result == "PASS" and declared_names and passed_names != declared_names:
-        # Steps passed so far, but the oracle is not complete: nothing may
-        # close on this until the remaining steps pass over the same inputs.
-        result = "PARTIAL"
-    if steps_run and count is not None:
-        steps_run[-1]["count"] = count
-
-    # The same capture again: a completion is bound to inputs that did not
-    # move while they were being judged.
-    inputs_after = recovery.acceptance_inputs(repo, cfg)
-    drift = sorted(set(recovery.inputs_differences(inputs_before, inputs_after) + monitor.finish()))
-    if required:
-        drift = sorted(set(drift + recovery.inputs_differences(chain_start, inputs_after)))
-    if drift:
-        result = "INPUTS_CHANGED"
 
     payload = {
         "result": result,
@@ -1191,18 +1014,8 @@ def _run_acceptance_monitored(repo: Path, cfg: dict, cmd, monitor, step: str | N
         "fingerprint": worktree_fingerprint(repo),
         "tail": tail,
         "quality": quality,
-        # The fingerprint above hashes `git status` output — which paths were
-        # dirty, not what was in them. These two capture the content the oracle
-        # actually ran over: HEAD, every changed or untracked path, and the
-        # configuration. A recovered task's completion commit carries no code
-        # of its own, so it is accepted against these instead.
-        "inputs_before": chain_start,
-        "inputs_after": inputs_after,
-        "inputs_drift": drift,
-        "steps": all_steps,
-        "recovery": recovery.verdict_binding(repo, cfg),
     }
-    record(payload)
+    write_verdict(repo, payload)
     return payload
 
 
@@ -1233,16 +1046,10 @@ def cmd_audit(args) -> None:
         ]
         subject = git(repo, "log", "-1", "--format=%s", sha).strip()
         if not code:
-            # A queue-only DONE is the fake-completion shape. It is legitimate
-            # only when a receipt that still revalidates, an acceptance run
-            # recorded against this very commit, and a cleared review barrier
-            # all line up; anything less stays a finding.
-            explained = recovery.audit_recovered(repo, cfg, sha, flipped)
-            label, clean = explained or ("FAKE_COMPLETION", False)
-            findings.append((sha[:10], ", ".join(flipped), subject, label, clean))
+            findings.append((sha[:10], ", ".join(flipped), subject, "FAKE_COMPLETION"))
         else:
             findings.append(
-                (sha[:10], ", ".join(flipped), subject, f"ok ({len(code)} code paths)", True)
+                (sha[:10], ", ".join(flipped), subject, f"ok ({len(code)} code paths)")
             )
 
     if not findings:
@@ -1251,13 +1058,13 @@ def cmd_audit(args) -> None:
 
     print(f"GATE audit — DONE transitions in the last {n} commits:\n")
     bad = 0
-    for sha, tasks, subject, verdict, clean in findings:
-        flag = "  " if clean else "!!"
-        if not clean:
+    for sha, tasks, subject, verdict in findings:
+        flag = "!!" if verdict == "FAKE_COMPLETION" else "  "
+        if verdict == "FAKE_COMPLETION":
             bad += 1
         print(f"{flag} {sha}  {tasks:<12}  {verdict}")
         print(f"     {subject}")
-    print(f"\n{bad} unproven completion(s) out of {len(findings)} DONE transition(s).")
+    print(f"\n{bad} fake completion(s) out of {len(findings)} DONE transition(s).")
     if bad:
         raise SystemExit(1)
 
@@ -1417,49 +1224,6 @@ def cmd_admit(args) -> None:
         bad += v["verdict"] != "admit"
     mode = "strict" if cfg.get("strict_admit") else "advisory"
     print(f"{len(verdicts)} TODO task(s), {bad} not admissible. Mode: {mode}.")
-    try:
-        policies = execution.resolve(cfg, text, parse_queue(text), pins)
-        print(f"execution       : {len(policies)} explicit task profiles OK")
-    except execution.PolicyError as exc:
-        die(f"execution admission refused: {exc}")
-
-
-def cmd_lock_execution(args) -> None:
-    repo = repo_root(Path(args.repo).resolve())
-    cfg = load_config(repo)
-    text = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
-    tasks = parse_queue(text)
-    pending = {tid for tid, row in tasks.items() if row["status"] in cfg["todo_markers"]}
-    # The worker may not have written its claim yet. Dispatch already counts
-    # as started, including a DONE row undergoing review or revision.
-    active = set()
-    jp = repo / GATE_DIR / "journal.ndjson"
-    if jp.exists():
-        for line in jp.read_text(encoding="utf-8").splitlines():
-            event = json.loads(line)
-            if event.get("event") == "attempt_start":
-                active.add(event.get("task"))
-            elif event.get("event") == "task_end":
-                active.discard(event.get("task"))
-            elif event.get("event") == "run_end":
-                active.clear()
-    try:
-        policies = execution.resolve(cfg, text, tasks, parse_task_workers(text))
-        lock = execution.freeze(repo, policies, getattr(args, "reason", None), pending - active)
-    except execution.PolicyError as exc:
-        die(str(exc))
-    print(f"execution locked: {len(policies)} tasks; sha256={lock['sha256']}")
-
-
-def reject_run_preflight(repo: Path, cfg: dict, run_id: str, stop: str, message: str) -> None:
-    report = render_report(repo, cfg, run_id, [], stop, 0) + f"\nPreflight: {message}\n"
-    (repo / GATE_DIR / "RUN-REPORT.md").write_text(report, encoding="utf-8")
-    (repo / GATE_DIR / f"RUN-REPORT-{run_id}.md").write_text(report, encoding="utf-8")
-    journal(repo, {"event": "admit_refused" if stop.startswith("admit_refused:") else "execution_refused",
-                   "run": run_id, "reason": message})
-    journal(repo, {"event": "run_end", "run": run_id, "stop": stop,
-                   "pid": os.getpid(), "host": platform.node()})
-    die(message, code=3)
 
 
 def is_quota(text: str) -> bool:
@@ -1540,30 +1304,6 @@ INCOMPLETE_WORK_PATTERNS = (
     ),
     re.compile(r"\bwaiting on (?:it|them) before .*\b(?:commit|verdict)\b", re.IGNORECASE),
 )
-
-
-# A worker that ends its turn asking the human for a scope decision — extra
-# declared files, a widened acceptance — has not failed at the work; a second
-# identical dispatch just asks the same question again for another ten
-# minutes. The "要你决定" row of the report format, when it is not 无/None, is
-# that ask; so are the English forms.
-SCOPE_REQUEST_PATTERNS = (
-    re.compile(r"要你决定\s*\|\s*(?!无\b|None\b|—|-|\s*\|)\S", re.IGNORECASE),
-    re.compile(r"\b(?:needs? your decision|awaiting (?:your )?(?:approval|decision))\b", re.IGNORECASE),
-)
-SCOPE_HINT_RE = re.compile(r"扩围|声明(?:文件|列表|范围)|declared files|files:|scope", re.IGNORECASE)
-SCOPE_PATH_RE = re.compile(r"(?<![\w/])(?:src|tests|docs|scripts)/[\w./\[\]()-]+\.[A-Za-z]{1,5}")
-
-
-def worker_scope_request(output: str) -> dict | None:
-    """Detect a worker that stopped to ask for a scope decision, and what for."""
-    if not any(p.search(output) for p in SCOPE_REQUEST_PATTERNS):
-        return None
-    if not SCOPE_HINT_RE.search(output):
-        return None
-    tail = output[-6000:]
-    files = sorted(set(SCOPE_PATH_RE.findall(tail)))
-    return {"files": files}
 
 
 def worker_incomplete_reason(output: str) -> str | None:
@@ -1670,7 +1410,7 @@ def spawn_worker(
 ):
     """Spawn one headless CLI process and stream it. `template` overrides the
     worker contract (used by the read-only judge and the usage probe, which
-    use their own invocation contracts); `timeout_s`
+    are not queue workers and skip the worker-model policy); `timeout_s`
     overrides task_timeout_s; `extra` adds placeholder substitutions."""
     projdir = repo / (cfg.get("project_prefix") or "")
     exe = resolve_tool(worker)
@@ -1682,6 +1422,9 @@ def spawn_worker(
         template = (cfg.get("worker_cmds") or {}).get(worker) or WORKER_CMDS.get(worker)
         if not template:
             return None, f"no invocation contract for {worker}"
+        template, model_error = ensure_worker_model(worker, template)
+        if model_error:
+            return None, model_error
 
     argv = []
     for part in template:
@@ -1694,16 +1437,6 @@ def spawn_worker(
             part = part.replace("{" + key + "}", value)
         argv.append(part)
     argv[0] = exe
-
-    try:
-        requested = execution.selected(cfg, worker)
-        if requested:
-            argv = execution.arguments(argv, worker, requested)
-            journal(repo, {"event": "execution_requested", "task": cfg.get("_execution_task"),
-                           "role": cfg.get("_execution_role", "workers"), "worker": worker,
-                           "profile": requested, "profile_sha256": execution.digest(requested)})
-    except execution.PolicyError as exc:
-        return None, f"execution_policy:{exc}"
 
     # Codex reads its prompt from stdin: the Windows .cmd shim truncates a
     # multi-line argument at the first newline.
@@ -1767,21 +1500,10 @@ def spawn_worker(
             on_beat(int(now - started), state["lines"], state["last_line"])
 
     t.join(timeout=10)
-    if not t.is_alive() and callable(getattr(proc.stdout, "close", None)):
-        proc.stdout.close()
     if log:
         log.close()
     rc = proc.returncode if proc.returncode is not None else -1
-    result = WorkerResult(rc, "".join(chunks), timed_out)
-    if requested:
-        observation = execution.observed(result.stdout, requested)
-        journal(repo, {"event": "execution_observed", "task": cfg.get("_execution_task"),
-                       "role": cfg.get("_execution_role", "workers"), "worker": worker,
-                       "requested": requested, "observed": observation})
-        result.execution_mismatch = observation["mismatch"]
-        if result.execution_mismatch:
-            result.returncode = 1
-    return result, None
+    return WorkerResult(rc, "".join(chunks), timed_out), None
 
 
 # ------------------------------------------------------------ usage probe
@@ -1836,9 +1558,6 @@ def bench_from_probe(repo: Path, cfg: dict, worker: str, reason: str, run_id: st
             "probed_run": run_id,
             "seen": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
-    requested = execution.selected(cfg, worker)
-    if requested:
-        st[worker]["probed_profile"] = execution.digest(requested)
     set_tool_state(repo, st)
 
 
@@ -1861,9 +1580,7 @@ def ensure_probed(repo: Path, cfg: dict, worker: str, run_id: str, run_dir: Path
         return False
     if not sub_cfg(cfg, "probe").get("enabled", True):
         return True
-    requested = execution.selected(cfg, worker)
-    profile_ok = not requested or info.get("probed_profile") == execution.digest(requested)
-    if info.get("probed_run") == run_id and profile_ok:
+    if info.get("probed_run") == run_id:
         return True
     usable, reason = probe_worker(repo, cfg, worker, run_dir)
     bench_from_probe(repo, cfg, worker, reason, run_id)
@@ -1879,29 +1596,13 @@ def cmd_usage(args) -> None:
     cfg = load_config(repo)
     qpath = repo / prefixed(cfg, cfg["queue_file"])
     pins = parse_task_workers(qpath.read_text(encoding="utf-8")) if qpath.exists() else {}
-    text = qpath.read_text(encoding="utf-8") if qpath.exists() else ""
-    try:
-        policies = execution.resolve(cfg, text, parse_queue(text), pins)
-        if not policies:
-            policies = execution.resolve(cfg, "", {"usage": {"status": cfg["todo_markers"][0]}}, {})
-    except execution.PolicyError as exc:
-        die(f"usage needs explicit execution profiles before probing: {exc}")
     run_id = "usage-" + time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     print("usage — one tiny request per CLI; quota benches for the cooldown, "
           "a probe that never reached the provider benches briefly")
-    seen_profiles = set()
-    for task, policy in policies.items():
-        for role, members in policy["profiles"].items():
-            for member, requested in members.items():
-                w = JUDGE_TOOL.get(member, member) if role == "judges" else member
-                key = (w, execution.digest(requested))
-                if key in seen_profiles:
-                    continue
-                seen_profiles.add(key)
-                probe_cfg = execution.bind(cfg, policy, task)
-                probe_cfg.update(_execution_role=role, _execution_member=member)
-                usable = ensure_probed(repo, probe_cfg, w, run_id, repo / GATE_DIR / "runs" / run_id)
-                print(f"  {w:8} {'ok' if usable else 'BENCHED'}  {requested['model']} / {requested['reasoning_effort']}")
+    for w in probe_candidates(cfg, pins):
+        usable, reason = probe_worker(repo, cfg, w)
+        bench_from_probe(repo, cfg, w, reason, run_id)
+        print(f"  {w:8} {'ok' if usable else 'BENCHED'}  {reason}")
     st = tool_state(repo)
     now = time.time()
     for w, info in st.items():
@@ -2003,11 +1704,10 @@ def judge_once(
     for member in jcfg.get("chain", []):
         template = cmds.get(member)
         tool = JUDGE_TOOL.get(member, member)
-        member_cfg = {**cfg, "_execution_role": "judges", "_execution_member": member}
         if not template:
             failures.append(f"{member}:no_contract")
             continue
-        if not ensure_probed(repo, member_cfg, tool, run_id, run_dir):
+        if not ensure_probed(repo, cfg, tool, run_id, run_dir):
             failures.append(f"{member}:benched")
             continue
         out_file = run_dir / f"{tag}.{member}.out.json"
@@ -2016,7 +1716,7 @@ def judge_once(
         pf = run_dir / f"{tag}.{member}.prompt.md"
         pf.write_text(prompt, encoding="utf-8")
         proc, err = spawn_worker(
-            repo, member_cfg, tool, prompt, pf,
+            repo, cfg, tool, prompt, pf,
             log_path=pf.with_suffix(".log"),
             template=template,
             timeout_s=jcfg.get("timeout_s", 1200),
@@ -2026,8 +1726,6 @@ def judge_once(
                 "out_file": str(out_file),
             },
         )
-        if proc is not None and getattr(proc, "execution_mismatch", False):
-            return None, "execution_mismatch"
         if proc is None:
             failures.append(f"{member}:{err}")
             continue
@@ -2068,7 +1766,6 @@ def judge_task(
     files: list[str],
     last_worker: str,
     pin: str | None,
-    extra_commits: list[str] | None = None,
 ) -> dict:
     """Judge a closed task and iterate at most judge.max_revisions times.
 
@@ -2079,22 +1776,14 @@ def judge_task(
     """
     jcfg = sub_cfg(cfg, "judge")
     rounds: list[dict] = []
-    history = [e for e in recovery.journal_events(repo) if e.get("task") == tid] if extra_commits else []
-    revisions = sum(e.get("event") == "revision_start" for e in history)
+    revisions = 0
     worker_of_last_commit = last_worker
-    scores: list[int] = [e["score"] for e in history if e.get("event") == "judge_verdict"]
-    exhausted = any(e.get("event") == "judge_escalated" and
-                    ("no progress" in e.get("reason", "") or "revision cap" in e.get("reason", ""))
-                    for e in history)
+    scores: list[int] = []
     while True:
         head = git(repo, "rev-parse", "HEAD").strip()
         commits = [
             s[:10] for s in git(repo, "rev-list", f"{base_head}..{head}", check=False).split()
         ]
-        # A recovered task closes an implementation that landed before this
-        # run started, so it is not in the range above. Name it explicitly:
-        # the reviewer must read the code, not only the commit that closed it.
-        commits = [s[:10] for s in (extra_commits or []) if s[:10] not in commits] + commits
         v = read_verdict(repo) or {}
         prompt = cfg["judge_prompt"].format(
             task=tid,
@@ -2111,8 +1800,6 @@ def judge_task(
         print(f"  judge round {len(rounds) + 1} for {tid} …")
         verdict, member = judge_once(repo, cfg, prompt, run_dir, tag, run_id)
         if verdict is None:
-            if member == "execution_mismatch":
-                return _escalate(repo, tid, rounds, member)
             journal(repo, {"event": "judge_skipped", "task": tid, "reason": member})
             print(f"  judge unavailable ({member}) — task stays DONE, unreviewed")
             return {"final": "skipped", "reason": member, "rounds": rounds}
@@ -2128,10 +1815,7 @@ def judge_task(
         scores.append(verdict["score"])
         journal(repo, {"event": "judge_verdict", "task": tid, "round": len(rounds),
                        "score": verdict["score"], "verdict": verdict["verdict"],
-                       "member": member, "findings": len(verdict["findings"]),
-                       "commit": head,
-                       "receipt": recovery.open_barriers(repo).get(tid, {}).get("receipt"),
-                       "passed": verdict["verdict"] == "pass" or verdict["score"] >= jcfg["pass_score"]})
+                       "member": member, "findings": len(verdict["findings"])})
         print(f"  judge ({member}): score {verdict['score']}, {verdict['verdict']}")
         notify(cfg, repo, f"{tid} judged {verdict['score']} ({verdict['verdict']}, {member})",
                format_findings(verdict["findings"]))
@@ -2140,7 +1824,7 @@ def judge_task(
             return {"final": "pass", "reason": "", "rounds": rounds}
         if verdict["verdict"] == "escalate":
             return _escalate(repo, tid, rounds, "judge asked for a human")
-        if exhausted or revisions >= jcfg["max_revisions"]:
+        if revisions >= jcfg["max_revisions"]:
             return _escalate(repo, tid, rounds, f"revision cap {jcfg['max_revisions']} reached")
         if len(scores) >= 2 and scores[-1] - scores[-2] < jcfg["min_gain"]:
             return _escalate(
@@ -2149,9 +1833,8 @@ def judge_task(
             )
 
         # Pick a usable worker other than the one that made the last commit.
-        revision_cfg = {**cfg, "_execution_role": "revisions"}
-        pool = [w for w in available_workers(repo, revision_cfg, prefer=pin)
-                if ensure_probed(repo, revision_cfg, w, run_id, run_dir)]
+        pool = [w for w in available_workers(repo, cfg, prefer=pin)
+                if ensure_probed(repo, cfg, w, run_id, run_dir)]
         others = [w for w in pool if w != worker_of_last_commit]
         if not pool:
             return _escalate(repo, tid, rounds, "no_workers_for_revision")
@@ -2185,10 +1868,8 @@ def judge_task(
                            "seconds": secs, "lines": lines, "last_line": last,
                            "phase": "revision"})
 
-        proc, err = spawn_worker(repo, revision_cfg, worker, rprompt, pf,
+        proc, err = spawn_worker(repo, cfg, worker, rprompt, pf,
                                  log_path=pf.with_suffix(".log"), on_beat=beat)
-        if proc is not None and getattr(proc, "execution_mismatch", False):
-            return _escalate(repo, tid, rounds, "execution_mismatch", final="broke_verify")
         head_after = git(repo, "rev-parse", "HEAD").strip()
         queue_after = queue_path.read_text(encoding="utf-8")
         changed_rows = queue_status_changes(queue_before, queue_after)
@@ -2232,230 +1913,9 @@ def _escalate(repo: Path, tid: str, rounds: list[dict], reason: str, final: str 
     return {"final": final, "reason": reason, "rounds": rounds}
 
 
-class CodexTaskSession:
-    """Reuse only the immediately preceding clean, reviewed Codex attempt.
-
-    Persist metadata for audit, never load it as authority after a restart.
-    The gate still dispatches exactly one task and owns all stop decisions.
-    """
-
-    def __init__(self, repo: Path, cfg: dict, run_dir: Path):
-        self.repo, self.cfg, self.run_dir = repo, cfg, run_dir
-        self.options = sub_cfg(cfg, "session_reuse")
-        self.previous = None
-
-    def snapshot(self) -> dict:
-        import hashlib
-
-        # Unlike worktree_fingerprint(), detect a second edit to an already
-        # dirty file. Unrelated pre-existing changes may remain, unchanged.
-        digest = hashlib.sha256()
-        for flags in (("--cached", "HEAD"), ()):
-            digest.update(git(self.repo, "diff", "--binary", *flags,
-                              "--", ".", ":(exclude).gate").encode())
-        for name in sorted(git(self.repo, "ls-files", "--others", "--exclude-standard", "-z").split("\0")):
-            if not name or name.startswith(".gate/"):
-                continue
-            path = self.repo / name
-            digest.update(name.encode())
-            digest.update(path.read_bytes() if path.is_file() else b"<not-file>")
-        return {"head": git(self.repo, "rev-parse", "HEAD").strip(),
-                "dirty": digest.hexdigest()}
-
-    def background_hash(self, group: str) -> str:
-        import hashlib
-
-        root = (self.repo / (self.cfg.get("project_prefix") or "")).resolve()
-        paths = [root / p for p in self.options.get("context_files", [])]
-        paths += [root / group / "spec.md", root / self.cfg.get("context_file", "CONTEXT.md"),
-                  self.repo / GATE_DIR / CONFIG_NAME, root / ".codex/config.toml"]
-        codex_dir = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
-        paths += [codex_dir / "config.toml", codex_dir / "AGENTS.md"]
-        digest = hashlib.sha256()
-        digest.update(execution.digest(self.cfg.get("_execution_policy")).encode())
-        for path in paths:
-            digest.update(str(path).encode())
-            content = path.read_bytes() if path.is_file() else b"<missing>"
-            if path.name == "config.toml" and path.is_file():
-                try:
-                    import tomllib
-                    config = tomllib.loads(content.decode("utf-8"))
-                    # Codex registers a newly visited trusted repo at startup.
-                    # Ignore only that bookkeeping, retaining explicit untrusted
-                    # entries and every other setting. Raw bytes are the safe
-                    # fallback on Python 3.10 or malformed TOML.
-                    projects = config.get("projects", {})
-                    for name, settings in list(projects.items()):
-                        if isinstance(settings, dict) and settings.get("trust_level") == "trusted":
-                            settings.pop("trust_level")
-                            if not settings:
-                                projects.pop(name)
-                    if not projects:
-                        config.pop("projects", None)
-                    content = json.dumps(config, sort_keys=True, default=str).encode()
-                except (ImportError, ValueError, AttributeError):
-                    pass
-            digest.update(content)
-        return digest.hexdigest()
-
-    def select(self, task: str, worker: str, queue: str, dispatch: int, files: list[str]) -> dict:
-        decision = {"mode": "off", "reason": "disabled", "task": task}
-        if not self.options.get("enabled"):
-            return decision
-        groups = re.findall(r"<!--\s*task:" + re.escape(task) + r"\s+session:\s*(\S+)\s*-->", queue)
-        if worker != "codex" or (self.cfg.get("worker_cmds") or {}).get("codex"):
-            decision["reason"] = "unsupported_worker_or_override"
-            return decision
-        root = (self.repo / (self.cfg.get("project_prefix") or "")).resolve()
-        if (len(groups) != 1 or not re.fullmatch(r"docs/work/[A-Za-z0-9_/-]+", groups[0])
-                or not (root / groups[0]).resolve().is_relative_to(root)
-                or not (root / groups[0] / "spec.md").is_file()):
-            decision["reason"] = "no_valid_group"
-            return decision
-        if irreversible_files(self.cfg, files):
-            decision["reason"] = "irreversible_task"
-            return decision
-        decision.update(mode="fresh", reason="no_checkpoint", group=groups[0],
-                        background=self.background_hash(groups[0]), before=self.snapshot())
-        previous = self.previous
-        if dispatch != 1:
-            decision["reason"] = "retry"
-        elif previous:
-            if previous["group"] != decision["group"]:
-                decision["reason"] = "group_changed"
-            elif previous["background"] != decision["background"]:
-                decision["reason"] = "background_changed"
-            elif previous["after"] != decision["before"]:
-                decision["reason"] = "workspace_changed"
-            elif previous["tasks"] >= int(self.options["max_tasks"]):
-                decision["reason"] = "task_budget"
-            elif previous["input_tokens"] >= int(self.options["max_input_tokens"]):
-                decision["reason"] = "input_budget"
-            else:
-                decision.update(mode="resume", reason="eligible", session_id=previous["session_id"],
-                                previous_task=previous["task"], tasks=previous["tasks"],
-                                input_tokens=previous["input_tokens"])
-        return decision
-
-    @staticmethod
-    def template(decision: dict) -> list[str] | None:
-        if decision["mode"] == "off":
-            return None
-        # Keep the existing exec sandbox and cwd flags, including on resume.
-        argv = WORKER_CMDS["codex"][:-1] + ["--json"]
-        if decision["mode"] == "resume":
-            argv += ["resume", decision["session_id"]]
-        return argv + ["-"]
-
-    def prompt(self, decision: dict, original: str, files: list[str]) -> str:
-        if decision["mode"] == "off":
-            return original
-        task = decision["task"]
-        brief = (
-            f"This invocation authorizes ONLY task {task}. Stop after that task; "
-            "the gate dispatches the next task after acceptance and independent review. "
-            "Never choose a different TODO or alter another task's status. "
-            f"Scope: {', '.join(files)}. Work package: {decision['group']}.\n"
-        )
-        if decision["mode"] == "resume":
-            brief += (
-                f"Previous task {decision['previous_task']} passed the gate and judge without revision. "
-                f"Current HEAD: {decision['before']['head']}. Shared background files and workspace "
-                "still match the recorded checkpoint. Reuse the common instructions and code "
-                "understanding already in this conversation. Read the CURRENT queue row and "
-                "this task's spec/acceptance; read changed or newly relevant source as needed. "
-                "Claim, implement, verify in the foreground, and commit this task using the "
-                "same project procedure. Previous test results do not validate this task. "
-                "Do not reread unchanged general background just to reconstruct it.\n"
-            )
-        else:
-            brief += original + "\n"
-        return brief + (
-            "Keep large command/test output in a task-specific .gate log file. Report the "
-            "exit code, measured summary, and log path; inspect relevant failure lines before "
-            "deciding what to do. Never discard errors or return with pending child processes. "
-            "Return a concise factual result, not a transcript. Do not push or open a PR.\n"
-        )
-
-    @staticmethod
-    def read_events(output: str) -> dict:
-        evidence = {"session_id": None, "completed": False, "usage": {}}
-        for line in output.splitlines():
-            try:
-                event = json.loads(line)
-            except (ValueError, TypeError):
-                continue
-            if not isinstance(event, dict):
-                continue
-            if event.get("type") == "thread.started":
-                sid = event.get("thread_id", "")
-                if isinstance(sid, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", sid):
-                    evidence["session_id"] = sid
-            elif event.get("type") == "turn.completed":
-                evidence["completed"] = True
-                usage = event.get("usage") or {}
-                if isinstance(usage, dict):
-                    evidence["usage"] = {k: v for k, v in usage.items()
-                                         if isinstance(v, int) and not isinstance(v, bool) and v >= 0}
-            elif event.get("type") in ("turn.failed", "error"):
-                evidence["completed"] = False
-        return evidence
-
-    def finish(self, decision: dict, evidence: dict, outcome: str, judge: dict | None,
-               dispatches: int, returncode: int, started: float, worker_head: str) -> dict:
-        self.previous = None
-        summary = {k: decision[k] for k in ("mode", "reason", "group") if k in decision}
-        summary.update(session_id=evidence.get("session_id"), usage=evidence.get("usage", {}))
-        if decision["mode"] == "off":
-            return summary
-        verdict = read_verdict(self.repo) or {}
-        after = self.snapshot()
-        checks = {
-            "task_incomplete": outcome == "done",
-            "retried": dispatches == 1,
-            "worker_exit": returncode == 0,
-            "missing_events": evidence.get("completed") and evidence.get("session_id"),
-            "wrong_thread": decision["mode"] != "resume" or evidence.get("session_id") == decision["session_id"],
-            "not_reviewed_without_revision": judge and judge.get("final") == "pass" and len(judge.get("rounds", [])) == 1,
-            "head_changed_after_worker": after["head"] == worker_head,
-            "left_changes": after["dirty"] == decision["before"]["dirty"],
-            "background_changed": self.background_hash(decision["group"]) == decision["background"],
-            "missing_fresh_pass": verdict.get("result") == "PASS" and verdict.get("at_epoch", 0) >= started,
-            "missing_usage": "input_tokens" in summary["usage"],
-        }
-        reusable = all(checks.values())
-        summary["checkpoint_reason"] = next((key for key, passed in checks.items() if not passed), "eligible")
-        if reusable:
-            self.previous = dict(decision, after=after, session_id=evidence["session_id"],
-                                 tasks=decision.get("tasks", 0) + 1,
-                                 input_tokens=decision.get("input_tokens", 0) + summary["usage"]["input_tokens"])
-        summary["reusable"] = bool(
-            self.previous and self.previous["tasks"] < int(self.options["max_tasks"])
-            and self.previous["input_tokens"] < int(self.options["max_input_tokens"])
-        )
-        record = {"task": decision["task"], **summary, "checkpoint": self.previous}
-        (self.run_dir / "session.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
-        return summary
-
-
 def cmd_run(args) -> None:
     repo = repo_root(Path(args.repo).resolve())
-    try:
-        lock = recovery.EngineLock(repo, "gate run").acquire()
-    except recovery.RecoveryError as exc:
-        die(str(exc), code=3)
-    try:
-        if recovery.pending_transactions(repo):
-            die("incomplete recovery transaction; retry the original recover-task command", code=3)
-        _cmd_run_locked(args)
-    finally:
-        lock.release()
-
-
-def _cmd_run_locked(args) -> None:
-    repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
-    base_cfg = cfg
     projdir = repo / (cfg.get("project_prefix") or "")
     qpath = repo / prefixed(cfg, cfg["queue_file"])
 
@@ -2473,35 +1933,6 @@ def _cmd_run_locked(args) -> None:
         )
     if not qpath.exists():
         die(f"queue not found: {qpath}")
-    # A recovered task owes an independent review, and a DONE row is not
-    # evidence that it got one. The barrier outlives this process.
-    barriers = recovery.open_barriers(repo)
-    if barriers:
-        first = sorted(barriers)[0]
-        journal(repo, {"event": "review_barrier", "run": run_id, "task": first,
-                       "reason": barriers[first].get("reason")})
-        die(
-            f"{first} is closed but unreviewed ({barriers[first].get('reason')}). "
-            f"Run: gate.py review-task --repo {repo} --task {first}",
-            code=3,
-        )
-
-    initial_text = qpath.read_text(encoding="utf-8")
-    initial_tasks = parse_queue(initial_text)
-    initial_pins = parse_task_workers(initial_text)
-    first, first_state = head_task(cfg, initial_tasks)
-    if first and first_state == "todo" and (args.strict_admit or cfg.get("strict_admit")):
-        admission = admit_verdicts(cfg, repo, initial_tasks, parse_task_files(initial_text),
-                                  initial_pins, parse_task_after(initial_text), parse_task_approved(initial_text))[first]
-        if admission["verdict"] != "admit" and not admission.get("needs_approval"):
-            reject_run_preflight(repo, cfg, run_id, f"admit_refused:{first}",
-                                 f"task {first} refused admission: {admission['reason']}")
-    try:
-        policies = execution.resolve(cfg, initial_text, parse_queue(initial_text), parse_task_workers(initial_text))
-        locked = execution.freeze(repo, policies)
-    except execution.PolicyError as exc:
-        reject_run_preflight(repo, cfg, run_id, "execution_policy",
-                             f"execution preflight refused before any inference: {exc}")
 
     workers = available_workers(repo, cfg)
     pins = parse_task_workers(qpath.read_text(encoding="utf-8"))
@@ -2527,20 +1958,20 @@ def _cmd_run_locked(args) -> None:
     journal(
         repo,
         {"event": "run_start", "run": run_id, "workers": workers, "pins": pins,
-         "judge": bool(jcfg.get("enabled")),
-         # Who is running. A later recovery has to name a stopped owner, and
-         # an unrecorded owner is one the operator has to observe by hand.
-         "pid": os.getpid(), "host": platform.node()},
+         "judge": bool(jcfg.get("enabled"))},
     )
 
     # Probe before spending: every candidate CLI once, so a quota-dead worker
     # is benched before it costs a dispatch and a queue-row restore.
     run_dir = repo / GATE_DIR / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "execution.json").write_text(json.dumps(locked, indent=2) + "\n", encoding="utf-8")
+    if sub_cfg(cfg, "probe").get("enabled", True):
+        print("  probing :")
+        for w in probe_candidates(cfg, pins):
+            ensure_probed(repo, cfg, w, run_id, run_dir)
+
     results: list[dict] = []
     stop_reason = "budget"
-    sessions = CodexTaskSession(repo, cfg, run_dir)
 
     for slot in range(max_tasks):
         if time.time() - started > cfg["run_timeout_s"]:
@@ -2568,19 +1999,6 @@ def _cmd_run_locked(args) -> None:
         strict = args.strict_admit or cfg.get("strict_admit", False)
         pins = parse_task_workers(qtext)
         pin = pins.get(tid)
-        try:
-            task_lock = execution.read_lock(repo)
-            policy = task_lock["tasks"][tid]
-            if policy["pin"] != pin:
-                raise execution.PolicyError(f"queue worker changed without an execution lock update: {tid}")
-            cfg = execution.bind(base_cfg, policy, tid)
-            sessions.cfg = cfg
-        except (execution.PolicyError, KeyError) as exc:
-            stop_reason = f"execution_policy:{tid}"
-            journal(repo, {"event": "execution_refused", "task": tid, "reason": str(exc)})
-            break
-        (run_dir / f"{tid}.execution.json").write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
-        journal(repo, {"event": "execution_locked", "task": tid, "sha256": execution.digest(policy)})
         files_map = parse_task_files(qtext)
         task_files = files_map.get(tid) or []
         adm = admit_verdicts(
@@ -2614,47 +2032,13 @@ def _cmd_run_locked(args) -> None:
 
         print(f"\nGATE: task {tid} ({slot + 1}/{max_tasks})")
         head_before = git(repo, "rev-parse", "HEAD").strip()
-        recovered = recovery.receipt_for(repo, cfg, tid)
-        if recovered is None and any(e.get("task") == tid for e in
-                                     recovery._read_ndjson(recovery.index_path(repo), "recovery index")):
-            stop_reason = f"recovery_invalid:{tid}"
-            print(f"GATE: {tid} has recovery history but no valid receipt; refusing ordinary dispatch")
-            break
-        attempt_cap = cfg["max_attempts_per_task"]
-        budget = None
-        if recovered:
-            # A recovery does not hand back a fresh attempt budget. It grants
-            # exactly one recorded revalidation dispatch on top of the attempts
-            # the task already spent, and only once per receipt.
-            budget = recovery.revalidation_budget(repo, cfg, tid, recovered)
-            if budget["used"] >= budget["allowed"]:
-                stop_reason = f"revalidation_exhausted:{tid}"
-                journal(repo, {"event": "revalidation_refused", "task": tid, **budget})
-                print(
-                    f"GATE: {tid} already spent its one revalidation dispatch "
-                    f"(receipt {recovered['sha256'][:10]}) — stopping."
-                )
-                break
-            attempt_cap = budget["prior_attempts"] + budget["allowed"]
-            print(
-                f"  {tid} carries recovery receipt {recovered['sha256'][:10]} for "
-                f"implementation {recovered['implementation']['commit'][:10]}; "
-                f"{budget['prior_attempts']} prior attempt(s) kept, "
-                f"{budget['allowed']} revalidation dispatch allowed"
-            )
-        # A recovered task carries its spent attempts and its last failure
-        # signature forward: the original limit still bounds it, and a repeat
-        # of the same failure is still no progress.
-        attempts = budget["prior_attempts"] if budget else 0
+        attempts = 0
         dispatches = 0
         outcome = "unknown"
-        last_sig = budget["prior_signature"] if budget else None
+        last_sig = None
         last_worker = ""
-        session_decision = {"mode": "off", "reason": "not_dispatched", "task": tid}
-        session_evidence: dict = {}
-        session_returncode, session_started, session_head = -1, time.time(), ""
 
-        while attempts < attempt_cap:
+        while attempts < cfg["max_attempts_per_task"]:
             attempt_queue_text = qpath.read_text(encoding="utf-8")
             attempt_tasks = parse_queue(attempt_queue_text)
             attempt_status = attempt_tasks.get(tid, {}).get("status", "<missing>")
@@ -2683,10 +2067,7 @@ def _cmd_run_locked(args) -> None:
             # its attempts on claude while it was returning 529, with codex,
             # grok and kimi installed and idle. Quota benching already rotates; this covers every other
             # tool-shaped failure, which is most of them.
-            # A recovered task's one revalidation dispatch goes to the preferred
-            # worker: the attempts it carries were not that CLI's failures, so
-            # rotating on them would only swap the pinned model for a fallback.
-            worker = pool[0] if recovered else pool[attempts % len(pool)]
+            worker = pool[attempts % len(pool)]
             last_worker = worker
             dispatches += 1
             attempt_head = git(repo, "rev-parse", "HEAD").strip()
@@ -2696,10 +2077,6 @@ def _cmd_run_locked(args) -> None:
                 skill=cfg.get("worker_skill") or "the project's next-session",
                 task=tid,
             )
-            session_decision = sessions.select(tid, worker, attempt_queue_text, dispatches, task_files)
-            session_evidence = {}
-            session_returncode = -1
-            prompt = sessions.prompt(session_decision, prompt, task_files)
             pf = repo / GATE_DIR / "runs" / run_id / f"{tid}-a{dispatches}.prompt.md"
             pf.parent.mkdir(parents=True, exist_ok=True)
             pf.write_text(prompt, encoding="utf-8")
@@ -2710,36 +2087,17 @@ def _cmd_run_locked(args) -> None:
                 else (f"fallback from {pin}" if pin else "run-wide")
             )
             print(f"  attempt {attempts + 1} via {worker} [{how}] … (live log: {logp})")
-            if recovered:
-                budget = recovery.revalidation_budget(repo, cfg, tid, recovered)
-                if budget["used"] >= budget["allowed"]:
-                    outcome = "revalidation_exhausted"
-                    break
-                # Spend the one revalidation dispatch before the worker starts,
-                # and raise the review barrier before it can close anything: a
-                # crash between here and the judge must not read as approval.
-                recovery.record_revalidation_dispatch(repo, tid, recovered, budget)
-                recovery.raise_barrier(
-                    repo, tid, recovered["sha256"],
-                    f"recovered implementation {recovered['implementation']['commit'][:10]} "
-                    "closed without a recorded judge pass",
-                )
             journal(
                 repo,
                 {
                     "event": "attempt_start",
                     "task": tid,
                     "worker": worker,
-                    "pid": os.getpid(),
                     "pin": pin,
                     "pinned": bool(pin) and worker == pin,
                     "attempt": attempts + 1,
                     "dispatch": dispatches,
                     "log": str(logp),
-                    "session_mode": session_decision["mode"],
-                    "session_reason": session_decision["reason"],
-                    "session_before": session_decision.get("before"),
-                    "session_background": session_decision.get("background"),
                 },
             )
             notify(cfg, repo, f"{tid} started (attempt {attempts + 1}, {worker})")
@@ -2760,14 +2118,8 @@ def _cmd_run_locked(args) -> None:
                 )
 
             t0 = time.time()
-            session_started = t0
             try:
-                session_options = {}
-                if session_decision["mode"] != "off":
-                    session_options["template"] = sessions.template(session_decision)
-                proc, err = spawn_worker(
-                    repo, cfg, worker, prompt, pf, log_path=logp, on_beat=beat, **session_options
-                )
+                proc, err = spawn_worker(repo, cfg, worker, prompt, pf, log_path=logp, on_beat=beat)
             except subprocess.TimeoutExpired:
                 proc, err = None, "timeout"
             took = round(time.time() - t0, 1)
@@ -2793,12 +2145,6 @@ def _cmd_run_locked(args) -> None:
                 break
 
             out = (proc.stdout or "") + (proc.stderr or "")  # already streamed to logp
-            if getattr(proc, "execution_mismatch", False):
-                outcome = "execution_mismatch"
-                break
-            session_returncode = proc.returncode
-            session_evidence = sessions.read_events(out) if session_decision["mode"] != "off" else {}
-            session_head = git(repo, "rev-parse", "HEAD").strip()
 
             # Tool outages are not task failures. A model CLI may itself exit
             # zero after a nested Git command fails, so classify its transcript
@@ -2954,18 +2300,6 @@ def _cmd_run_locked(args) -> None:
                 )
                 break
 
-            asked = worker_scope_request(out)
-            if asked:
-                outcome = "scope_request"
-                print(
-                    f"  {worker} stopped to ask for a scope decision"
-                    + (": " + ", ".join(asked["files"]) if asked["files"] else "")
-                    + " — stopping without an identical retry"
-                )
-                journal(repo, {"event": "scope_request", "task": tid, "worker": worker,
-                               "files": asked["files"]})
-                break
-
             dirty_after = non_gate_worktree_state(repo)
             if dirty_after != attempt_worktree:
                 outcome = "worker_left_changes"
@@ -2989,46 +2323,11 @@ def _cmd_run_locked(args) -> None:
 
         judge_info: dict | None = None
         if outcome == "done" and jcfg.get("enabled"):
-            # Named only when there is something to add, so an ordinary task's
-            # review is the same call it has always been.
-            extra = recovery.judge_extra_commits(
-                repo, recovered, git(repo, "rev-parse", "HEAD").strip()
-            )
             judge_info = judge_task(
                 repo, cfg, run_id, run_dir, tid, head_before, task_files,
-                last_worker, pin, **({"extra_commits": extra} if extra else {}),
-            )
-        # Resumed code is still unreviewed code. A recovered task closes on an
-        # implementation no judge has seen, so a disabled, benched or
-        # unparsable judge is escalated here instead of passing silently.
-        if outcome == "done" and recovered and (
-            judge_info is None or judge_info["final"] == "skipped"
-        ):
-            judge_info = _escalate(
-                repo, tid, (judge_info or {}).get("rounds", []),
-                "recovered task needs an independent review: "
-                + ("judge disabled" if judge_info is None else judge_info["reason"]),
-            )
-        if recovered and outcome != "done":
-            # The dispatch closed nothing: retire the barrier it raised, or no
-            # later run could ever start. A DONE row is never retired here —
-            # open_barriers reconstructs that obligation from the history.
-            recovery.retire_dispatch_barrier(
-                repo, cfg, tid, f"revalidation dispatch ended {outcome}; the row is not DONE"
-            )
-        if recovered and judge_info and judge_info["final"] == "pass":
-            rounds = judge_info["rounds"]
-            recovery.clear_barrier(
-                repo, tid, "judge",
-                f"round {len(rounds)} scored {rounds[-1]['score']} "
-                f"({rounds[-1]['member']}) on {recovered['implementation']['commit'][:10]}"
-                if rounds else "judge passed",
+                last_worker, pin,
             )
 
-        session_info = sessions.finish(session_decision, session_evidence, outcome, judge_info,
-                                       dispatches, session_returncode, session_started, session_head)
-        if session_decision["mode"] != "off":
-            journal(repo, {"event": "session_checkpoint", "task": tid, **session_info})
 
         results.append(
             {
@@ -3040,12 +2339,10 @@ def _cmd_run_locked(args) -> None:
                 "worker": last_worker,
                 "pin": pin or "",
                 "judge": judge_info,
-                "session": session_info,
             }
         )
         journal(repo, {"event": "task_end", "task": tid, "outcome": outcome,
-                       "judge": (judge_info or {}).get("final"),
-                       "attempts": attempts, "signature": last_sig})
+                       "judge": (judge_info or {}).get("final")})
         if outcome != "done":
             notify(
                 cfg,
@@ -3069,8 +2366,7 @@ def _cmd_run_locked(args) -> None:
     (repo / GATE_DIR / f"RUN-REPORT-{run_id}.md").write_text(report, encoding="utf-8")
     latest = repo / GATE_DIR / "RUN-REPORT.md"
     latest.write_text(report, encoding="utf-8")
-    journal(repo, {"event": "run_end", "run": run_id, "stop": stop_reason,
-                   "pid": os.getpid(), "host": platform.node()})
+    journal(repo, {"event": "run_end", "run": run_id, "stop": stop_reason})
 
     print("\n" + report)
 
@@ -3083,8 +2379,7 @@ def _cmd_run_locked(args) -> None:
     )
 
     needs_human = stop_reason.split(":", 1)[0] in (
-        "judge_escalated", "revision_broke_verify", "needs_approval", "execution_policy",
-        "execution_mismatch", "scope_request",
+        "judge_escalated", "revision_broke_verify", "needs_approval"
     )
     if any(r["outcome"] != "done" for r in results) or not results or needs_human:
         raise SystemExit(3)
@@ -3110,19 +2405,6 @@ def render_report(
         )
     if not results:
         lines.append("| — | nothing ran | 0 | 0 |")
-
-    session_rows = [r for r in results if r.get("session", {}).get("mode", "off") != "off"]
-    if session_rows:
-        lines += ["", "## Sessions", "",
-                  "| task | mode | reason | input tokens | cached input | reusable | checkpoint |",
-                  "|---|---|---|---:|---:|---|---|"]
-        for r in session_rows:
-            s = r["session"]
-            usage = s.get("usage", {})
-            lines.append(f"| {r['task']} | {s['mode']} | {s['reason']} | "
-                         f"{usage.get('input_tokens', 'unknown')} | "
-                         f"{usage.get('cached_input_tokens', 'unknown')} | {s.get('reusable', False)} | "
-                         f"{s.get('checkpoint_reason', 'unknown')} |")
 
     # Judge: rounds, scores, and what each round's worker was. A skipped
     # judge is printed loudly — quality silently switched off is the failure.
@@ -3246,184 +2528,6 @@ def render_report(
     return "\n".join(lines) + "\n"
 
 
-def cmd_recover_task(args) -> None:
-    """Return one stopped claim to TODO, with the evidence that it is one.
-
-    Refuses everything it cannot prove: a live claim, an open run, a stop that
-    named another task, an implementation that is not an ancestor, changed
-    declared scope or content, staged or dirty declared source. It never
-    writes DONE, never commits, and never touches another row.
-    """
-    repo = repo_root(Path(args.repo).resolve())
-    cfg = load_config(repo)
-    missing = [
-        flag for flag, value in (
-            ("--task", args.task),
-            ("--implementation", args.implementation),
-            ("--run", args.run),
-            ("--reason", args.reason),
-        ) if not value
-    ]
-    if missing:
-        die("recover-task needs " + ", ".join(missing))
-    stopped_pid = None
-    if args.stopped_pid:
-        try:
-            stopped_pid = int(args.stopped_pid)
-        except ValueError:
-            die("--stopped-pid must be the numeric pid of the runner you observed stopped")
-    evidence_args = {
-        "stopped_pid": stopped_pid,
-        "requirement_mode": args.requirement_mode or "headings",
-        "requirement_path": args.requirement,
-    }
-    try:
-        if args.dry_run:
-            proposal = recovery.plan(
-                repo, cfg, args.task, args.implementation, args.run, args.reason,
-                **evidence_args
-            )
-            print(json.dumps(proposal, indent=2, ensure_ascii=False))
-            print(
-                f"GATE: {args.task} is recoverable "
-                f"({proposal['queue_transition']['from']} → {proposal['queue_transition']['to']}). "
-                "Nothing was written."
-            )
-            return
-        receipt = recovery.recover(
-            repo, cfg, args.task, args.implementation, args.run, args.reason,
-            args.note or "", **evidence_args
-        )
-    except recovery.RecoveryError as exc:
-        journal(repo, {"event": "recovery_refused", "task": args.task,
-                       "implementation": args.implementation, "run": args.run,
-                       "reason": str(exc), "dry_run": bool(args.dry_run)})
-        die(f"recovery refused: {exc}")
-    queue = receipt["scope"]["queue_file"]
-    print(
-        f"GATE: {args.task} {receipt['queue_transition']['from']} → "
-        f"{receipt['queue_transition']['to']} in {queue} (worktree only, not committed)"
-    )
-    print(f"  implementation : {receipt['implementation']['commit']}")
-    print(f"  declared       : {', '.join(receipt['scope']['declared_files'])}")
-    print(f"  requirement    : {', '.join(receipt['requirement']['sources']) or '(row only)'}"
-          f" [{receipt['requirement']['mode']}]")
-    print(f"  stopped owner  : pid {receipt['ownership']['owner_pid']} "
-          f"({receipt['ownership']['owner_source']}), census "
-          f"{receipt['ownership']['census_size']} process(es)")
-    print(f"  receipt        : {recovery.receipt_path(repo, receipt['sha256'])}")
-    print(
-        "  next           : commit that one row, then run the task normally. "
-        "Gate 1 will accept its queue-only DONE only after a fresh PASS from "
-        f"{cfg['verify_cmd']!r} over these same blobs."
-    )
-
-
-def cmd_renew_revalidation(args) -> None:
-    """One more revalidation dispatch for a lineage whose only dispatch passed
-    the oracle and was then refused at the gate. Evidenced, journalled, once."""
-    repo = repo_root(Path(args.repo).resolve())
-    cfg = load_config(repo)
-    if not args.task:
-        die("renew-revalidation needs --task")
-    try:
-        grant = recovery.renew_revalidation(repo, cfg, args.task, args.reason or "")
-    except recovery.RecoveryError as exc:
-        journal(repo, {"event": "renewal_refused", "task": args.task, "reason": str(exc)})
-        die(f"renewal refused: {exc}")
-    print(f"GATE: {args.task} granted one more revalidation dispatch "
-          f"(lineage {grant['implementation'][:10]}); recover the stopped claim, then run.")
-
-
-def cmd_review_task(args) -> None:
-    """Independent review only, under the same lock and persistent budgets."""
-    repo = repo_root(Path(args.repo).resolve())
-    try:
-        lock = recovery.EngineLock(repo, "review task").acquire()
-    except recovery.RecoveryError as exc:
-        die(str(exc), code=3)
-    try:
-        _cmd_review_task_locked(args, repo)
-    finally:
-        lock.release()
-
-
-def _cmd_review_task_locked(args, repo) -> None:
-    cfg = load_config(repo)
-    if not args.task:
-        die("review-task needs --task")
-    barriers = recovery.open_barriers(repo)
-    receipt = None
-    if args.task in barriers:
-        receipt = recovery.receipt_for(repo, cfg, args.task)
-        if receipt is None:
-            die(f"no valid recovery receipt for {args.task}; nothing to review against")
-    elif not (args.base and args.closure):
-        print(
-            f"GATE: {args.task} has no open review barrier. To review an ordinary DONE "
-            "task whose judge was skipped, name its commits: --base <sha before the "
-            "task> --closure <its closing commit>."
-        )
-        return
-    jcfg = sub_cfg(cfg, "judge")
-    if not jcfg.get("enabled"):
-        die("judge.enabled is false; independent review is required.")
-    head = git(repo, "rev-parse", "HEAD").strip()
-    base = closure = None
-    commits: list[str] = []
-    if receipt is None:
-        # An ordinary task: the review names exactly its commits. Later tasks
-        # may already sit on top, so the range is pinned, not "since base".
-        base = git(repo, "rev-parse", "--verify", f"{args.base}^{{commit}}").strip()
-        closure = git(repo, "rev-parse", "--verify", f"{args.closure}^{{commit}}").strip()
-        if subprocess.run(["git", "merge-base", "--is-ancestor", closure, head],
-                          cwd=str(repo)).returncode != 0:
-            die("closure must be an ancestor of HEAD")
-        commits = [s for s in git(repo, "rev-list", f"{base}..{closure}").split() if s]
-        if not commits:
-            die(f"no commits in {base[:10]}..{closure[:10]}")
-        if args.task not in newly_done(repo, cfg, base, closure):
-            die(f"{args.task} does not flip to DONE between {base[:10]} and {closure[:10]}")
-    run_id = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-review"
-    run_dir = repo / GATE_DIR / "runs" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        policy = execution.read_lock(repo)["tasks"][args.task]
-        cfg = execution.bind(cfg, policy, args.task)
-    except (execution.PolicyError, KeyError) as exc:
-        die(f"execution profile for {args.task} is not locked: {exc}")
-    text = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
-    if receipt is None:
-        journal(repo, {"event": "review_requested", "task": args.task, "base": base,
-                       "closure": closure, "commits": commits, "pid": os.getpid()})
-        info = judge_task(
-            repo, cfg, run_id, run_dir, args.task, head,
-            parse_task_files(text).get(args.task) or [],
-            "", parse_task_workers(text).get(args.task),
-            extra_commits=commits,
-        )
-        if info["final"] == "pass":
-            print(f"GATE: {args.task} reviewed: pass.")
-            return
-        die(f"{args.task} review did not pass: {info['final']} ({info['reason']})", code=3)
-    info = judge_task(
-        repo, cfg, run_id, run_dir, args.task, receipt["implementation"]["parent"],
-        parse_task_files(text).get(args.task) or receipt["scope"]["declared_files"],
-        "", parse_task_workers(text).get(args.task),
-        extra_commits=recovery.judge_extra_commits(repo, receipt, head),
-    )
-    if info["final"] == "pass":
-        rounds = info["rounds"]
-        recovery.clear_barrier(
-            repo, args.task, "judge",
-            f"round {len(rounds)} scored {rounds[-1]['score']} ({rounds[-1]['member']})"
-            if rounds else "judge passed",
-        )
-        print(f"GATE: {args.task} reviewed and cleared.")
-        return
-    die(f"{args.task} remains unreviewed: {info['final']} ({info['reason']})", code=3)
-
-
 def cmd_doctor(args) -> None:
     repo = repo_root(Path(args.repo).resolve())
     print(f"repo            : {repo}")
@@ -3449,11 +2553,6 @@ def cmd_doctor(args) -> None:
         }
         if todo_pins:
             print(f"worker pins     : {todo_pins}")
-        try:
-            policies = execution.resolve(cfg, qf.read_text(encoding="utf-8"), tasks, pins)
-            print(f"execution       : {len(policies)} explicit task profiles OK")
-        except execution.PolicyError as exc:
-            print(f"execution       : MISSING/INVALID ({exc})")
     installed, hook_mode = hook_installation(repo)
     print(f"pre-commit gate : {'INSTALLED' if installed else 'not installed'} ({hook_mode})")
     print(f"verify_cmd      : {cfg['verify_cmd']}")
@@ -3465,13 +2564,6 @@ def cmd_doctor(args) -> None:
         print("last verdict    : none")
 
 
-# recovery.py needs this module's queue parsing, path resolution and journal,
-# and this module is loaded under several names (__main__ from the hook, a
-# throwaway name from importlib in the tests). Handing over the namespace binds
-# the copy that is actually running instead of importing a second one.
-recovery.bind(globals())
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(prog="gate.py", description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -3480,23 +2572,9 @@ def main() -> None:
         ("init", cmd_init, [("--force", "store_true")]),
         ("install-hook", cmd_install_hook, [("--force", "store_true")]),
         ("check-commit", cmd_check_commit, []),
-        ("verify", cmd_verify, [("--cmd", "str"), ("--step", "str")]),
+        ("verify", cmd_verify, [("--cmd", "str")]),
         ("audit", cmd_audit, [("--last", "int")]),
         ("admit", cmd_admit, []),
-        ("recover-task", cmd_recover_task, [
-            ("--task", "str"),
-            ("--implementation", "str"),
-            ("--run", "str"),
-            ("--reason", "str"),
-            ("--note", "str"),
-            ("--stopped-pid", "str"),
-            ("--requirement", "str"),
-            ("--requirement-mode", "str"),
-            ("--dry-run", "store_true"),
-        ]),
-        ("review-task", cmd_review_task, [("--task", "str"), ("--base", "str"), ("--closure", "str")]),
-        ("renew-revalidation", cmd_renew_revalidation, [("--task", "str"), ("--reason", "str")]),
-        ("lock-execution", cmd_lock_execution, [("--reason", "str")]),
         ("usage", cmd_usage, []),
         ("doctor", cmd_doctor, []),
         ("run", cmd_run, [
