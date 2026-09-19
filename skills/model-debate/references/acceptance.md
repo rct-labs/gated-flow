@@ -32,6 +32,10 @@ This is a workflow test, not a live-model or sandbox test.
 | Constraint challenged / required tool absent | Surface scoped concern/capability gap, never ignore applicable instructions. |
 | Duplicate new claims and minority objection | Keep prefixed IDs/mappings, origins and full index links. |
 | Unanimous unsupported final claim | Mark open/unverifiable or correct; agreement is not verification. |
+| "Finish quickly" arrives mid-run on a disclosed `debate` | Round 2 still runs, or the run is kept open / downgraded with agreement; never reported as a debate without cross-examination. |
+| Two models, one vendor and account pool | Minimum met; reduced diversity disclosed in roster and report; agreement not called cross-vendor. |
+| Run stops after round 1 | `decision-log.md` written with stage reached and reason; reported incomplete. |
+| Report with `final.md` not applied | Application status stated on its own line. |
 
 ## Live miniature smoke
 

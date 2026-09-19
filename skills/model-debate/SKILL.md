@@ -41,6 +41,11 @@ for one model do not satisfy this rule. Different models provide diversity, not
 statistical independence. Group corroboration by underlying model and source
 origin; truth never follows seat count, majority vote or model prestige.
 
+Prefer models from **different vendors and account pools** when the roster
+allows it. Two models of one vendor meet the minimum but share training lineage
+and usually one allowance: disclose that as reduced diversity in `roster.md` and
+the final report, and never present their agreement as cross-vendor support.
+
 ## Setup and selection
 
 Infer the target, constraints and requested models from the conversation. User
@@ -83,8 +88,23 @@ against runtime identity. Group aliases resolving to the same underlying model.
 ## Procedure
 
 Setup → per-seat research → independent critique → cross-examination → host
-verification → freeze. Research is not a debate round. There are two debate
+verification → freeze. Research is not a debate round. A `debate` has two
 rounds; extra rounds require authorization outside the original budget.
+
+Choose the run size at setup and record it in `roster.md`:
+
+| Profile | Use for | Shape |
+|---|---|---|
+| `debate` (default) | a fork that is uncertain, high-impact and hard to undo | research, round 1, round 2, host verification |
+| `single-round` | a bounded question where independent reads matter more than rebuttal | research, round 1, host verification; no cross-examination |
+
+`single-round` is a choice made and disclosed before calls, not a way to finish
+a `debate` early. An instruction to hurry, finish or run unattended (including
+from `$flow-run`) does not remove round 2 from a run that was disclosed as a
+`debate`. If round 2 cannot run, say so, keep the run open or downgrade it with
+the user's agreement, and name the profile that actually ran in every report: a
+run without cross-examination is never reported as a debate. Host verification
+is mandatory in both profiles.
 
 At stage boundaries report material findings and let the user intervene. Existing
 authorization to complete the run covers these checkpoints: report and continue
@@ -183,7 +203,11 @@ constraint questions. A new design fork is not permission for an unbudgeted roun
 
 Check factual claims from the draft and every proposed final change, including
 inventory omissions. Prioritize disputed, unverified, stale and uncited-consensus
-claims. Inspect sources yourself: model citations are leads, not evidence. Tie
+claims. Treat unanimity as a risk signal, not a shortcut: when every seat agrees
+on a load-bearing premise, parameter or error signature, verify it first and
+against the primary artifact (run the query, open the file, read the actual
+error), because shared training produces shared invention. Output from a failed
+or truncated seat attempt is not evidence. Inspect sources yourself: model citations are leads, not evidence. Tie
 code evidence to the recorded snapshot and actually inspect line references.
 
 For external facts, open cited URLs, confirm quotes in context, check dates and
@@ -209,8 +233,18 @@ originating seats/models, accepted/rejected fixes and unresolved constraints.
 Include identity limitations, shared research, isolation assurance, failed/dropped
 seats, retries/calls and evidence gaps. Preserve every attempt.
 
-Report seats versus distinct models, rounds, checked sources, verdict counts,
-material changes, limitations and artifact paths in the user's output style.
+Before reporting, check the run directory holds `roster.md`, the quota receipts,
+`verification.md`, `decision-log.md` and `final.md`. A run missing any of them
+is reported as incomplete, naming the gap. A run that stops early still writes
+`decision-log.md` with the stage reached and the reason; a run directory with
+no decision log is a defect. Record total calls, retries and wall-clock per
+stage in the decision log.
+
+Report the profile that ran, seats versus distinct models and vendors, whether
+the host also held a seat or authored the draft under review, rounds,
+checked sources, verdict counts, material changes, limitations and artifact
+paths in the user's output style. State on its own line whether `final.md` has
+been applied to its destination; when it has not, say what would apply it.
 Applying the final back to its original destination needs authorization; an
 existing explicit instruction to revise that destination already satisfies it.
 Do not commit, publish or change project configuration merely because a debate ran.

@@ -6,7 +6,9 @@ mandatory standalone parser.
 ## Roster
 
 `roster.md` records original request, configuration source, host role,
-draft/project snapshot identity, language, research/isolation mode, and budget:
+draft/project snapshot identity, language, run profile (`debate` or
+`single-round`), vendor and account pool per model, research/isolation mode,
+and budget:
 calls, retries, concurrency by subscription and deadline per seat.
 
 Record frozen requested reasoning effort and separately observed effort for

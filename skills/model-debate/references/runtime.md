@@ -79,6 +79,21 @@ Check these non-obvious pitfalls:
   choose API-only modes or copy credentials to make a sandbox work.
 - Without enforceable write restrictions, use an actually protected snapshot
   or another verified boundary. A prompt saying "do not edit" is insufficient.
+- The working directory of an agent CLI is part of the prompt. Launched at a
+  repository root it auto-loads that project's instruction files (`AGENTS.md`,
+  `CLAUDE.md`, project skills), which can replace the seat's role. Launch from
+  the seat's own input directory and hand over project evidence as inputs.
+- Windows `.cmd` package-manager shims can cut a prompt at its first newline.
+  Resolve the native executable, or pass the prompt by file or stdin, and
+  confirm in preflight that a multi-line prompt arrives whole.
+- A planning or approval-only permission mode may return narration instead of
+  a review, and may auto-activate unrelated skills. Probe that the chosen mode
+  yields a complete final answer before using it for a seat.
+- A seat started inside the host's own tool shell dies with that shell and
+  inherits its tool timeout, which truncates long reviews. Launch seats as
+  detached processes and poll their completion records.
+- Non-empty stderr is not a failure: some CLIs echo the whole transcript there.
+  Judge the attempt by its completion record and the validity of the result.
 
 ## Isolation and probes
 
