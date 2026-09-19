@@ -213,6 +213,11 @@ JUDGE_SCHEMA = {
     "additionalProperties": False,
 }
 
+# Headless claude runs cannot receive chat messages, yet each one loaded the
+# Telegram channel plugin: two bun processes, about 700 MB per run (measured
+# 2026-09-19). A false entry for a plugin that is not installed is a no-op.
+CLAUDE_HEADLESS_SETTINGS = '{"enabledPlugins":{"telegram@claude-plugins-official":false}}'
+
 # Read-only judge contracts. The chain is fable → opus → codex; fable is allowed
 # here because the judge only reads. {schema} is the inline JSON schema,
 # {schema_file} / {out_file} are paths for CLIs that take files.
@@ -224,6 +229,7 @@ JUDGE_CMDS: dict[str, list[str]] = {
         "--allowedTools",
         "Read,Grep,Glob,Bash(git diff:*),Bash(git show:*),Bash(git log:*),Bash(git status:*)",
         "--max-budget-usd", "5",
+        "--settings", CLAUDE_HEADLESS_SETTINGS,
     ],
     "opus": [
         "claude", "-p", "{prompt}",
@@ -232,6 +238,7 @@ JUDGE_CMDS: dict[str, list[str]] = {
         "--allowedTools",
         "Read,Grep,Glob,Bash(git diff:*),Bash(git show:*),Bash(git log:*),Bash(git status:*)",
         "--max-budget-usd", "5",
+        "--settings", CLAUDE_HEADLESS_SETTINGS,
     ],
     "codex": [
         "codex", "exec", "--sandbox", "read-only", "--skip-git-repo-check",
@@ -261,6 +268,7 @@ WORKER_CMDS: dict[str, list[str]] = {
         "--permission-mode", "acceptEdits",
         "--allowedTools", "Read,Edit,Write,Bash,Glob,Grep,TaskOutput",
         "--output-format", "text",
+        "--settings", CLAUDE_HEADLESS_SETTINGS,
     ],
     "grok": [
         "grok", "--prompt-file", "{prompt_file}",
