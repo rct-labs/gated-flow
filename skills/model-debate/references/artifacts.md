@@ -6,8 +6,8 @@ mandatory standalone parser.
 ## Roster
 
 `roster.md` records original request, configuration source, host role,
-draft/project snapshot identity, language, run profile (`debate` or
-`single-round`), vendor and account pool per model, research/isolation mode,
+draft/project snapshot identity, language, run profile (`focused` or
+`debate`), vendor and account pool per model, research/isolation mode,
 and budget:
 calls, retries, concurrency by subscription and deadline per seat.
 
@@ -97,7 +97,8 @@ research alone must not expose peer research to round-1 seats.
 
 `claims.md`: `ID | assertion | kind | draft location | relevant question`.
 Assign `C001`, etc. before round 1; never silently renumber. Kinds: fact,
-assumption, proposal. `constraints.md` uses `K001`, etc., owner decision/source
+assumption, proposal. A pre-verified fact also carries `SETTLED-TRUE` or
+`SETTLED-FALSE`, its evidence and checked date. `constraints.md` uses `K001`, etc., owner decision/source
 and date or conversation provenance.
 
 Seats add `N-<seat>-001` claims and `O-<seat>-001` objections, linked to locations

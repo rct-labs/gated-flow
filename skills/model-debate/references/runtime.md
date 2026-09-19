@@ -123,8 +123,20 @@ Probe through actual enabled seat tools under the same launch policy:
   Its absence in the answer is **not** proof: retain tool-level denied reads
   and the successful control read.
 
-Reuse probes only for identical boundary configuration in the same run; test
-each differing policy. If a channel is unrestricted or a read succeeds, do not
+Reuse probes within a run only for identical boundary configuration; test each
+differing policy. Across runs, a **cached preflight** may stand in for the
+identity, isolation and web probes of an adapter when all of these still match
+the cached record: executable path and version, resolved model selector and
+effort, argument array, permission/sandbox policy, the non-secret effective
+configuration fingerprint, and OS user. Keep the records outside any project
+(for example `~/.model-debate/preflight/<fingerprint>.json`) with the probe
+evidence and timestamp. A record is valid for 7 days; any fingerprint change, a
+failed or surprising seat result, or a user request invalidates it at once and
+the probes run again. State in `roster.md` and the report which assurances come
+from a cached preflight and its age. The cache never covers quota: run the
+quota guard fresh every time. Cached results do not upgrade an assurance level
+and cannot supply the evidence for a second distinct model that the original
+probe did not establish. If a channel is unrestricted or a read succeeds, do not
 label the round independent. Try supported stricter launch modes first. If none
 works, report the precise gap. Proceed with explicitly labeled **soft isolation**
 only when the user authorizes that limitation; otherwise stop the affected launch.

@@ -32,7 +32,13 @@ This is a workflow test, not a live-model or sandbox test.
 | Constraint challenged / required tool absent | Surface scoped concern/capability gap, never ignore applicable instructions. |
 | Duplicate new claims and minority objection | Keep prefixed IDs/mappings, origins and full index links. |
 | Unanimous unsupported final claim | Mark open/unverifiable or correct; agreement is not verification. |
-| "Finish quickly" arrives mid-run on a disclosed `debate` | Round 2 still runs, or the run is kept open / downgraded with agreement; never reported as a debate without cross-examination. |
+| "Finish quickly" arrives mid-run | `focused` keeps host verification and the surviving-dispute round, `debate` keeps round 2; otherwise the run stays open or changes profile with agreement, and the report names the profile that ran. |
+| No profile requested, ordinary review | `focused`, three seats on three vendors, one call per seat plus a disclosed reserve. |
+| Draft claim checkable by reading a local file | Host settles it before seat calls; seats receive it as `SETTLED-*` with evidence, not as an open question. |
+| `focused`: one design dispute survives verification, three objections settled by it | Only the surviving dispute is sent, to the seats holding the positions plus one other model; settled objections closed with reasons. |
+| `focused`: nothing survives verification | `no surviving disputes` recorded, no second round, run reported complete. |
+| Cached preflight, CLI version changed | Cache rejected; probes rerun; roster shows fresh evidence. |
+| Cached preflight valid | Probes skipped, quota guard still run fresh, report states the cache and its age. |
 | Two models, one vendor and account pool | Minimum met; reduced diversity disclosed in roster and report; agreement not called cross-vendor. |
 | Run stops after round 1 | `decision-log.md` written with stage reached and reason; reported incomplete. |
 | Report with `final.md` not applied | Application status stated on its own line. |

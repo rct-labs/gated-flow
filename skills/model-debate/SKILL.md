@@ -62,8 +62,9 @@ professions or opposition. Roles specify questions, not conclusions. All seats
 use the same output format. Distribute important review dimensions across models
 too, so a difference of opinion is not completely confounded with role assignment.
 
-Prefer two seats per model and four to six total for substantial reviews; these
-are defaults, not hard limits. Small reviews may use one seat per model. Honor
+Default to three seats on three models from different vendors, one seat per
+model. Use two seats per model and four to six total for a `debate` or when the
+review dimensions do not fit three roles; these are defaults, not hard limits. Honor
 explicit counts and enabled catalog models; disclose excess size instead of
 silently trimming them. Freeze roles in `roster.md` before research. Ordinary role
 generation needs no separate approval when the run is already authorized.
@@ -87,24 +88,26 @@ against runtime identity. Group aliases resolving to the same underlying model.
 
 ## Procedure
 
-Setup → per-seat research → independent critique → cross-examination → host
-verification → freeze. Research is not a debate round. A `debate` has two
-rounds; extra rounds require authorization outside the original budget.
-
-Choose the run size at setup and record it in `roster.md`:
+Choose the profile at setup and record it in `roster.md`:
 
 | Profile | Use for | Shape |
 |---|---|---|
-| `debate` (default) | a fork that is uncertain, high-impact and hard to undo | research, round 1, round 2, host verification |
-| `single-round` | a bounded question where independent reads matter more than rebuttal | research, round 1, host verification; no cross-examination |
+| `focused` (default) | most reviews | host pre-verification → round 1 with research inside the same call → host verification → cross-examination of surviving disputes only → freeze |
+| `debate` | an irreversible, high-impact fork, or an explicit request | host pre-verification → per-seat research → round 1 → full round 2 → host verification → freeze |
 
-`single-round` is a choice made and disclosed before calls, not a way to finish
-a `debate` early. An instruction to hurry, finish or run unattended (including
-from `$flow-run`) does not remove round 2 from a run that was disclosed as a
-`debate`. If round 2 cannot run, say so, keep the run open or downgrade it with
-the user's agreement, and name the profile that actually ran in every report: a
-run without cross-examination is never reported as a debate. Host verification
-is mandatory in both profiles.
+Spend calls where they change the outcome. Past runs show host verification
+overturns about a third of claims while a full second round rarely moves a
+conclusion, so `focused` checks facts first and sends to cross-examination only
+what is still in dispute afterwards. The numbered stages below describe
+`debate`; each states what `focused` does differently. Research is not a debate
+round. Rounds beyond the profile need authorization outside the original budget.
+
+The profile is chosen and disclosed before calls. An instruction to hurry,
+finish or run unattended (including from `$flow-run`) removes neither host
+verification nor the surviving-dispute round from `focused`, nor round 2 from a
+`debate`. If a required stage cannot run, say so, keep the run open or change
+profile with the user's agreement, and name the profile that actually ran in
+every report. Host verification is mandatory in both profiles.
 
 At stage boundaries report material findings and let the user intervene. Existing
 authorization to complete the run covers these checkpoints: report and continue
@@ -121,14 +124,24 @@ grants it; routine execution and corrections within scope need no new gate.
    as `C001`, `C002`, etc., linked to draft locations. Distinguish facts,
    assumptions, proposals and constraints. The inventory is not an endorsement
    or a restriction on what seats can challenge or add.
-3. Define shared and role-specific research questions derived from the draft,
+3. Pre-verify: settle every claim the host can check cheaply against a primary
+   artifact (run the query, open the file, read the actual error, inspect the
+   recorded snapshot) before any seat call. Mark each `SETTLED-TRUE` or
+   `SETTLED-FALSE` in `claims.md` with its evidence and checked date. Seats
+   receive these as established facts and spend their effort on judgment; a
+   seat may still challenge one, but only with contrary evidence. Do not
+   pre-verify preferences, designs or anything needing interpretation.
+4. Define shared and role-specific research questions derived from the draft,
    including current external dependencies. Prepare identical common inputs
    and each seat's role file; avoid arbitrary question counts.
-4. Disclose seats, model requests, shared subscriptions and call budget: normally
-   three calls per seat (research and two rounds), two with `--no-web`, plus
-   model preflights, capability probes and a stated retry allowance. Set total
-   calls, concurrency by subscription and wall-clock deadlines per seat.
-5. Run the quota guard for the complete remaining budget, including inference
+5. Disclose seats, model requests, shared subscriptions and call budget. In
+   `focused`: one call per seat plus a stated reserve for surviving disputes
+   (normally up to one further call for each seat). In `debate`: three calls per
+   seat (research and two rounds), two with `--no-web`. Add model preflights,
+   capability probes not covered by a valid cached preflight (`runtime.md`) and
+   a stated retry allowance. Set total calls, concurrency by subscription and
+   wall-clock deadlines per seat.
+6. Run the quota guard for the complete remaining budget, including inference
    probes and retries. Missing allowance/estimate or insufficient project quorum
    blocks the affected launch. Resolve/lock models and probe actual read/write
    boundaries and web capability
@@ -137,6 +150,10 @@ grants it; routine execution and corrections within scope need no new gate.
    requests/failures; never silently replace a requested model with a default.
 
 ### 1. Research independently
+
+In `focused` there is no separate research call: each seat researches inside
+its round-1 session under the rules below and returns sources and critique in
+one result. The barrier, privacy and host-packet rules apply unchanged.
 
 Research is on by default and runs **per seat**, guided by its role. Each gets
 only common inputs and its role. Use fresh sessions; do not fork the host's
@@ -182,6 +199,19 @@ results as a logically complete immutable stage. Then merge sources into
 
 ### 3. Cross-examine by claim
 
+In `focused` this stage runs **after** stage 4 and only on surviving disputes.
+A dispute survives when seats on different models hold incompatible positions
+on a point that changes the final document, and host verification could not
+settle it: a preference, a design trade-off, or a fact marked `UNVERIFIABLE`.
+Objections that verification settled, that no seat opposes, or that do not
+change the outcome are recorded in `objections.md` as closed with the reason
+and are not sent out. Send each surviving dispute to the seats that hold the
+positions plus one seat on a different model where available; other seats are
+not called. If nothing survives, record `no surviving disputes` and run no
+second round: that is a complete `focused` run, not a shortened one. Verify any
+new factual claim raised in these replies before it reaches `final.md`. The
+rules below apply to whatever is sent.
+
 Build `objections.md` indexed by claim/objection ID: concern, evidence and
 counterevidence, originating seat/model, and links to full passages. Include
 minority objections and source conflicts. Preserve the force of objections;
@@ -200,6 +230,9 @@ Keep round-2 results private until its completion barrier. Report disputes and
 constraint questions. A new design fork is not permission for an unbudgeted round.
 
 ### 4. Verify evidence (host, mandatory)
+
+In `focused` this runs as soon as the round-1 barrier closes, before any
+cross-examination, and its verdicts decide which disputes survive.
 
 Check factual claims from the draft and every proposed final change, including
 inventory omissions. Prioritize disputed, unverified, stale and uncited-consensus

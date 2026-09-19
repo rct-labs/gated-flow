@@ -23,7 +23,8 @@ This skill is a router. Load the others when that step starts:
 shape / brief / spec / CONTEXT / queue format -> `flow`;
 launch, journal watch, stop reasons -> `run-queue`;
 a fork that is uncertain, high-impact and hard to undo -> `model-debate`
-(its two rounds are part of the decision; do not shorten it to finish sooner).
+(its verification and dispute rounds are part of the decision; do not drop
+them to finish sooner).
 `flow home` prints the checkout; the design is `<home>/docs/autonomy.md`.
 
 ## 0. Worker pin

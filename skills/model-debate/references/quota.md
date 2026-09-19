@@ -136,7 +136,9 @@ not defaults that manufacture permission. Update the plan's remaining work and
 spent calls before recovery; keep `frozen_assignments` matching the failure record. After
 a READY recovery, apply `required_plan_changes`, save the new frozen assignments
 and record the roster revision before launch. A replacement must budget its fresh research and
-both rounds, and all other seats need the repeated round2. Reaching the budget
+both rounds, and all other seats need the repeated round2; in `focused`, budget
+its round 1 and repeat only the dispute calls that read the replaced seat's
+output. Reaching the budget
 does not authorize extending it. Missing authorization is a scoped roster/budget
 decision only; existing explicit substitution authority is reused, not re-asked.
 
