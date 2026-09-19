@@ -1,12 +1,15 @@
 ---
 name: flow-run
 description: >
-  Inspect this project's current state, decide the next work as the host CLI,
-  write an admission-ready TASK_QUEUE, then unattended-run it. Optional worker
-  pin: claude / claude-code, codex, kimi, grok / grok-build, pi. No pin means
-  the CLI running this skill. Use when the user types $flow-run or /flow-run,
-  or says check progress, keep going and finish, flow run, or continue and
-  finish; also responds to equivalent requests in other languages. Works from
+  The default entry for this workflow: inspect the project's current state,
+  decide the next work as the host CLI, write an admission-ready TASK_QUEUE,
+  then unattended-run it. It loads $flow and $run for their steps, so the
+  user never has to pick between them. Optional worker pin: claude /
+  claude-code, codex, kimi, grok / grok-build, pi. No pin means the CLI
+  running this skill. Use when the user types $flow-run or /flow-run, or says
+  check progress, continue, keep going, keep executing, run unattended,
+  continue until blocked, flow run, or continue and finish; also responds to
+  equivalent requests in other languages. Works from
   Claude Code, Codex CLI, Kimi CLI and Grok Build. Analysis-only, plan-only
   and paused-business requests do not authorize execution.
 ---

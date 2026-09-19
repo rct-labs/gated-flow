@@ -4,8 +4,10 @@
 > details: [../gate/README.md](../gate/README.md). Unattended-run behaviour:
 > [autonomy.md](autonomy.md).
 >
-> One-sentence mental model: **have an idea, want to continue, want to tidy up →
-> `$flow`; let the already-queued tasks run themselves → `$run`.**
+> One-sentence mental model: **want the work to move forward → `$flow-run`. It
+> loads the other two as needed. Only shaping an idea, handing off or tidying up,
+> with nothing run → `$flow`; only running a queue that is already written →
+> `$run`.**
 
 Each agent CLI has its own sigil for invoking a skill: Claude Code `/flow`,
 Codex `$flow`, Kimi Code `/skill:flow`, Grok Build `/flow`. This manual writes

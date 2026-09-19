@@ -1,13 +1,14 @@
 ---
 name: run-queue
 description: >
-  $run: run the project's task queue unattended. Admission-checked tasks, one
-  worker process per task, a machine-checked verdict after each, one package
-  review and one full acceptance per run, progress reported as it happens,
-  and a stop at the first thing that needs a human. Use when the user says
-  run unattended, run the queue, keep executing, continue until blocked, or
-  types $run or /run-queue; also responds to equivalent requests in other
-  languages. Not for a single task.
+  $run: the launch protocol for a task queue that is already written and
+  admitted. Admission-checked tasks, one worker process per task, a
+  machine-checked verdict after each, one package review and one full
+  acceptance per run, progress reported as it happens, and a stop at the
+  first thing that needs a human. Normally loaded by $flow-run at its launch
+  step. Use directly only when the user types $run or /run-queue, or asks to
+  run the existing queue as it stands. Not for a single task, and not for
+  deciding what to do next: that is $flow-run.
 ---
 
 # $run: unattended queue execution

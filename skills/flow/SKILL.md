@@ -1,15 +1,15 @@
 ---
 name: flow
 description: >
-  $flow — the single interactive entry for the personal development workflow:
-  capture and shape a fuzzy idea into brief/spec, scaffold a work package,
-  queue admission-ready tasks, insert an urgent task, resume or hand off a
-  session via CONTEXT.md, and audit a project tree for drift (read-only).
-  Use when the user types $flow or /flow, or asks to tidy the project, switch
-  or hand off a session, continue, insert a task, or turn a new idea into
-  tasks in a project governed by this workflow; also responds to equivalent
-  requests in other languages. Unattended execution is NOT this skill — that
-  is $run (the run-queue skill).
+  $flow — interactive planning that executes nothing: capture and shape a
+  fuzzy idea into brief/spec, scaffold a work package, queue admission-ready
+  tasks, insert an urgent task, hand off a session via CONTEXT.md, and audit
+  a project tree for drift (read-only). Use when the user types $flow or
+  /flow, or asks to tidy the project, hand off or switch a session, insert a
+  task, or turn a new idea into tasks without running them; also responds to
+  equivalent requests in other languages. Any request to continue, keep going
+  or finish the work is $flow-run, which loads this skill for its planning
+  steps.
 ---
 
 # $flow — interactive workflow entry
@@ -152,5 +152,5 @@ invocations.
 - No file moves or deletes from audit results without explicit per-batch
   human approval.
 - Never edit acceptance/verify commands to make a queued task admissible.
-- Unattended execution requests hand off to the run-queue skill ($run), not
-  to a loop you run.
+- Execution requests hand off to $flow-run (or $run when the queue is already
+  admitted), not to a loop you run.

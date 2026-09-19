@@ -12,9 +12,9 @@ each one closed — without ever letting a model mark its own work done.
 
 | Entry | You say | What happens |
 |---|---|---|
-| **flow** | `$flow <idea, question, or "tidy up">` | Interactive: survey the code, shape a brief and spec, queue admission-ready tasks, hand off a session, audit the tree (read-only) |
-| **run-queue** | `$run` | Unattended: `gate.py` runs one worker process per task, verifies each with the project's own acceptance command, stops at the first thing that needs a human |
-| **flow-run** | `$flow-run [claude\|codex\|kimi\|grok]` | Host CLI inspects the project, decides the next slice, writes the queue, then runs it unattended |
+| **flow-run** | `$flow-run [claude\|codex\|kimi\|grok]` | **Start here.** Host CLI inspects the project, decides the next slice, writes the queue, then runs it unattended; it loads the two skills below as it goes |
+| **flow** | `$flow <idea, question, or "tidy up">` | Planning only, runs nothing: survey the code, shape a brief and spec, queue admission-ready tasks, hand off a session, audit the tree (read-only) |
+| **run-queue** | `$run` | The queue is already written and you only want it run: `gate.py` runs one worker process per task, verifies each with the project's own acceptance command, stops at the first thing that needs a human |
 | **model-debate** | `$model-debate <draft>` | Role-based seats on two or more distinct models research, critique and cross-examine a draft; the host verifies every claim against evidence before freezing it |
 
 The sigil differs per CLI (`/flow` in Claude Code and Grok Build, `$flow` in
@@ -84,7 +84,7 @@ skills (it installs skills only, not the `flow` command):
 
 ```bash
 npx skills add rct-labs/gated-flow --list
-npx skills add rct-labs/gated-flow --skill flow --skill run-queue --skill model-debate
+npx skills add rct-labs/gated-flow --skill flow-run --skill flow --skill run-queue --skill model-debate
 ```
 
 As a Claude Code plugin (skills only, namespaced `gated-flow:flow` etc.):
@@ -111,8 +111,8 @@ you set one — loud beats a guessed oracle.
 1. **Have an idea** → `$flow …`. The agent surveys the code, discusses in small
    rounds, writes `docs/work/<id>/brief.md` and `spec.md`, appends queue rows
    with scope lines, and shows the admission report.
-2. **Let it run** → `$run` (or `$flow-run` to have the host decide the next
-   slice first). The run is detached from the chat session, narrated from the
+2. **Let it run** → `$flow-run` (the host decides the next slice, queues it
+   and runs it), or `$run` when the queue is already written. The run is detached from the chat session, narrated from the
    journal, and ends with `RUN-REPORT.md`; read its **Waiting on you** section.
 3. **Switch sessions** → `$flow hand off`. `CONTEXT.md` (≤200 lines, five
    questions) is the handoff; nothing else.

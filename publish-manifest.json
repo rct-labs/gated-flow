@@ -1,7 +1,6 @@
 {
   "policy": "Explicit publish whitelist. scripts/verify_repository.py fails on any file present but not listed here and on any listed file that is missing. Add a path only after checking it for local paths, private names and untranslated text.",
   "excluded_by_design": [
-    "sequential-execute skill (deprecated forwarder to run-queue)",
     "chat/notification integrations that depend on private scripts or credentials",
     "run artifacts, debate transcripts, pilot fixtures, backups and caches",
     "internal requirement drafts and design history"
