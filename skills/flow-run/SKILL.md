@@ -22,9 +22,10 @@ You are the host CLI. You survey, you decide, you write the queue.
 This skill is a router. Load the others when that step starts:
 shape / brief / spec / CONTEXT / queue format -> `flow`;
 launch, journal watch, stop reasons -> `run-queue`;
-a fork that is uncertain, high-impact and hard to undo -> `model-debate`
-(its verification and dispute rounds are part of the decision; do not drop
-them to finish sooner).
+a fork that is uncertain and high-impact -> `model-debate`. It picks its own
+profile: `focused` by default, `debate` only when the fork is truly hard to
+undo. Its verification and dispute rounds are part of the decision; do not
+drop them to finish sooner.
 `flow home` prints the checkout; the design is `<home>/docs/autonomy.md`.
 
 ## 0. Worker pin
