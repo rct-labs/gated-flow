@@ -76,9 +76,35 @@ on their own right after they close.
   gated on. A single-model score varies by several points between rounds; a
   threshold on it is a coin flip, and the five-round revise loop it produced
   on a real project is why this design exists.
-- Medium and low findings on a passing review become TODO rows of the same
-  package (`<!-- task:ID origin: review -->`, scope from the finding's file),
-  admitted like any other row on the next run.
+- Every finding carries `action`: `required` (the acceptance is not met, or a
+  nameable defect remains), `optional` (an improvement) or `none` (an
+  observation). A missing value counts as `required`. The definition is
+  appended to the review prompt after the project's `judge_prompt`, so an
+  override cannot drop it.
+- `required` medium and low findings on a passing review become TODO rows of
+  the same package (`<!-- task:ID origin: review -->`, scope from the
+  finding's file), admitted like any other row on the next run.
+- Review rows are reviewed too, so the chain is bounded. A row carries
+  `<!-- task:ID gen: N -->`: one more than the generation of the task the
+  finding landed on (the task that declared the finding's file; without one,
+  the highest among the reviewed tasks). Ordinary rows are generation 0; an
+  `origin: review` row without `gen` counts as 1. A finding on a task already
+  at `review_rows.max_gen` (default 1) creates no row.
+- A `required` medium finding on a file that a review row declared itself
+  means patching is not converging. No row is created; the run stops with
+  `review_loop:<file>` and the report asks the host for one structural repair
+  row. The 2026-09-19 incident this rule comes from: four generations of
+  patch rows on one block of string parsing, about two hours and five full
+  oracles for a few lines of wording.
+- No finding is dropped. Those that do not become rows are the residual
+  record, in full (severity, action, reason, file, issue, fix): the
+  `review_residuals` journal event, a residuals block in the report's Review
+  section, and `REVIEW-RESIDUALS.md` next to the queue file, committed
+  together with the queue. It lives there because `.gate/` is gitignored in
+  some projects and the queue's directory is the one tracked place the gate
+  already commits to.
+- None of this touches `high` findings: they always fail the review, whatever
+  their action or the generation, and never enter the residual record.
 - Fail: stop with `review_failed:<ids>` and the findings in the report. The
   host admits one repair task; the runner never revises on its own.
 - Chain down or unparsable: `review_skipped`, the run continues to full
@@ -117,10 +143,11 @@ and the host decides whether to start one.
 
 Events: `probe`, `attempt_start`, `heartbeat`, `task_done`, `scope_drift`, `worker_left_changes`,
 `scope_request`, `prompt_too_large`, `review_start`, `review_verdict`,
-`review_skipped`, `review_rows_added`, `full_acceptance`, `needs_approval`,
+`review_skipped`, `review_rows_added`, `review_residuals`, `full_acceptance`, `needs_approval`,
 `task_end`, `tool_disabled`, `run_end`.
 
-Stop reasons that need a human: `review_failed:<ids>`, `full_acceptance_failed:<ids>`,
+Stop reasons that need a human: `review_failed:<ids>`, `review_loop:<file>`,
+`full_acceptance_failed:<ids>`,
 `scope_request:<id>`, `prompt_too_large:<id>`, `needs_approval:<id>`.
 
 ## 10. What the user reads

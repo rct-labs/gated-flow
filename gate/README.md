@@ -190,8 +190,12 @@ run with `scope_request:<id>`.
 chain (`judge.chain`, next member on outage or unparsable output) reads the run's
 commits once and returns strict JSON (`score`, `verdict`, `findings[]`,
 `revision_brief`). Pass means verdict `pass` and no `high` finding; the score is
-recorded only. Medium and low findings are appended to the queue as TODO rows with
-`<!-- task:ID origin: review -->`. A failed review stops with `review_failed:<ids>`;
+recorded only. Each finding carries `action` (`required` / `optional` / `none`);
+`required` medium and low findings are appended to the queue as TODO rows with
+`<!-- task:ID origin: review -->` and `<!-- task:ID gen: N -->`. Rows stop at
+`review_rows.max_gen` (default 1), a repeated medium on a review row's own file stops
+the run with `review_loop:<file>`, and every finding that did not become a row is kept
+in `REVIEW-RESIDUALS.md` next to the queue (details: docs/autonomy.md). A failed review stops with `review_failed:<ids>`;
 a chain outage journals `review_skipped` and the run continues. Rows in
 `judge.checkpoints` are reviewed alone right after they close. There is no revision
 loop: the host admits one repair row.
@@ -214,7 +218,7 @@ is refused `needs-approval` by `admit` unless the queue carries
 `<!-- task:ID approved: <who/date> -->`; `run` stops on it with `needs_approval:<id>`
 even in advisory mode.
 
-Exit code 3 covers every stop that needs a human: `review_failed`,
+Exit code 3 covers every stop that needs a human: `review_failed`, `review_loop`,
 `full_acceptance_failed`, `scope_request`, `prompt_too_large`, `needs_approval`.
 
 ## What it checks, after the fact

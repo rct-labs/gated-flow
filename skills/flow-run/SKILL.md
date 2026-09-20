@@ -111,6 +111,8 @@ language, leading with the measured result or the blocking fact.
 - `review_failed:<ids>`: read the findings; admit one repair row inside the
   same package with the findings as its acceptance, then relaunch. Never
   revise by hand or lower the bar.
+- `review_loop:<file>`: review rows keep producing findings on that file.
+  Read the residuals; admit one structural repair row, never another patch.
 - `full_acceptance_failed:<ids>`: read the tail; admit one repair row.
 - `scope_request:<id>`: widen the declared files or split the task.
 - `prompt_too_large:<id>`: shorten the spec acceptance or split the task.

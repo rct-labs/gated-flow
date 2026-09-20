@@ -148,6 +148,7 @@ the next CLI takes over without burning an attempt.
 | `scope_request:<id>` / `prompt_too_large:<id>` | Widen or split the task |
 | `no_workers` | Every CLI is benched; wait for the cooldown |
 | `review_failed:<ids>` | The reviewer found something high; admit one repair row |
+| `review_loop:<file>` | A review row got another required finding on its own file; admit one structural repair row instead of another patch, or accept the residuals in `REVIEW-RESIDUALS.md` |
 | `full_acceptance_failed:<ids>` | The full oracle fails after the run; admit one repair row |
 | `needs_approval:<id>` | Add the task's `approved:` line after reading its scope |
 

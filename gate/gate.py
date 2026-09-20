@@ -157,6 +157,10 @@ DEFAULT_CONFIG = {
         "checkpoints": [],
         "timeout_s": 1200,
     },
+    # A row made from a review finding is reviewed too, so the chain needs a
+    # bound. Rows carry `<!-- task:ID gen: N -->`; a finding on a task already
+    # at max_gen creates no row and is kept in the residual record instead.
+    "review_rows": {"max_gen": 1},
     "judge_prompt": (
         "You are the read-only reviewer of finished work in this repository. "
         "Tasks under review: {tasks}. Commits since {base}: {commits}. Declared files: "
@@ -171,8 +175,7 @@ DEFAULT_CONFIG = {
         "'revise' when a high finding needs another worker; 'escalate' when the "
         "acceptance itself is ambiguous or a human decision is required. score: your "
         "0-100 overall impression, recorded but not gated on. revision_brief: one "
-        "paragraph for the host, or empty.\n"
-        "Return ONLY JSON matching the schema."
+        "paragraph for the host, or empty."
     ),
     # Declared files matching these are irreversible for this project: the
     # task needs an explicit `<!-- task:ID approved: <who/date> -->` line or the
@@ -185,6 +188,19 @@ DEFAULT_CONFIG = {
         "scripts/apply-*",
     ],
 }
+
+FINDING_ACTIONS = ("required", "optional", "none")
+
+# Appended to every review prompt after the project's judge_prompt has been
+# formatted, so a project override cannot drop the definition of `action`.
+JUDGE_ACTION_CONTRACT = (
+    "\n\nEvery finding carries `action`: 'required' when the acceptance is not met "
+    "or a nameable defect remains and the code must change; 'optional' for an "
+    "improvement the work is correct without; 'none' for an observation that "
+    "needs no change. Only 'required' findings become follow-up tasks; the others "
+    "are recorded in full, so never mark a finding 'required' to get it noticed.\n"
+    "Return ONLY JSON matching the schema."
+)
 
 JUDGE_SCHEMA = {
     "type": "object",
@@ -200,10 +216,11 @@ JUDGE_SCHEMA = {
                     "file": {"type": "string"},
                     "issue": {"type": "string"},
                     "fix": {"type": "string"},
+                    "action": {"type": "string", "enum": list(FINDING_ACTIONS)},
                 },
                 # Codex strict structured output requires every property here.
                 # Empty strings represent findings without a location or fix.
-                "required": ["severity", "file", "issue", "fix"],
+                "required": ["severity", "file", "issue", "fix", "action"],
                 "additionalProperties": False,
             },
         },
@@ -546,6 +563,24 @@ def parse_task_after(text: str) -> dict[str, list[str]]:
     out: dict[str, list[str]] = {}
     for m in TASK_AFTER_RE.finditer(text):
         out[m.group(1)] = [f.strip() for f in m.group(2).split(",") if f.strip()]
+    return out
+
+
+# <!-- task:WP-7-R1 origin: review -->
+# <!-- task:WP-7-R1 gen: 1 -->
+TASK_ORIGIN_RE = re.compile(r"<!--\s*task:(\S+)\s+origin:\s*(\S+)\s*-->")
+TASK_GEN_RE = re.compile(r"<!--\s*task:(\S+)\s+gen:\s*(\d+)\s*-->")
+
+
+def parse_task_gen(text: str) -> dict[str, int]:
+    """Map task id -> review generation, for the tasks that have one. An
+    ordinary row is generation 0 and is absent here. A row made from a review
+    finding carries `gen: N`; one written before the field existed carries
+    only `origin: review` and counts as generation 1, so a loop that is
+    already running converges at once."""
+    out = {m.group(1): 1 for m in TASK_ORIGIN_RE.finditer(text) if m.group(2) == "review"}
+    for m in TASK_GEN_RE.finditer(text):
+        out[m.group(1)] = int(m.group(2))
     return out
 
 
@@ -1818,6 +1853,9 @@ def normalize_judge_verdict(obj: dict) -> dict:
                 "file": f.get("file") or "",
                 "issue": str(f["issue"]),
                 "fix": f.get("fix") or "",
+                # A missing or unknown action is `required`: an older reviewer
+                # contract must never lose a finding to the residual record.
+                "action": f.get("action") if f.get("action") in FINDING_ACTIONS else "required",
             })
     return {
         "score": int(obj["score"]),
@@ -1888,6 +1926,7 @@ def format_findings(findings: list[dict]) -> str:
     return "\n".join(
         f"- [{f['severity']}] {f['file'] + ': ' if f['file'] else ''}{f['issue']}"
         + (f" → fix: {f['fix']}" if f["fix"] else "")
+        + (f" (action: {f['action']})" if f.get("action") else "")
         for f in findings
     )
 
@@ -1926,7 +1965,7 @@ def review_package(
         commits=", ".join(commits) or head[:10],
         files=", ".join(files) or "(undeclared)",
         verify_tail=(v.get("tail") or "")[-1500:],
-    )
+    ) + JUDGE_ACTION_CONTRACT
     tag = "review-" + "-".join(tasks)[:60]
     journal(repo, {"event": "review_start", "tasks": tasks, "commit": head})
     print(f"  review of {', '.join(tasks)} ...")
@@ -1953,11 +1992,49 @@ def review_package(
     return info
 
 
+RESIDUALS_NAME = "REVIEW-RESIDUALS.md"
+
+
+def write_review_residuals(repo: Path, cfg: dict, review: dict, residuals: list[dict]) -> str:
+    """Append the findings that did not become rows to REVIEW-RESIDUALS.md next
+    to the queue file, full text. That directory is the one project-tracked
+    place the gate already commits to; .gate/ is gitignored in some projects.
+    Returns the repo-relative path for the caller's commit."""
+    rel = str(Path(prefixed(cfg, cfg["queue_file"])).parent / RESIDUALS_NAME).replace("\\", "/")
+    path = repo / rel
+    out = [] if path.exists() else [
+        "# Review residuals", "",
+        "Review findings that did not become queue rows (gate.py, append-only).",
+        "reason: `action:<optional|none>`, `max_gen:<N>` or `review_loop`.", ""]
+    head = git(repo, "rev-parse", "--short", "HEAD", check=False).strip()
+    out += [f"## {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())} - "
+            f"{', '.join(review['tasks'])} ({review.get('member') or '-'}, at {head})", ""]
+    for f in residuals:
+        out += [f"- severity: {f['severity']} | action: {f.get('action', 'required')} | "
+                f"reason: {f['reason']}",
+                f"  - file: {f.get('file') or '-'}",
+                f"  - issue: {f['issue']}",
+                f"  - fix: {f.get('fix') or '-'}"]
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("\n".join(out) + "\n\n")
+    return rel
+
+
 def append_review_rows(repo: Path, cfg: dict, review: dict, files_by_task: dict[str, list[str]]) -> list[str]:
     """Turn a passing review's lesser findings into TODO rows of the same
     package. The row shape follows the last row of the queue table; scope is
     the finding's file or the reviewed tasks' files. Admission decides later
-    whether each row is small and isolated enough to run."""
+    whether each row is small and isolated enough to run.
+
+    Review rows are reviewed too, so three rules make the chain terminate
+    (docs/autonomy.md, review rows). A finding becomes a row only when its
+    action is `required`, and only while the task it lands on is below
+    review_rows.max_gen. A `required` medium finding on a file that a review
+    row declared itself means patching is not converging: no row, and
+    review["loop_file"] tells the caller to stop with review_loop. Every
+    finding that does not become a row goes to the residual record
+    (review["residuals"], journal, REVIEW-RESIDUALS.md); none is dropped.
+    High findings never reach this function's rules: they fail the review."""
     findings = [f for f in review.get("findings", []) if f.get("severity") not in ("high", "critical")]
     if not findings:
         return []
@@ -1966,6 +2043,38 @@ def append_review_rows(repo: Path, cfg: dict, review: dict, files_by_task: dict[
     rows = [i for i, ln in enumerate(lines) if ROW_RE.match(ln) and not _is_separator_row(ln.split("|"))]
     if not rows:
         return []
+    gens = parse_task_gen("\n".join(lines))
+    declared = parse_task_files("\n".join(lines))
+    max_gen = int(sub_cfg(cfg, "review_rows").get("max_gen", 1))
+    residuals: list[dict] = []
+    accepted: list[tuple[dict, int]] = []
+    for f in findings:
+        # Generation is per finding: the task that declared the finding's file,
+        # else the highest among the reviewed tasks. One review can cover an
+        # ordinary task and a review row; only the latter is at its bound.
+        owner = next((t for t in review["tasks"] if f.get("file")
+                      and f["file"] in (files_by_task.get(t) or declared.get(t) or [])), None)
+        gen = gens.get(owner, 0) if owner else max(gens.get(t, 0) for t in review["tasks"])
+        action = f.get("action") or "required"
+        if action != "required":
+            reason = f"action:{action}"
+        elif owner and gens.get(owner, 0) >= 1 and f.get("severity") == "medium":
+            reason = "review_loop"
+            review.setdefault("loop_file", f["file"])
+        elif gen >= max_gen:
+            reason = f"max_gen:{max_gen}"
+        else:
+            accepted.append((f, gen + 1))
+            continue
+        residuals.append({**f, "reason": reason})
+    if residuals:
+        review["residuals"] = residuals
+        journal(repo, {"event": "review_residuals", "tasks": review["tasks"],
+                       "loop_file": review.get("loop_file"), "findings": residuals})
+    rel = prefixed(cfg, cfg["queue_file"])
+    commit_paths = [rel]
+    if residuals:
+        commit_paths.append(write_review_residuals(repo, cfg, review, residuals))
     last = lines[rows[-1]]
     cells = last.split("|")
     numbers = [int(m.group(1)) for ln in lines for m in [re.match(r"^\s*\|\s*(\d+)\s*\|", ln)] if m]
@@ -1977,7 +2086,7 @@ def append_review_rows(repo: Path, cfg: dict, review: dict, files_by_task: dict[
     added: list[str] = []
     new_rows: list[str] = []
     scope_lines: list[str] = []
-    for f in findings:
+    for f, row_gen in accepted:
         number += 1
         n = 1
         while f"{base}-R{n}" in existing:
@@ -1996,6 +2105,7 @@ def append_review_rows(repo: Path, cfg: dict, review: dict, files_by_task: dict[
         scope = [f["file"]] if f.get("file") else sorted({x for t in review["tasks"] for x in files_by_task.get(t, [])})
         scope_lines.append(f"<!-- task:{tid} files: {', '.join(scope)} -->")
         scope_lines.append(f"<!-- task:{tid} origin: review -->")
+        scope_lines.append(f"<!-- task:{tid} gen: {row_gen} -->")
         # The same local check as the reviewed task that owns the file, so a
         # review row never falls back to the full suite during implementation.
         owner = next((t for t in review["tasks"] if f.get("file") in files_by_task.get(t, [])), None)
@@ -2003,16 +2113,18 @@ def append_review_rows(repo: Path, cfg: dict, review: dict, files_by_task: dict[
         if check:
             scope_lines.append(f"<!-- task:{tid} verify: {json.dumps(check)} -->")
         added.append(tid)
-    lines[rows[-1] + 1:rows[-1] + 1] = new_rows
-    text = "\n".join(lines).rstrip("\n") + "\n" + "\n".join(scope_lines) + "\n"
-    qpath.write_text(text, encoding="utf-8")
-    journal(repo, {"event": "review_rows_added", "tasks": added})
+    if added:
+        lines[rows[-1] + 1:rows[-1] + 1] = new_rows
+        text = "\n".join(lines).rstrip("\n") + "\n" + "\n".join(scope_lines) + "\n"
+        qpath.write_text(text, encoding="utf-8")
+        journal(repo, {"event": "review_rows_added", "tasks": added})
     # A queue-only commit flips nothing to DONE, so the hook lets it through;
-    # the next run then starts from a clean tree instead of a dirty queue.
-    rel = prefixed(cfg, cfg["queue_file"])
-    git(repo, "add", "--", rel, check=False)
-    git(repo, "commit", "-q", "-m", "chore(gate): review findings as tasks " + ", ".join(added),
-        "--", rel, check=False)
+    # the next run then starts from a clean tree instead of a dirty queue. The
+    # residual record rides in the same commit: .gate/ may be gitignored.
+    subject = ("review findings as tasks " + ", ".join(added) if added
+               else "review residuals of " + ", ".join(review["tasks"]))
+    git(repo, "add", "--", *commit_paths, check=False)
+    git(repo, "commit", "-q", "-m", "chore(gate): " + subject, "--", *commit_paths, check=False)
     return added
 
 
@@ -2514,6 +2626,9 @@ def cmd_run(args) -> None:
         if checkpoint and checkpoint["final"] == "failed":
             stop_reason = f"review_failed:{tid}"
             break
+        if checkpoint and checkpoint.get("loop_file"):
+            stop_reason = f"review_loop:{checkpoint['loop_file']}"
+            break
 
     # ---- closeout: one review of what closed, then the full oracle once -----
     done_tasks = [r["task"] for r in results if r["outcome"] == "done"]
@@ -2527,6 +2642,8 @@ def cmd_run(args) -> None:
                 stop_reason = "review_failed:" + ",".join(unreviewed)
             elif review_info["final"] == "pass":
                 append_review_rows(repo, cfg, review_info, files_by_task)
+                if review_info.get("loop_file"):
+                    stop_reason = f"review_loop:{review_info['loop_file']}"
         if not stop_reason.startswith("review_failed"):
             print("GATE: full acceptance after the run ...")
             acceptance = run_acceptance(repo, cfg)
@@ -2556,7 +2673,7 @@ def cmd_run(args) -> None:
 
     needs_human = stop_reason.split(":", 1)[0] in (
         "review_failed", "full_acceptance_failed", "needs_approval", "scope_request",
-        "prompt_too_large",
+        "prompt_too_large", "review_loop",
     )
     if any(r["outcome"] != "done" for r in results) or not results or needs_human:
         raise SystemExit(3)
@@ -2628,6 +2745,17 @@ def render_report(
                           format_findings(j["findings"])]
                 if j.get("brief"):
                     lines += ["", f"Brief: {j['brief']}"]
+        # Findings that did not become rows, in full. Also appended to
+        # REVIEW-RESIDUALS.md next to the queue, which is committed.
+        for label, j in reviews:
+            if j.get("residuals"):
+                lines += ["", f"### {label} - residuals (no row created)", ""]
+                for f in j["residuals"]:
+                    lines += [f"- severity: {f['severity']} | action: {f.get('action', 'required')} "
+                              f"| reason: {f['reason']}",
+                              f"  - file: {f.get('file') or '-'}",
+                              f"  - issue: {f['issue']}",
+                              f"  - fix: {f.get('fix') or '-'}"]
     if acceptance:
         lines += ["", "## Full acceptance", "",
                   f"- `{acceptance['cmd']}` -> **{acceptance['result']}** "
@@ -2686,6 +2814,15 @@ def render_report(
             f"({review_reason(results, review)}). Read the Review section; admit one "
             "repair task or accept the risk."
         )
+    # Keyed on the reviews, not the stop reason: a failing full oracle after
+    # the same review must not hide the loop.
+    for label, j in reviews:
+        if j.get("loop_file"):
+            waiting.append(
+                f"- **{label}**: a review row got another required finding on its own file "
+                f"`{j['loop_file']}`. Patching is not converging, so no patch row was created. "
+                "Read the residuals in the Review section and admit one structural repair row "
+                "for that block, or accept the residuals.")
     if stop.startswith("full_acceptance_failed:"):
         tids = stop.split(":", 1)[1]
         waiting.append(
@@ -2737,6 +2874,10 @@ def render_report(
     elif stop.startswith("review_failed:"):
         lines.append("- The tasks are DONE and committed; the review, not the work, stopped "
                      "the run. Admit one repair row for the findings above, then run again.")
+    elif stop.startswith("review_loop:"):
+        lines.append("- The tasks are DONE and the review passed; the run stopped because review "
+                     "rows keep producing findings on the same file. Admit one structural repair "
+                     "row (restructure, not another patch), then run again.")
     elif stop.startswith("full_acceptance_failed:"):
         lines.append("- Local checks passed but the full oracle did not. Admit one repair "
                      "row with the failing test as its local check, then run again.")
@@ -2785,6 +2926,8 @@ def cmd_review(args) -> None:
             stop = "review_failed:" + ",".join(tasks)
         elif info["final"] == "pass":
             append_review_rows(repo, cfg, info, files_by_task)
+            if info.get("loop_file"):
+                stop = f"review_loop:{info['loop_file']}"
     if (info is None or info["final"] != "failed") and not args.no_acceptance:
         print("GATE: full acceptance ...")
         acceptance = run_acceptance(repo, cfg)

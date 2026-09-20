@@ -75,7 +75,8 @@ Then watch the journal: append-only NDJSON at `<repo>/.gate/journal.ndjson`.
 | `scope_drift` | the task's commits touched undeclared paths; listed under Waiting on you, not a stop |
 | `scope_request` / `prompt_too_large` | needs the host; run stops |
 | `review_start` / `review_verdict` / `review_skipped` | the one package review (or a checkpoint) |
-| `review_rows_added` | lesser findings appended as TODO rows |
+| `review_rows_added` | `required` lesser findings appended as TODO rows (`gen: N`) |
+| `review_residuals` | findings that did not become rows, full text: `action` not `required`, task at `review_rows.max_gen`, or `review_loop`; also in the report and in `REVIEW-RESIDUALS.md` next to the queue |
 | `full_acceptance` | the full oracle after the review: `result`, `count` |
 | `needs_approval` | head task touches an irreversible path without approval |
 | `tool_disabled` | a CLI hit its quota and was benched |
@@ -152,6 +153,7 @@ task did not close, quote the last lines of its log from `.gate/runs/<run-id>/`.
 | `timeout:<id>` | worker exceeded `task_timeout_s` | check for a half-finished tree |
 | `no_workers` | every CLI is benched | wait for the cooldown (`.gate/tool-status.json`) |
 | `review_failed:<ids>` | review reported a high finding or did not pass | read the findings; a `score 0 / escalate / no findings` verdict means the reviewer could not run its tools: fix the tool, then `gate.py review --tasks <ids>`; otherwise admit one repair row |
+| `review_loop:<file>` | a review row got another `required` medium finding on a file it declared; no patch row was created | read the residuals; admit one structural repair row for that block (restructure, not another patch), or accept the residuals |
 | `full_acceptance_failed:<ids>` | the full oracle fails after the run | admit one repair row |
 | `needs_approval:<id>` | irreversible path without `approved:` | the user approves that task, then relaunch |
 
