@@ -2885,7 +2885,7 @@ def render_report(
 def cmd_review(args) -> None:
     """Host-driven review of DONE tasks outside a run: after a review chain
     outage, or for tasks closed by hand. Same chain, same pass rule, same
-    row appending; then the full oracle once unless --no-acceptance."""
+    record of findings; then the full oracle once unless --no-acceptance."""
     repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
     tasks = [t.strip() for t in (args.tasks or "").split(",") if t.strip()]
