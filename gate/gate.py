@@ -158,6 +158,11 @@ DEFAULT_CONFIG = {
         "chain": ["fable", "opus", "codex"],
         "checkpoints": [],
         "timeout_s": 1200,
+        # Spend ceiling of one review, per reviewed task: a package review reads
+        # the diff of every task it covers, so a flat ceiling that fits one
+        # task starves a review of four (alltom 2026-09-20: budget_exhausted at
+        # $5 after 31 turns, the package closed unreviewed).
+        "budget_usd_per_task": 5,
     },
     "judge_prompt": (
         "You are the read-only reviewer of finished work in this repository. "
@@ -247,7 +252,7 @@ JUDGE_CMDS: dict[str, list[str]] = {
         "--output-format", "json", "--json-schema", "{schema}",
         "--allowedTools",
         "Read,Grep,Glob,Bash(git diff:*),Bash(git show:*),Bash(git log:*),Bash(git status:*)",
-        "--max-budget-usd", "5",
+        "--max-budget-usd", "{budget_usd}",
         "--settings", CLAUDE_HEADLESS_SETTINGS,
     ],
     "opus": [
@@ -256,7 +261,7 @@ JUDGE_CMDS: dict[str, list[str]] = {
         "--output-format", "json", "--json-schema", "{schema}",
         "--allowedTools",
         "Read,Grep,Glob,Bash(git diff:*),Bash(git show:*),Bash(git log:*),Bash(git status:*)",
-        "--max-budget-usd", "5",
+        "--max-budget-usd", "{budget_usd}",
         "--settings", CLAUDE_HEADLESS_SETTINGS,
     ],
     "codex": [
@@ -1870,10 +1875,12 @@ def normalize_judge_verdict(obj: dict) -> dict:
 
 
 def judge_once(
-    repo: Path, cfg: dict, prompt: str, run_dir: Path, tag: str, run_id: str
+    repo: Path, cfg: dict, prompt: str, run_dir: Path, tag: str, run_id: str,
+    n_tasks: int = 1,
 ) -> tuple[dict | None, str]:
     """Walk the judge chain. Returns (verdict, member) or (None, why)."""
     jcfg = sub_cfg(cfg, "judge")
+    budget = float(jcfg.get("budget_usd_per_task") or 5) * max(n_tasks, 1)
     cmds = dict(JUDGE_CMDS)
     cmds.update(cfg.get("judge_cmds") or {})
     schema_file = run_dir / f"{tag}.schema.json"
@@ -1902,6 +1909,7 @@ def judge_once(
                 "schema": json.dumps(JUDGE_SCHEMA),
                 "schema_file": str(schema_file),
                 "out_file": str(out_file),
+                "budget_usd": f"{budget:g}",
             },
         )
         if proc is None:
@@ -1918,7 +1926,11 @@ def judge_once(
             continue
         verdict = parse_judge_output(out, out_file)
         if verdict is None:
-            failures.append(f"{member}:unparsable")
+            # A CLI that reports its own failure says why; "unparsable" is for
+            # output that is neither a verdict nor an error.
+            env = _last_json_object(out) or {}
+            why = str(env.get("subtype") or "error") if env.get("is_error") else "unparsable"
+            failures.append(f"{member}:{why}")
             continue
         if verdict["verdict"] == "escalate" and verdict["score"] == 0 and not verdict["findings"]:
             # The reviewer's own statement that it read nothing (a sandbox that
@@ -1982,7 +1994,7 @@ def review_package(
     tag = "review-" + "-".join(tasks)[:60]
     journal(repo, {"event": "review_start", "tasks": tasks, "commit": head})
     print(f"  review of {', '.join(tasks)} ...")
-    verdict, member = judge_once(repo, cfg, prompt, run_dir, tag, run_id)
+    verdict, member = judge_once(repo, cfg, prompt, run_dir, tag, run_id, n_tasks=len(tasks))
     if verdict is None:
         journal(repo, {"event": "review_skipped", "tasks": tasks, "reason": member})
         print(f"  review unavailable ({member}) - tasks stay DONE, unreviewed")

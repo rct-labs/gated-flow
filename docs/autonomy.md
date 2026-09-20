@@ -101,6 +101,11 @@ Three rules. None has a threshold to tune, so none is fitted to a project.
   member. Measured 2026-09-20: Codex 0.155 with `--sandbox read-only` on
   Windows could not start a process, answered exactly that, and the run
   stopped as if the work had failed review.
+- A review's spend ceiling is `judge.budget_usd_per_task` times the tasks it
+  covers (`{budget_usd}` in the claude review commands): a package review
+  reads every task's diff, so a flat ceiling that fits one task starves it.
+  A CLI that reports its own failure is named in the skip reason
+  (`opus:error_max_budget_usd`), not folded into `unparsable`.
 - Chain down, unparsable or without access: `review_skipped`, the full
   acceptance still runs, the report says so. Visibility replaces a silent
   quality-off.
@@ -158,7 +163,7 @@ and the host decides whether to start one.
 
 ```json
 "probe": { "enabled": true, "timeout_s": 90, "retry_s": 600 },
-"judge": { "enabled": false, "chain": ["fable", "opus", "codex"], "checkpoints": [], "timeout_s": 1200 },
+"judge": { "enabled": false, "chain": ["fable", "opus", "codex"], "checkpoints": [], "timeout_s": 1200, "budget_usd_per_task": 5 },
 "judge_cmds": { "fable": [...], "opus": [...], "codex": [...] },
 "judge_prompt": "<template; {tasks} {base} {commits} {files} {verify_tail}>",
 "max_model_calls": 40,

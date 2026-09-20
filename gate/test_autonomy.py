@@ -92,8 +92,9 @@ class ReviewHarness(unittest.TestCase):
     def _judge(self, verdicts: list[dict], members: list[str] | None = None):
         calls = {"n": 0, "prompts": []}
 
-        def fake_judge_once(repo, cfg, prompt, run_dir, tag, run_id):
+        def fake_judge_once(repo, cfg, prompt, run_dir, tag, run_id, n_tasks=1):
             i = calls["n"]
+            calls.setdefault("n_tasks", []).append(n_tasks)
             calls["n"] += 1
             calls["prompts"].append(prompt)
             if i >= len(verdicts):
@@ -205,7 +206,7 @@ class ReviewTests(ReviewHarness):
         with tempfile.TemporaryDirectory() as td:
             repo = judged_runner_repo(Path(td), ["claude"])
 
-            def unavailable(repo_, cfg, prompt, run_dir, tag, run_id):
+            def unavailable(repo_, cfg, prompt, run_dir, tag, run_id, n_tasks=1):
                 return None, "fable:quota; opus:quota; codex:not found"
             report = self._run(repo, self._spawn([]), unavailable)
             self.assertIn("| EAV-2 | skipped |", report)
@@ -427,6 +428,7 @@ class ReviewIsAGateTests(ReviewHarness):
             report = self._run(repo, self._spawn([]), judge)
             self.assertEqual(calls["n"], 1)
             self.assertIn("Tasks under review: EAV-2, EAV-3.", calls["prompts"][0])
+            self.assertEqual(calls["n_tasks"], [2])   # the review's spend ceiling scales
             self.assertIn("| EAV-2, EAV-3 | pass | pass | 90 |", report)
             self.assertIn("-> **PASS**", report)
             self.assertEqual(len(self._events(repo, "review_start")), 1)
@@ -620,6 +622,28 @@ class JudgeChainTests(unittest.TestCase):
             self.assertEqual((v["score"], v["verdict"]), (40, "revise"))
             self.assertIsNone(self.gate.parse_judge_output(
                 "{\"score\": 300, \"verdict\": \"pass\"}", Path(td) / "none"))
+
+    def test_review_budget_scales_with_tasks_and_a_cli_error_is_named(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"], judge={"chain": ["opus"]})
+            with mock.patch.dict(os.environ, {"GATE_CONFIG": ""}):
+                cfg = self.gate.load_config(repo)
+            run_dir = repo / ".gate" / "runs" / "t"
+            run_dir.mkdir(parents=True)
+            seen: list[str] = []
+
+            def fake_spawn(repo_arg, cfg_, tool, prompt, pf, **kw):
+                seen.append(kw["extra"]["budget_usd"])
+                self.assertIn("{budget_usd}", kw["template"])
+                return self.gate.WorkerResult(1, json.dumps({
+                    "type": "result", "subtype": "error_max_budget_usd", "is_error": True,
+                    "errors": ["Reached maximum budget"]})), None
+            with mock.patch.object(self.gate, "resolve_tool", side_effect=lambda n: n), \
+                 mock.patch.object(self.gate, "spawn_worker", side_effect=fake_spawn):
+                verdict, why = self.gate.judge_once(repo, cfg, "p", run_dir, "tag", "run", n_tasks=4)
+            self.assertEqual(seen, ["20"])
+            self.assertIsNone(verdict)
+            self.assertEqual(why, "opus:error_max_budget_usd")
 
     def test_braces_inside_a_finding_do_not_hide_the_envelope(self) -> None:
         with tempfile.TemporaryDirectory() as td:
