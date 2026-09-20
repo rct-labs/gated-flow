@@ -31,6 +31,7 @@ Subcommands
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fnmatch
 import json
 import os
@@ -140,6 +141,10 @@ DEFAULT_CONFIG = {
     # Flip to true only after one real project's advisory report has been
     # human-checked for false refusals.
     "strict_admit": False,
+    # One full oracle at a time on this machine, across projects: an OS file
+    # lock under the user's home (~/.gate/full-acceptance.lock), released by
+    # the OS when the process ends. Tasks and task-local checks never wait.
+    "serialize_full_acceptance": True,
     # ---- autonomy (docs/autonomy.md) ---------------------------------------
     # Probe every candidate CLI once per run, before the first dispatch, with a
     # tiny real request. A quota-shaped answer benches it for quota_cooldown_s;
@@ -1089,6 +1094,72 @@ def cmd_verify(args) -> None:
         raise SystemExit(2)
 
 
+def _try_os_lock(handle) -> bool:
+    """Take an exclusive, non-blocking OS lock on an open file. The OS drops it
+    when the process ends, however it ends, so there is no stale lock to detect
+    and no timeout to choose."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def full_oracle_turn(repo: Path, cfg: dict):
+    """One full oracle at a time on this machine, across projects.
+
+    Runners of different projects share nothing but the machine, and the full
+    oracle is the one step that loads it for many minutes. Two at once slow
+    each other and make time-sensitive tests fail for reasons that are not in
+    the code. Tasks and task-local checks are not serialized; only the full
+    oracle waits its turn. Yields the seconds spent waiting."""
+    if not cfg.get("serialize_full_acceptance", True):
+        yield 0.0
+        return
+    lock_dir = Path(os.environ.get("GATE_MACHINE_DIR") or Path.home() / GATE_DIR)
+    holder_file = lock_dir / "full-acceptance.holder.json"
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_dir / "full-acceptance.lock", "a+b")
+    except OSError as exc:
+        # A machine without a writable home must still be able to verify.
+        print(f"GATE: full-oracle turn unavailable ({exc}); running without it")
+        yield 0.0
+        return
+    started = time.time()
+    try:
+        announced = False
+        while not _try_os_lock(handle):
+            if not announced:
+                announced = True
+                try:
+                    holder = json.loads(holder_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    holder = {}
+                print("GATE: another full oracle is running on this machine "
+                      f"({holder.get('repo', 'unknown project')}); waiting for its end")
+                journal(repo, {"event": "full_acceptance_wait", "holder": holder.get("repo"),
+                               "holder_pid": holder.get("pid")})
+            time.sleep(2)
+        waited = round(time.time() - started, 1)
+        try:
+            holder_file.write_text(json.dumps({
+                "repo": str(repo), "pid": os.getpid(),
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}), encoding="utf-8")
+        except OSError:
+            pass
+        yield waited
+    finally:
+        handle.close()
+
+
 def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
                    task: str | None = None, timeout_s: int | None = None,
                    files: list[str] | None = None, log_path: Path | None = None) -> dict:
@@ -1106,19 +1177,22 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
     # can host several projects.
     workdir = repo / (cfg.get("project_prefix") or "")
 
-    print(f"GATE: running acceptance command in {workdir}: {cmd}")
-    started = time.time()
-    proc = subprocess.run(
-        cmd,
-        cwd=str(workdir),
-        shell=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout_s or cfg["verify_timeout_s"],
-    )
-    elapsed = round(time.time() - started, 1)
+    # The full oracle takes its turn on the machine; a task-local check does not.
+    turn = full_oracle_turn(repo, cfg) if task is None else contextlib.nullcontext(0.0)
+    with turn as waited:
+        print(f"GATE: running acceptance command in {workdir}: {cmd}")
+        started = time.time()
+        proc = subprocess.run(
+            cmd,
+            cwd=str(workdir),
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_s or cfg["verify_timeout_s"],
+        )
+        elapsed = round(time.time() - started, 1)
     output = (proc.stdout or "") + (proc.stderr or "")
     quality = quality_phase(repo, cfg, "task")
     if quality is not None:
@@ -1153,6 +1227,7 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
         "count": count,
         "cmd": cmd,
         "elapsed_s": elapsed,
+        "waited_s": waited,
         "at_epoch": time.time(),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "head": git(repo, "rev-parse", "HEAD", check=False).strip(),

@@ -10,6 +10,8 @@ set -e
 GATE="$(cd "$(dirname "$0")" && pwd)/gate.py"
 S="${1:-${TMPDIR:-/tmp}/gate-selftest}"
 PY="${PYTHON:-python}"
+# A private machine turn: the selftest must not wait for a real project's oracle.
+export GATE_MACHINE_DIR="$S.machine"; mkdir -p "$GATE_MACHINE_DIR"
 
 rm -rf "$S"; mkdir -p "$S/proj/src" "$S/proj/tests"; cd "$S"
 git init -q .

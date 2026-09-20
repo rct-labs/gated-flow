@@ -69,6 +69,16 @@ Probes count against `max_model_calls`.
   `.gate/runs/<run-id>/full-acceptance.log` for the runner's full acceptance
   (its path is in the verdict, the journal event and the report), and
   `.gate/acceptance.log`, last run only, for `gate.py verify`.
+- One full oracle at a time on the machine, across projects. Runners of
+  different projects share nothing but the machine, and the full oracle is the
+  one step that loads it for many minutes; two at once slow each other and
+  make time-sensitive tests fail for reasons that are not in the code. The
+  turn is an OS file lock under the user's home
+  (`~/.gate/full-acceptance.lock`), which the OS releases when the process
+  ends, however it ends: no stale lock, no timeout to choose. A waiting runner
+  journals `full_acceptance_wait` once and the verdict records `waited_s`.
+  Tasks and task-local checks never wait. `"serialize_full_acceptance": false`
+  opts a project out.
 - No verdict cache. Re-running a local check is the cheap path.
 
 ## 5. The review is a gate, once per package
@@ -167,6 +177,7 @@ and the host decides whether to start one.
 "judge_cmds": { "fable": [...], "opus": [...], "codex": [...] },
 "judge_prompt": "<template; {tasks} {base} {commits} {files} {verify_tail}>",
 "max_model_calls": 40,
+"serialize_full_acceptance": true,
 "worker_packet_max_bytes": 6000,
 "worker_models": { "pi": "" },
 "irreversible_globs": ["drizzle/**", "data/**", ".git/hooks/**", ".claude/settings*", "scripts/apply-*"]
@@ -176,7 +187,7 @@ and the host decides whether to start one.
 
 Events: `probe`, `attempt_start`, `heartbeat`, `task_done`, `scope_drift`, `worker_left_changes`,
 `scope_request`, `prompt_too_large`, `review_start`, `review_verdict`,
-`review_skipped`, `review_findings`, `full_acceptance`, `needs_approval`,
+`review_skipped`, `review_findings`, `full_acceptance_wait`, `full_acceptance`, `needs_approval`,
 `task_end`, `tool_disabled`, `run_end`.
 
 Stop reasons that need a human: `review_failed:<ids>`, `review_loop:<file>`,

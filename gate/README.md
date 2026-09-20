@@ -195,7 +195,9 @@ strict JSON (`score`, `verdict`, `findings[]`, `revision_brief`). A member that 
 and no `high` finding; the score is recorded only. The review is a gate and never writes
 queue rows: findings below high go, in full, to the report, the `review_findings` journal
 event and `REVIEW-NOTES.md` next to the queue (committed). The full oracle follows once.
-A run that ends with TODO rows left defers both. A failed review stops with
+A run that ends with TODO rows left defers both. Full oracles of different projects
+take turns on the machine (an OS lock under `~/.gate/`, config
+`serialize_full_acceptance`); tasks never wait. A failed review stops with
 `review_failed:<ids>` and gets one repair round: a repair row (`origin: review`) that draws
 another high finding on its own file stops with `review_loop:<file>`;
 a chain outage journals `review_skipped` and the run continues. Rows in

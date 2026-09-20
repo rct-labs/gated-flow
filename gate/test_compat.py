@@ -15,6 +15,9 @@ from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
+# The full oracle takes a machine-wide turn (~/.gate). The suites must neither
+# wait for a real project's oracle nor make one wait: give them a private turn.
+os.environ["GATE_MACHINE_DIR"] = tempfile.mkdtemp(prefix="gate-machine-")
 GATE = HERE / "gate.py"
 FLOW = HERE.parent / "flow" / "flow.py"
 

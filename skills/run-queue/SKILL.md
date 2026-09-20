@@ -76,6 +76,7 @@ Then watch the journal: append-only NDJSON at `<repo>/.gate/journal.ndjson`.
 | `scope_request` / `prompt_too_large` | needs the host; run stops |
 | `review_start` / `review_verdict` / `review_skipped` | the one package review (or a checkpoint); a skip reason `<member>:no_access` means that reviewer could not read the repository: fix its tool or sandbox, then `gate.py review --tasks <ids>` |
 | `review_findings` | findings below high, full text; recorded in the report and `REVIEW-NOTES.md`, never rows |
+| `full_acceptance_wait` | another project's full oracle is running on this machine; this one waits for its turn (`holder`), nothing is wrong |
 | `full_acceptance` | the full oracle after the review, once per package: `result`, `count` |
 | `needs_approval` | head task touches an irreversible path without approval |
 | `tool_disabled` | a CLI hit its quota and was benched |

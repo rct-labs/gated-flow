@@ -133,7 +133,9 @@ the next CLI takes over without burning an attempt.
   rows: work enters the queue only through planning. No revision loop, no
   score threshold.
 - **Full acceptance once.** After that review the runner runs `verify_cmd`
-  once and stops with `full_acceptance_failed` when it fails.
+  once and stops with `full_acceptance_failed` when it fails. Several projects
+  can run at the same time on one machine; their full oracles take turns, so
+  one never slows another into false failures.
 - **Bounded spend.** `max_model_calls` and `run_timeout_s` cap a run.
 - **Irreversible actions need prior approval.** A task whose declared files
   hit `irreversible_globs` runs only with `<!-- task:ID approved: <who/date> -->`.

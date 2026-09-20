@@ -494,6 +494,70 @@ class ReviewIsAGateTests(ReviewHarness):
                 self.assertIn("issue: " + issue, notes)
 
 
+class FullOracleTurnTests(unittest.TestCase):
+    """One full oracle at a time on the machine; task checks never wait."""
+
+    def setUp(self) -> None:
+        self.gate = load_gate_module()
+
+    def _repo(self, root: Path) -> tuple[Path, dict]:
+        repo = committed_runner_repo(root, ["claude"])
+        with mock.patch.dict(os.environ, {"GATE_CONFIG": ""}):
+            return repo, self.gate.load_config(repo)
+
+    def test_a_second_full_oracle_waits_for_the_first_and_says_so_once(self) -> None:
+        import threading
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as machine, \
+                mock.patch.dict(os.environ, {"GATE_MACHINE_DIR": machine}):
+            repo, cfg = self._repo(Path(td))
+            inside = threading.Event()
+            release = threading.Event()
+
+            def first() -> None:
+                with self.gate.full_oracle_turn(Path("other-project"), cfg):
+                    inside.set()
+                    release.wait(20)
+            holder = threading.Thread(target=first)
+            holder.start()
+            self.assertTrue(inside.wait(10))
+            result: dict = {}
+            second = threading.Thread(
+                target=lambda: result.update(self.gate.run_acceptance(repo, cfg)))
+            second.start()
+            second.join(3)
+            self.assertTrue(second.is_alive())          # still waiting for its turn
+            self.assertFalse((repo / ".gate" / "verdict.json").exists())
+            release.set()
+            holder.join(10)
+            second.join(30)
+            self.assertEqual(result["result"], "PASS")
+            self.assertGreater(result["waited_s"], 2)
+            events = [json.loads(ln) for ln in
+                      (repo / ".gate" / "journal.ndjson").read_text(encoding="utf-8").splitlines()]
+            waits = [e for e in events if e["event"] == "full_acceptance_wait"]
+            self.assertEqual(len(waits), 1)
+            self.assertEqual(waits[0]["holder"], "other-project")
+
+    def test_task_checks_and_an_opted_out_project_never_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as machine, \
+                mock.patch.dict(os.environ, {"GATE_MACHINE_DIR": machine}):
+            repo, cfg = self._repo(Path(td))
+            with self.gate.full_oracle_turn(Path("other-project"), cfg):
+                task = self.gate.run_acceptance(repo, cfg, task="EAV-2", files=["eav2.txt"])
+                self.assertEqual((task["result"], task["waited_s"]), ("PASS", 0.0))
+                off = self.gate.run_acceptance(repo, {**cfg, "serialize_full_acceptance": False})
+                self.assertEqual((off["result"], off["waited_s"]), ("PASS", 0.0))
+
+    def test_the_turn_is_free_again_after_a_holder_that_raised(self) -> None:
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as machine, \
+                mock.patch.dict(os.environ, {"GATE_MACHINE_DIR": machine}):
+            repo, cfg = self._repo(Path(td))
+            with self.assertRaises(RuntimeError):
+                with self.gate.full_oracle_turn(repo, cfg):
+                    raise RuntimeError("oracle crashed")
+            self.assertEqual(self.gate.run_acceptance(repo, cfg)["waited_s"], 0.0)
+
+
 class JudgeChainTests(unittest.TestCase):
     def setUp(self) -> None:
         self.gate = load_gate_module()
