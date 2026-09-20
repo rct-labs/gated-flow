@@ -1792,26 +1792,25 @@ def cmd_usage(args) -> None:
 
 
 def _last_json_object(text: str) -> dict | None:
-    """Best-effort: the last balanced {...} in a transcript, parsed."""
-    end = text.rfind("}")
-    while end != -1:
-        depth = 0
-        for i in range(end, -1, -1):
-            ch = text[i]
-            if ch == "}":
-                depth += 1
-            elif ch == "{":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        obj = json.loads(text[i:end + 1])
-                        if isinstance(obj, dict):
-                            return obj
-                    except json.JSONDecodeError:
-                        pass
-                    break
-        end = text.rfind("}", 0, end)
-    return None
+    """The last top-level JSON object in a transcript, parsed.
+
+    The JSON decoder does the scanning, so braces inside strings do not count.
+    Counting braces by hand returned one finding instead of the envelope
+    whenever a finding quoted code with a brace in it, and a finished review
+    was recorded as unparsable (AugurNext, 2026-09-20: 8 minutes and $3.38)."""
+    decoder = json.JSONDecoder()
+    last: dict | None = None
+    pos = text.find("{")
+    while pos != -1:
+        try:
+            obj, end = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError:
+            pos = text.find("{", pos + 1)
+            continue
+        if isinstance(obj, dict):
+            last = obj
+        pos = text.find("{", end)
+    return last
 
 
 def parse_judge_output(output: str, out_file: Path) -> dict | None:

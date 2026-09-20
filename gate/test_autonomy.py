@@ -621,6 +621,21 @@ class JudgeChainTests(unittest.TestCase):
             self.assertIsNone(self.gate.parse_judge_output(
                 "{\"score\": 300, \"verdict\": \"pass\"}", Path(td) / "none"))
 
+    def test_braces_inside_a_finding_do_not_hide_the_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            body = {"score": 87, "verdict": "pass", "revision_brief": "",
+                    "findings": [{"severity": "low", "file": "a.py", "fix": "close the brace }",
+                                  "issue": "`raise Error({` is never closed; see `}` at line 9"}]}
+            env = json.dumps({"type": "result", "structured_output": body,
+                              "result": json.dumps(body), "usage": {"input_tokens": 1}})
+            v = self.gate.parse_judge_output("banner { not json\n" + env + "\n", Path(td) / "none")
+            self.assertEqual((v["score"], v["verdict"], len(v["findings"])), (87, "pass", 1))
+            # A plain transcript still ends in its verdict object.
+            v = self.gate.parse_judge_output(
+                'thinking {"draft": 1} ...\nfinal: ' + json.dumps(body), Path(td) / "none")
+            self.assertEqual(v["score"], 87)
+            self.assertIsNone(self.gate._last_json_object("no json { here"))
+
     def test_scope_request_detection(self) -> None:
         ask = self.gate.worker_scope_request
         self.assertIsNone(ask("Implemented and committed. Done."))
