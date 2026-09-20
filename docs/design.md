@@ -48,7 +48,7 @@ ignore. Gate checks: `gate/README.md`. Judge, probe and approval mechanics:
     work/<work-id>/         one vertical work package per feature
       brief.md              ask, goal, non-goals, unknowns
       spec.md               approved behaviour; edit in place and bump `revision:`
-      evidence.md           verification summary and pointers
+      evidence.md           verification summary, pointers, candidate lessons
 ```
 
 `CONTEXT.md` answers exactly five questions: goal and red lines; what is being
@@ -135,6 +135,12 @@ an audit is a separate, human-approved batch.
   that the gate contract requires of a worker.
 - No independent model as the acceptance authority; acceptance is a command
   and its exit code.
+- No context-usage hook, tool-call counter or transcript pruning. A handoff is
+  considered at phase boundaries and `CONTEXT.md` carries it; compaction is
+  the host CLI's feature, and an unknown usage figure stays unknown.
+- No learning daemon, session observer, lesson generator or confidence score.
+  A lesson is a row in a work package's `evidence.md`, backed by evidence,
+  scoped to its repository, and a rule only after the user approves it.
 
 ## 9. Removed on 2026-09-18, and why
 

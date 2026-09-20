@@ -64,6 +64,10 @@ already a testable slice, use it; otherwise write or update
 the user to pick among options this skill exists to settle; record the choice
 under Decisions in the spec.
 
+The survey ending here is a phase boundary: `CONTEXT.md` is fresh, so the
+run can start from a new session if this one is heavy. `flow` has the rule
+(Hand off at a phase boundary); it is advice, never a required step.
+
 ## 3. Queue
 
 Append TODO rows in gate format, one independently verifiable and reversible
@@ -128,7 +132,11 @@ never a task source. Do not write rows from it, alone or merged, to tidy up
 a finished package. When a note matters, it becomes part of the next planned
 work through `$flow`, with an acceptance of its own.
 
-Rebuild `CONTEXT.md`. If the user asked to finish everything and TODO rows
+Rebuild `CONTEXT.md`: a stopped or interrupted task is written as such, with
+its failing command, the uncommitted paths and the log path, never as done.
+If the run brought a user correction or a verified failure and fix, record
+one candidate lesson in the package's `evidence.md` (`flow`: Capture a
+lesson); otherwise none. If the user asked to finish everything and TODO rows
 remain for a reason other than a genuine blocker, say so and launch again.
 
 ## Host notes

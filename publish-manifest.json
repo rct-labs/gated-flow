@@ -25,6 +25,7 @@
     "flow/flow.py",
     "flow/templates/CONTEXT.md",
     "flow/templates/brief.md",
+    "flow/templates/evidence.md",
     "flow/templates/spec.md",
     "gate/README.md",
     "gate/gate.py",

@@ -175,6 +175,29 @@ five questions: goal and red lines / what is being worked on / last checkpoint /
 next step / decisions waiting on a human). **CONTEXT.md is the handoff document;
 there is no separate long handoff write-up.**
 
+The agent also considers a handoff on its own at three phase boundaries:
+research done and implementation about to start, a work package closed, a
+switch to another task. It is advice. The agent uses a context-usage figure
+only when its CLI states one; without one the usage is "unknown", never a
+guessed percentage, and a count of tool calls never forces anything. It does
+not hand off in the middle of a failing test or a half-made edit: it first
+writes the recoverable state into `CONTEXT.md`. An interrupted task keeps its
+failing command, its uncommitted paths and the path of its log under "Now",
+and is never described as done. Compaction stays the CLI's own feature; this
+workflow installs no hook for it and prunes no transcript.
+
+### 4.1 Lessons
+
+When you correct the agent, or a failure is reproduced and its fix verified,
+the agent may add one row to the Lessons table of that work package's
+`evidence.md`: the observed fact, the proposed rule, the evidence (commit,
+file and line, test or log), a status and a date. A row is a candidate and
+changes nothing. It becomes a rule only when you approve it; the agent then
+writes it once into `AGENTS.md` or an ADR and records that destination in the
+row. Lessons stay in the repository they came from; nothing is promoted to a
+global skill or to another project unless you say so. Your standing
+instructions always win over a lesson.
+
 ## 5. Troubleshooting
 
 | Symptom | Fix |

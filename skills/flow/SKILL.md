@@ -34,7 +34,8 @@ no-oracle until they set one; never invent an oracle for them.
   decisions waiting on a human. Rebuild, never append.
 - `docs/work/<work-id>/brief.md` + `spec.md` (+ `evidence.md`; `prototype/`
   only when a repository-held prototype is explicitly needed) — one vertical
-  work package per feature. Templates: `<home>/flow/templates/`.
+  work package per feature. `evidence.md` holds what was verified and the
+  package's candidate lessons. Templates: `<home>/flow/templates/`.
 - `TASK_QUEUE.md` — the ONLY task list (gate.py format). Never create
   tasks.yaml / tasks.json / a second queue.
 
@@ -122,6 +123,51 @@ queue, and `.gate/journal.ndjson` tail. Rebuild CONTEXT.md as a fresh ≤200
 line snapshot answering the five questions. That file is the handoff — never
 write a separate handoff document.
 
+**Hand off at a phase boundary** — three moments are natural handoff points:
+research is done and implementation starts, a work package closed, the user
+switches to another task. At one of them, and only there, consider whether a
+fresh session would serve the user better. No extra model call, no check
+after every tool use.
+
+- Context pressure is advice, never a command. Use a real usage figure only
+  when this host states one reliably (Host notes below). No figure means
+  "unknown": never zero, never a guessed percentage. A count of tool calls
+  says nothing about the window and never forces a handoff.
+- Before a handoff or a compaction, make the state recoverable: rebuild
+  CONTEXT.md from the template's five sections, keeping the goal and
+  constraints, the user's decisions, what is uncommitted, any unresolved
+  failure with its exact command, the next action, and the paths of the
+  evidence. Refer to durable files; do not copy logs.
+- Never hand off or compact in the middle of an unresolved edit, a failing
+  test or a debugging chain because a number was crossed. Reach a
+  recoverable state first. An interrupted task is written as interrupted,
+  never as done: only the gate closes a task.
+- Compaction itself belongs to the host. Do not imitate it, call an
+  unsupported API for it, or prune a transcript.
+- Say it once. Repeat only when the state or the pressure really changed.
+
+**Capture a lesson** — only when something concrete happened in the current
+work package: the user corrected the work, a failure was reproduced and its
+fix verified, or the same observation recurred and would prevent a future
+mistake. Not after every session, and not from one choice the user made.
+Add or update one row in that package's `evidence.md` (template: Lessons),
+with the observed fact kept apart from the proposed generalization, and a
+commit, file and line, test or durable log as evidence.
+
+- A candidate is not an instruction. It changes no prompt, no worker policy
+  and no config until the user approves it. Then write the rule once, in the
+  project's conventions (`AGENTS.md`) or an ADR, record that destination in
+  the row and mark it `accepted`. Never keep the same active rule in several
+  places.
+- Scope is this repository. A lesson never becomes a global skill or another
+  project's convention unless the user says so explicitly; seeing it in two
+  projects is evidence, not permission.
+- A standing user instruction always wins. A lesson that contradicts one is
+  shown to the user, not applied. A superseded lesson keeps its row and its
+  evidence.
+- No confidence scores: evidence and status decide. No transcript, credential
+  or runtime artifact goes into a lesson.
+
 **Is the project getting messy?** — run the read-only auditor:
 
 ```
@@ -154,3 +200,18 @@ invocations.
 - Never edit acceptance/verify commands to make a queued task admissible.
 - Execution requests hand off to $flow-run (or $run when the queue is already
   admitted), not to a loop you run.
+
+## Host notes: context usage
+
+Kept apart from the rules above because it differs per CLI. As known on
+2026-09-20; when in doubt the answer is "unknown".
+
+- Claude Code compacts on its own and says when it did; `/compact` and
+  `/context` are the user's commands. Use a usage figure only when the
+  session itself states one; otherwise it is unknown. This workflow installs
+  no hook to compute one from the transcript.
+- Codex CLI, Kimi CLI, Grok Build: no documented usage source the host model
+  can read. Unknown.
+- A figure, if a host ever provides one, needs its window size from that
+  host's own metadata, and cached tokens counted once. Never assume a window
+  size from a model name.
