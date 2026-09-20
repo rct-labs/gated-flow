@@ -233,6 +233,25 @@ class ReviewTests(ReviewHarness):
             self.assertIn("full_acceptance_failed:EAV-2", report)
             self.assertIn("the full oracle fails", report)
 
+    def test_a_failed_full_acceptance_keeps_its_whole_output(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            cmd = ("python -c \"import sys; print('TRACEBACK-LINE-1'); "
+                   "[print('noise', i) for i in range(40)]; print('1 passed'); sys.exit(1)\"")
+            repo = judged_runner_repo(Path(td), ["claude"], verify_cmd=cmd)
+            judge, _ = self._judge([verdict(90, "pass", findings=[])])
+            report = self._run(repo, self._spawn([]), judge, expect_exit="3")
+            verdict_json = json.loads((repo / ".gate" / "verdict.json").read_text(encoding="utf-8"))
+            self.assertNotIn("TRACEBACK-LINE-1", verdict_json["tail"])   # the tail is 15 lines
+            log = repo / verdict_json["log"]
+            self.assertEqual(log.name, "full-acceptance.log")
+            self.assertIn("TRACEBACK-LINE-1", log.read_text(encoding="utf-8"))
+            self.assertIn(f"The whole output, tracebacks included, is in `{verdict_json['log']}`",
+                          report)
+            events = [json.loads(ln) for ln in
+                      (repo / ".gate" / "journal.ndjson").read_text(encoding="utf-8").splitlines()]
+            accepted = [e for e in events if e["event"] == "full_acceptance"]
+            self.assertEqual(accepted[-1]["log"], verdict_json["log"])
+
     def test_model_call_budget_stops_the_run(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = judged_runner_repo(Path(td), ["claude"], max_tasks=2,
@@ -529,6 +548,62 @@ class JudgeChainTests(unittest.TestCase):
                 v, member = self.gate.judge_once(repo, cfg, "p", run_dir, "tag", "run")
             self.assertEqual(seen, ["claude-fable-5-1", "opus"])
             self.assertEqual((member, v["score"]), ("opus", 91))
+
+    def _no_access_chain(self, blind: set[str]):
+        """judge_once over a chain where the members in `blind` answer that they
+        could not read anything (the Codex read-only sandbox on Windows did)."""
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        repo = judged_runner_repo(Path(td.name), ["claude"])
+        with mock.patch.dict(os.environ, {"GATE_CONFIG": ""}):
+            cfg = self.gate.load_config(repo)
+        run_dir = repo / ".gate" / "runs" / "t"
+        run_dir.mkdir(parents=True)
+        seen: list[str] = []
+
+        def fake_spawn(repo_arg, cfg_, tool, prompt, pf, **kw):
+            template = kw["template"]
+            member = template[template.index("--model") + 1] if "--model" in template else "codex"
+            seen.append(member)
+            body = ({"score": 0, "verdict": "escalate", "findings": [],
+                     "revision_brief": "exec_command failed: CreateProcess rejected"}
+                    if member in blind else
+                    {"score": 87, "verdict": "pass", "findings": [], "revision_brief": ""})
+            return self.gate.WorkerResult(0, json.dumps({"structured_output": body})), None
+        with mock.patch.object(self.gate, "resolve_tool", side_effect=lambda n: n), \
+             mock.patch.object(self.gate, "spawn_worker", side_effect=fake_spawn):
+            verdict, member = self.gate.judge_once(repo, cfg, "p", run_dir, "tag", "run")
+        return repo, seen, verdict, member
+
+    def test_a_reviewer_that_could_not_read_is_an_outage_not_a_verdict(self) -> None:
+        repo, seen, verdict, member = self._no_access_chain({"claude-fable-5-1"})
+        self.assertEqual(seen, ["claude-fable-5-1", "opus"])
+        self.assertEqual((member, verdict["score"]), ("opus", 87))
+        # Not benched: the same CLI may be a fine worker.
+        self.assertNotIn("claude", self.gate.tool_state(repo))
+
+    def test_a_chain_that_could_not_read_at_all_skips_the_review(self) -> None:
+        _, seen, verdict, why = self._no_access_chain({"claude-fable-5-1", "opus", "codex"})
+        self.assertEqual(len(seen), 3)
+        self.assertIsNone(verdict)
+        self.assertEqual(why, "fable:no_access; opus:no_access; codex:no_access")
+
+    def test_an_escalate_with_a_basis_is_still_a_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"])
+            with mock.patch.dict(os.environ, {"GATE_CONFIG": ""}):
+                cfg = self.gate.load_config(repo)
+            run_dir = repo / ".gate" / "runs" / "t"
+            run_dir.mkdir(parents=True)
+            body = {"score": 40, "verdict": "escalate", "findings": [],
+                    "revision_brief": "the acceptance is ambiguous"}
+
+            def fake_spawn(repo_arg, cfg_, tool, prompt, pf, **kw):
+                return self.gate.WorkerResult(0, json.dumps({"structured_output": body})), None
+            with mock.patch.object(self.gate, "resolve_tool", side_effect=lambda n: n), \
+                 mock.patch.object(self.gate, "spawn_worker", side_effect=fake_spawn):
+                verdict, member = self.gate.judge_once(repo, cfg, "p", run_dir, "tag", "run")
+            self.assertEqual((member, verdict["verdict"]), ("fable", "escalate"))
 
     def test_parse_claude_envelope_and_codex_file(self) -> None:
         with tempfile.TemporaryDirectory() as td:

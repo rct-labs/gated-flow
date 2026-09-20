@@ -189,7 +189,9 @@ run with `scope_request:<id>`.
 **One review per package** (`judge`, default off). When the queue has no eligible TODO
 left, the review chain (`judge.chain`, next member on outage or unparsable output) reads
 once everything closed since the last full acceptance, earlier runs included, and returns
-strict JSON (`score`, `verdict`, `findings[]`, `revision_brief`). Pass means verdict `pass`
+strict JSON (`score`, `verdict`, `findings[]`, `revision_brief`). A member that answers
+`escalate`, score 0, no findings has said it could not read the repository: that is
+`<member>:no_access`, and the next member reviews. Pass means verdict `pass`
 and no `high` finding; the score is recorded only. The review is a gate and never writes
 queue rows: findings below high go, in full, to the report, the `review_findings` journal
 event and `REVIEW-NOTES.md` next to the queue (committed). The full oracle follows once.

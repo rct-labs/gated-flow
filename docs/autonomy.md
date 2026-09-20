@@ -64,6 +64,11 @@ Probes count against `max_model_calls`.
   once per package, after the review (section 5), journals `full_acceptance`,
   and stops with `full_acceptance_failed:<ids>` when it fails. Nothing is
   rolled back.
+- The verdict keeps a 15-line tail; the whole output is kept too, so a long
+  oracle never has to run again just to be read:
+  `.gate/runs/<run-id>/full-acceptance.log` for the runner's full acceptance
+  (its path is in the verdict, the journal event and the report), and
+  `.gate/acceptance.log`, last run only, for `gate.py verify`.
 - No verdict cache. Re-running a local check is the cheap path.
 
 ## 5. The review is a gate, once per package
@@ -90,8 +95,15 @@ Three rules. None has a threshold to tune, so none is fitted to a project.
   own. Acceptance is a command and its exit code (design.md section 2); a
   reviewing model is not an acceptance authority, and any new diff gives it
   something to say, so a review that feeds the queue has no last round.
-- Chain down or unparsable: `review_skipped`, the full acceptance still runs,
-  the report says so. Visibility replaces a silent quality-off.
+- A member that could not read the repository is an outage, not a verdict.
+  The prompt tells a reviewer without tool access to answer `escalate`, score
+  0, no findings; the chain records `<member>:no_access` and asks the next
+  member. Measured 2026-09-20: Codex 0.155 with `--sandbox read-only` on
+  Windows could not start a process, answered exactly that, and the run
+  stopped as if the work had failed review.
+- Chain down, unparsable or without access: `review_skipped`, the full
+  acceptance still runs, the report says so. Visibility replaces a silent
+  quality-off.
 
 **2. The boundary is the package, not the run.** The review and the full
 oracle run when the queue has no eligible TODO left, and cover every task

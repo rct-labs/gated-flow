@@ -151,7 +151,7 @@ the next CLI takes over without burning an attempt.
 | `no_workers` | Every CLI is benched; wait for the cooldown |
 | `review_failed:<ids>` | The reviewer found something high; admit one repair row tagged `origin: review` |
 | `review_loop:<file>` | The repair row drew another high finding on its own file; no second repair row: revise the spec or decide to accept the risk |
-| `full_acceptance_failed:<ids>` | The full oracle fails after the run; admit one repair row |
+| `full_acceptance_failed:<ids>` | The full oracle fails after the run; its whole output is in `.gate/runs/<run-id>/full-acceptance.log`; admit one repair row |
 | `needs_approval:<id>` | Add the task's `approved:` line after reading its scope |
 
 **Stopping is good. The only unacceptable outcome is a green light that lies.**

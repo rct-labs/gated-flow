@@ -198,6 +198,9 @@ JUDGE_ACTION_CONTRACT = (
     "needs no change. No finding becomes a task on its own: a high finding blocks "
     "the package, every other finding is recorded in full for the people planning "
     "the next work. So never raise a severity or an action to get a finding noticed.\n"
+    "If you could not read the repository or run your tools, you have no basis for a "
+    "verdict: return verdict 'escalate', score 0, no findings, and the reason in "
+    "revision_brief.\n"
     "Return ONLY JSON matching the schema."
 )
 
@@ -1083,11 +1086,16 @@ def cmd_verify(args) -> None:
 
 def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
                    task: str | None = None, timeout_s: int | None = None,
-                   files: list[str] | None = None) -> dict:
+                   files: list[str] | None = None, log_path: Path | None = None) -> dict:
     """Run an acceptance command, write the verdict, return it. Shared by
     `verify` and by the runner's own full acceptance at the end of a run.
     A task-scoped verdict records the task and a fingerprint of its declared
-    files; a queue-scoped one records the full oracle."""
+    files; a queue-scoped one records the full oracle.
+
+    The whole output goes to `log_path` (default .gate/acceptance.log, the last
+    run only): the verdict keeps a 15-line tail, which names the failures but
+    not their tracebacks, and an oracle that takes twenty minutes must not
+    have to run again just to be read."""
     cmd = cmd or cfg["verify_cmd"]
     # The oracle runs where the project lives, not at the repo root — a repo
     # can host several projects.
@@ -1111,6 +1119,13 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
     if quality is not None:
         output += "\n" + quality["tail"]
     tail = "\n".join(output.strip().splitlines()[-15:])
+    log_path = log_path or repo / GATE_DIR / "acceptance.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(output, encoding="utf-8")
+        log_rel = log_path.relative_to(repo).as_posix()
+    except (OSError, ValueError):
+        log_rel = ""
 
     count = None
     m = None
@@ -1141,6 +1156,7 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
         "files": sorted(files or []),
         "fingerprint": files_fingerprint(repo, cfg, files or []) if task else "",
         "tail": tail,
+        "log": log_rel,
         "quality": quality,
     }
     write_verdict(repo, payload)
@@ -1905,6 +1921,15 @@ def judge_once(
         if verdict is None:
             failures.append(f"{member}:unparsable")
             continue
+        if verdict["verdict"] == "escalate" and verdict["score"] == 0 and not verdict["findings"]:
+            # The reviewer's own statement that it read nothing (a sandbox that
+            # cannot start a process, a missing tool). Not a verdict on the
+            # work: the next member reviews. The CLI is not benched; it may
+            # still be a fine worker.
+            failures.append(f"{member}:no_access")
+            print(f"  review member {member} could not read the repository: "
+                  f"{verdict['revision_brief'][:160]}")
+            continue
         return verdict, member
     return None, "; ".join(failures) or "empty chain"
 
@@ -2599,10 +2624,10 @@ def cmd_run(args) -> None:
                                    else "review_failed:" + ",".join(unreviewed))
             if not stop_reason.startswith(("review_failed", "review_loop")):
                 print("GATE: full acceptance at the package boundary ...")
-                acceptance = run_acceptance(repo, cfg)
+                acceptance = run_acceptance(repo, cfg, log_path=run_dir / "full-acceptance.log")
                 journal(repo, {"event": "full_acceptance", "run": run_id, "tasks": ids,
                                "result": acceptance["result"], "count": acceptance["count"],
-                               "seconds": acceptance["elapsed_s"]})
+                               "seconds": acceptance["elapsed_s"], "log": acceptance["log"]})
                 if acceptance["result"] != "PASS":
                     stop_reason = "full_acceptance_failed:" + ",".join(ids)
 
@@ -2716,7 +2741,8 @@ def render_report(
         lines += ["", "## Full acceptance", "",
                   f"- `{acceptance['cmd']}` -> **{acceptance['result']}** "
                   f"(exit {acceptance['exit_code']}, count {acceptance.get('count')}, "
-                  f"{acceptance['elapsed_s']}s)"]
+                  f"{acceptance['elapsed_s']}s)"
+                  + (f"; full output: `{acceptance['log']}`" if acceptance.get("log") else "")]
 
     st = tool_state(repo)
     now = time.time()
@@ -2781,7 +2807,9 @@ def render_report(
         tids = stop.split(":", 1)[1]
         waiting.append(
             f"- **{tids}** closed on their local checks, but the full oracle fails. "
-            "Read the Full acceptance section and admit one repair task."
+            + (f"The whole output, tracebacks included, is in `{acceptance['log']}`. "
+               if acceptance and acceptance.get("log") else "")
+            + "Read it and admit one repair task."
         )
     if stop.startswith("scope_request:"):
         tid = stop.split(":", 1)[1]
@@ -2881,10 +2909,10 @@ def cmd_review(args) -> None:
     if (info is None or info["final"] != "failed") and not args.no_acceptance:
         # Closes the package boundary for every task pending in the journal.
         print("GATE: full acceptance ...")
-        acceptance = run_acceptance(repo, cfg)
+        acceptance = run_acceptance(repo, cfg, log_path=run_dir / "full-acceptance.log")
         journal(repo, {"event": "full_acceptance", "run": run_id, "tasks": tasks,
                        "result": acceptance["result"], "count": acceptance["count"],
-                       "seconds": acceptance["elapsed_s"]})
+                       "seconds": acceptance["elapsed_s"], "log": acceptance["log"]})
         if acceptance["result"] != "PASS":
             stop = "full_acceptance_failed:" + ",".join(tasks)
     results = [{"task": t, "outcome": "done", "attempts": 0, "dispatches": 0,
