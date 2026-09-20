@@ -2574,13 +2574,18 @@ def cmd_run(args) -> None:
     if pending and clean_stop:
         qtext = qpath.read_text(encoding="utf-8")
         ids = [e["task"] for e in pending]
+        unreviewed = [t for t in ids if t not in checkpointed] if jcfg.get("enabled") else []
         if head_task(cfg, parse_queue(qtext))[0] is not None:
+            deferred = ids
+        elif unreviewed and stop_reason == "budget:model_calls":
+            # No call left for the review. The full oracle would close the
+            # boundary and these tasks would never be reviewed; the next run
+            # has a new budget and closes the package properly.
             deferred = ids
         else:
             if stop_reason == "budget":
                 stop_reason = "queue_empty"  # the task limit was reached on the last row
-            unreviewed = [t for t in ids if t not in checkpointed]
-            if jcfg.get("enabled") and unreviewed and stop_reason != "budget:model_calls":
+            if unreviewed:
                 declared = parse_task_files(qtext)
                 for t in unreviewed:
                     files_by_task.setdefault(t, declared.get(t) or [])
@@ -2702,9 +2707,11 @@ def render_report(
     if deferred:
         lines += ["", "## Review and full acceptance", "",
                   f"- deferred to the package boundary: {len(deferred)} closed task(s) wait for a "
-                  f"queue with no TODO left ({', '.join(deferred[:12])}"
-                  + (", ..." if len(deferred) > 12 else "") + "). "
-                  "`gate.py review --tasks <ids>` reviews earlier on demand."]
+                  + ("run with model calls left for the review"
+                     if stop == "budget:model_calls" else "queue with no TODO left")
+                  + f" ({', '.join(deferred[:12])}" + (", ..." if len(deferred) > 12 else "") + "). "
+                  "`gate.py review --tasks <ids>` reviews earlier on demand; its full "
+                  "acceptance closes the boundary for every waiting task."]
     if acceptance:
         lines += ["", "## Full acceptance", "",
                   f"- `{acceptance['cmd']}` -> **{acceptance['result']}** "

@@ -152,7 +152,7 @@ task did not close, quote the last lines of its log from `.gate/runs/<run-id>/`.
 | `prompt_too_large:<id>` | packet over `worker_packet_max_bytes` | shorten the spec acceptance or split |
 | `timeout:<id>` | worker exceeded `task_timeout_s` | check for a half-finished tree |
 | `no_workers` | every CLI is benched | wait for the cooldown (`.gate/tool-status.json`) |
-| `review_failed:<ids>` | review reported a high finding or did not pass | read the findings; a `score 0 / escalate / no findings` verdict means the reviewer could not run its tools: fix the tool, then `gate.py review --tasks <ids>`; otherwise admit one repair row |
+| `review_failed:<ids>` | review reported a high finding or did not pass | read the findings; a `score 0 / escalate / no findings` verdict means the reviewer could not run its tools: fix the tool, then `gate.py review --tasks <ids>`; otherwise admit ONE repair row for all the findings, tagged `<!-- task:ID origin: review -->` |
 | `review_loop:<file>` | the repair row (`origin: review`) drew another high finding on a file it declared | no second repair row; take the findings to the user: revise the spec, or accept the risk |
 | `full_acceptance_failed:<ids>` | the full oracle fails after the run | admit one repair row |
 | `needs_approval:<id>` | irreversible path without `approved:` | the user approves that task, then relaunch |

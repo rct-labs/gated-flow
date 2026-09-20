@@ -142,8 +142,8 @@ the next CLI takes over without burning an attempt.
 
 | Stop reason | Meaning |
 |---|---|
-| `queue_empty` | Everything ran |
-| `budget` / `budget:model_calls` / `run_timeout` | A configured limit; start another run if you want more |
+| `queue_empty` | Everything ran, also when the task limit was reached on the last row; the package was reviewed and accepted |
+| `budget` / `budget:model_calls` / `run_timeout` | A configured limit with work left; start another run if you want more. The review and the full oracle wait for the package boundary |
 | `blocked:<id>` / `admit_refused:<id>` | The task needs decisions or a smaller shape |
 | `no_progress:<id>` / `not_done:<id>` | The system refused to record work it could not verify; read the log under `.gate/runs/<run-id>/` |
 | `worker_left_changes:<id>` | Two attempts left the tree dirty without closing the task |

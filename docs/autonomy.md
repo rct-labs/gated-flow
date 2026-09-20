@@ -98,10 +98,13 @@ oracle run when the queue has no eligible TODO left, and cover every task
 closed since the last full acceptance, including tasks of earlier runs
 (`task_done` events in the journal; a `full_acceptance` event or a failed
 review closes the boundary). A run that ends with TODO rows left reports the
-closed tasks as deferred and costs nothing more. A run that finds nothing to
+closed tasks as deferred and costs nothing more; so does a run whose model
+call budget is spent before the review, because a full oracle without the
+review would close the boundary unreviewed. A run that finds nothing to
 dispatch but tasks still waiting closes the package. Rows in
 `judge.checkpoints` are still reviewed alone right after they close, and
-`gate.py review --tasks <ids>` reviews on demand.
+`gate.py review --tasks <ids>` reviews on demand; its full acceptance closes
+the boundary for every waiting task.
 
 **3. A failed review gets one repair round.** `review_failed:<ids>` stops the
 run with the findings; the host admits one repair row for all of them, tagged

@@ -414,6 +414,27 @@ class ReviewIsAGateTests(ReviewHarness):
             accepted = self._events(repo, "full_acceptance")
             self.assertEqual([e["tasks"] for e in accepted], [["EAV-2", "EAV-3"]])
 
+    def test_a_spent_call_budget_defers_the_boundary_instead_of_skipping_the_review(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"], max_tasks=2, rows=1,
+                                      extra={"max_model_calls": 1})
+            gate = self.gate
+            real = self._spawn([])
+
+            def counting(repo_arg, cfg, worker, prompt, prompt_file, **kw):
+                gate.RUN_BUDGET["calls"] += 1
+                return real(repo_arg, cfg, worker, prompt, prompt_file, **kw)
+            never, _ = self._judge([])
+            report = self._run(repo, counting, never)
+            self.assertIn("stopped because: **budget:model_calls**", report)
+            self.assertIn("wait for a run with model calls left for the review (EAV-2)", report)
+            self.assertEqual(self._events(repo, "full_acceptance"), [])
+            judge, calls = self._judge([verdict(90, "pass", findings=[])])
+            report = self._run(repo, counting, judge)
+            self.assertEqual(calls["n"], 1)
+            self.assertIn("| EAV-2 | pass | pass | 90 |", report)
+            self.assertEqual(len(self._events(repo, "full_acceptance")), 1)
+
     def test_a_run_with_nothing_to_dispatch_closes_the_package(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = judged_runner_repo(Path(td), ["claude"])
