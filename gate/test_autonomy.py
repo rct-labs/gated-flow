@@ -20,9 +20,17 @@ from test_compat import GATE, committed_runner_repo, load_gate_module, run
 
 def judged_runner_repo(root: Path, workers: list[str], judge: dict | None = None,
                        verify_cmd: str | None = None, max_tasks: int = 1,
-                       extra: dict | None = None) -> Path:
-    """committed_runner_repo with the review switched on and the probe off."""
+                       extra: dict | None = None, rows: int | None = None) -> Path:
+    """committed_runner_repo with the review switched on and the probe off.
+    The review and the full oracle run at the package boundary (no TODO left),
+    so the queue holds as many rows as the run takes unless `rows` says more."""
     repo = committed_runner_repo(root, workers)
+    if (rows or max_tasks) == 1:
+        queue = repo / "TASK_QUEUE.md"
+        queue.write_text("".join(
+            ln for ln in queue.read_text(encoding="utf-8").splitlines(keepends=True)
+            if "EAV-3" not in ln), encoding="utf-8")
+        run("git", "-C", str(repo), "add", "TASK_QUEUE.md")
     cfg_path = repo / ".gate" / "config.json"
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     cfg["judge"] = {"enabled": True, "chain": ["fable", "opus", "codex"], "timeout_s": 60}
@@ -131,7 +139,8 @@ class ReviewTests(ReviewHarness):
             self.assertIn("| EAV-2, EAV-3 | pass | pass | 80 |", report)
             self.assertIn("## Full acceptance", report)
             self.assertIn("-> **PASS**", report)
-            self.assertIn("stopped because: **budget**", report)
+            # The task limit was reached on the last row: the package is closed.
+            self.assertIn("stopped because: **queue_empty**", report)
             self.assertIn("## Waiting on you\n\n- nothing", report)
             log = run("git", "-C", str(repo), "log", "--oneline").stdout
             self.assertIn("finish EAV-2", log)
@@ -151,18 +160,10 @@ class ReviewTests(ReviewHarness):
             judge, _ = self._judge([verdict(72, "pass")])  # one medium finding
             report = self._run(repo, self._spawn([]), judge)
             self.assertIn("| EAV-2 | pass | pass | 72 |", report)
-            queue = (repo / "TASK_QUEUE.md").read_text(encoding="utf-8")
-            self.assertIn("| EAV-2-R1 | x | `TODO` |", queue)
-            self.assertIn("<!-- task:EAV-2-R1 files: eav2.txt -->", queue)
-            self.assertIn("<!-- task:EAV-2-R1 origin: review -->", queue)
             self.assertIn("## Waiting on you\n\n- nothing", report)
-            # The queue commit leaves a clean tree for the next run.
-            self.assertEqual(run("git", "-C", str(repo), "status", "--porcelain",
-                                 "--", "TASK_QUEUE.md").stdout.strip(), "")
-            self.assertIn("review findings as tasks", run("git", "-C", str(repo), "log",
-                                                            "--oneline", "-1").stdout)
+            self.assertNotIn("TODO", (repo / "TASK_QUEUE.md").read_text(encoding="utf-8"))
 
-    def test_review_rows_inherit_the_local_check_and_old_prompts_are_reset(self) -> None:
+    def test_old_per_task_prompts_are_reset(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = judged_runner_repo(Path(td), ["claude"], extra={
                 "judge_prompt": "Judge task {task} at {commit}; pass at {pass_score}."})
@@ -175,8 +176,6 @@ class ReviewTests(ReviewHarness):
             judge, calls = self._judge([verdict(70, "pass")])
             self._run(repo, self._spawn([]), judge)
             self.assertIn("Tasks under review: EAV-2.", calls["prompts"][0])
-            text = queue.read_text(encoding="utf-8")
-            self.assertIn('<!-- task:EAV-2-R1 verify: {"cmd": "python -c', text)
             events = [json.loads(ln) for ln in
                       (repo / ".gate" / "journal.ndjson").read_text(encoding="utf-8").splitlines()]
             self.assertTrue(any(e["event"] == "judge_prompt_reset" for e in events))
@@ -267,7 +266,8 @@ class ReviewTests(ReviewHarness):
             report = (repo / ".gate" / "RUN-REPORT.md").read_text(encoding="utf-8")
             self.assertIn("| EAV-2 | pass | pass | 88 |", report)
             self.assertIn("## Full acceptance", report)
-            self.assertIn("EAV-2-R1", (repo / "TASK_QUEUE.md").read_text(encoding="utf-8"))
+            self.assertNotIn("EAV-2-R1", (repo / "TASK_QUEUE.md").read_text(encoding="utf-8"))
+            self.assertIn("issue: x", (repo / "REVIEW-NOTES.md").read_text(encoding="utf-8"))
             with self.assertRaises(SystemExit):
                 self.gate.cmd_review(SimpleNamespace(repo=str(repo), tasks="EAV-3", base=base,
                                                      no_acceptance=True, acceptance_only=False))  # not DONE
@@ -282,15 +282,11 @@ class ReviewTests(ReviewHarness):
             self.assertIn("prompt_too_large:EAV-2", report)
 
 
-class ReviewRowTerminationTests(ReviewHarness):
-    """The review-finding-to-row chain terminates: only `required` findings
-    become rows, rows stop at review_rows.max_gen, a recurring medium on a
-    review row's own file stops the run, and nothing is dropped
-    (docs/work/REVIEW-ROW-TERMINATION-20260920)."""
-
-    def _cfg(self, repo: Path) -> dict:
-        with mock.patch.dict(os.environ, {"GATE_CONFIG": ""}):
-            return self.gate.load_config(repo)
+class ReviewIsAGateTests(ReviewHarness):
+    """A review blocks on a high finding and does nothing else to the queue:
+    findings never become rows, the review and the full oracle run once per
+    package rather than once per run, and a failed review gets one repair
+    round (docs/autonomy.md section 5)."""
 
     @staticmethod
     def _finding(sev: str, issue: str, action: str | None = None, file: str = "eav2.txt") -> dict:
@@ -299,13 +295,6 @@ class ReviewRowTerminationTests(ReviewHarness):
             f["action"] = action
         return f
 
-    def _append(self, repo: Path, tasks: list[str], findings: list[dict],
-                files: dict | None = None, cfg: dict | None = None) -> tuple[list[str], dict]:
-        review = {"tasks": tasks, "findings": findings, "member": "fable"}
-        files = files or {t: ["eav2.txt"] for t in tasks}
-        added = self.gate.append_review_rows(repo, cfg or self._cfg(repo), review, files)
-        return added, review
-
     @staticmethod
     def _events(repo: Path, name: str) -> list[dict]:
         path = repo / ".gate" / "journal.ndjson"
@@ -313,6 +302,12 @@ class ReviewRowTerminationTests(ReviewHarness):
             return []
         return [e for e in map(json.loads, path.read_text(encoding="utf-8").splitlines())
                 if e["event"] == name]
+
+    def _mark_repair_row(self, repo: Path, tid: str = "EAV-2") -> None:
+        queue = repo / "TASK_QUEUE.md"
+        queue.write_text(queue.read_text(encoding="utf-8")
+                         + f"<!-- task:{tid} origin: review -->\n", encoding="utf-8")
+        run("git", "-C", str(repo), "commit", "-q", "-am", f"{tid} repairs a failed review")
 
     def test_schema_requires_action_and_missing_action_is_required(self) -> None:
         item = self.gate.JUDGE_SCHEMA["properties"]["findings"]["items"]
@@ -333,9 +328,10 @@ class ReviewRowTerminationTests(ReviewHarness):
             prompt = calls["prompts"][0]
             self.assertTrue(prompt.startswith("Project reviewer. Look at EAV-2"))
             self.assertIn("Every finding carries `action`", prompt)
+            self.assertIn("No finding becomes a task on its own", prompt)
             self.assertTrue(prompt.rstrip().endswith("Return ONLY JSON matching the schema."))
 
-    def test_only_required_findings_become_rows_and_the_rest_is_kept(self) -> None:
+    def test_findings_are_recorded_in_full_and_never_become_rows(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = judged_runner_repo(Path(td), ["claude"])
             judge, _ = self._judge([verdict(85, "pass", findings=[
@@ -344,27 +340,28 @@ class ReviewRowTerminationTests(ReviewHarness):
                 self._finding("low", "No change is required", "none")])])
             report = self._run(repo, self._spawn([]), judge)
             queue = (repo / "TASK_QUEUE.md").read_text(encoding="utf-8")
-            self.assertIn("| EAV-2-R1 | real defect | `TODO` |", queue)
-            self.assertIn("<!-- task:EAV-2-R1 gen: 1 -->", queue)
-            self.assertNotIn("EAV-2-R2", queue)
-            self.assertIn("### EAV-2 - residuals (no row created)", report)
-            self.assertIn("action: optional | reason: action:optional", report)
-            self.assertIn("  - issue: No change is required", report)
-            self.assertIn("  - fix: fix nicer wording", report)
-            self.assertIn("stopped because: **budget**", report)
+            self.assertNotIn("TODO", queue)
+            self.assertNotIn("-R1", queue)
+            self.assertNotIn("origin: review", queue)
+            self.assertIn("[medium] eav2.txt: real defect", report)
+            self.assertIn("(action: optional)", report)
+            self.assertIn("a record, not tasks; they are also in `REVIEW-NOTES.md`", report)
+            self.assertIn("stopped because: **queue_empty**", report)
             self.assertIn("## Waiting on you\n\n- nothing", report)
-            ev = self._events(repo, "review_residuals")
-            self.assertEqual([f["issue"] for f in ev[0]["findings"]],
-                             ["nicer wording", "No change is required"])
-            # Committed next to the queue, in the same commit as the rows.
-            residuals = (repo / "REVIEW-RESIDUALS.md").read_text(encoding="utf-8")
-            self.assertIn("issue: nicer wording", residuals)
+            self.assertEqual([f["issue"] for f in self._events(repo, "review_findings")[0]["findings"]],
+                             ["real defect", "nicer wording", "No change is required"])
+            self.assertEqual(self._events(repo, "review_rows_added"), [])
+            notes = (repo / "REVIEW-NOTES.md").read_text(encoding="utf-8")
+            for text in ("severity: medium | action: required", "issue: nicer wording",
+                         "fix: fix No change is required"):
+                self.assertIn(text, notes)
+            # Committed, so the next run starts from a clean tree.
             self.assertEqual(run("git", "-C", str(repo), "status", "--porcelain", "--",
-                                 "TASK_QUEUE.md", "REVIEW-RESIDUALS.md").stdout.strip(), "")
-            self.assertIn("REVIEW-RESIDUALS.md", run("git", "-C", str(repo), "show", "--stat",
-                                                     "--oneline", "-1").stdout)
+                                 "TASK_QUEUE.md", "REVIEW-NOTES.md").stdout.strip(), "")
+            self.assertIn("review notes of EAV-2",
+                          run("git", "-C", str(repo), "log", "--oneline", "-1").stdout)
 
-    def test_high_findings_ignore_action_and_never_enter_the_residuals(self) -> None:
+    def test_high_blocks_whatever_its_action_and_is_not_a_note(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = judged_runner_repo(Path(td), ["claude"])
             judge, _ = self._judge([verdict(95, "pass", findings=[
@@ -372,110 +369,87 @@ class ReviewRowTerminationTests(ReviewHarness):
                 self._finding("low", "cosmetic", "none")])])
             report = self._run(repo, self._spawn([]), judge, expect_exit="3")
             self.assertIn("stopped because: **review_failed:EAV-2**", report)
-            self.assertNotIn("residuals (no row created)", report)
-            self.assertFalse((repo / "REVIEW-RESIDUALS.md").exists())
-            self.assertEqual(self._events(repo, "review_residuals"), [])
-            self.assertNotIn("EAV-2-R1", (repo / "TASK_QUEUE.md").read_text(encoding="utf-8"))
+            self.assertNotIn("## Full acceptance", report)
+            notes = (repo / "REVIEW-NOTES.md").read_text(encoding="utf-8")
+            self.assertIn("issue: cosmetic", notes)   # no finding is dropped
+            self.assertNotIn("issue: wrong", notes)   # a high finding is a stop, not a note
 
-    def test_high_on_a_review_row_at_max_gen_still_fails_the_review(self) -> None:
+    def test_a_repair_row_gets_one_round(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            repo = judged_runner_repo(Path(td), ["claude"])
-            queue = repo / "TASK_QUEUE.md"
-            queue.write_text(queue.read_text(encoding="utf-8")
-                             + "<!-- task:EAV-2 origin: review -->\n<!-- task:EAV-2 gen: 1 -->\n",
-                             encoding="utf-8")
-            run("git", "-C", str(repo), "commit", "-q", "-am", "EAV-2 is a review row")
-            judge, _ = self._judge([verdict(90, "pass", findings=HIGH)])
-            report = self._run(repo, self._spawn([]), judge, expect_exit="3")
-            self.assertIn("stopped because: **review_failed:EAV-2**", report)
-            self.assertFalse((repo / "REVIEW-RESIDUALS.md").exists())
-
-    def test_recurring_medium_on_a_review_rows_own_file_stops_the_run(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            repo = judged_runner_repo(Path(td), ["claude"])
-            queue = repo / "TASK_QUEUE.md"
-            # A row from before `gen` existed: origin only, counted as gen 1.
-            queue.write_text(queue.read_text(encoding="utf-8")
-                             + "<!-- task:EAV-2 origin: review -->\n", encoding="utf-8")
-            run("git", "-C", str(repo), "commit", "-q", "-am", "EAV-2 is a review row")
-            judge, _ = self._judge([verdict(88, "pass")])  # medium, eav2.txt, no action
+            (Path(td) / "own").mkdir()
+            (Path(td) / "other").mkdir()
+            repo = judged_runner_repo(Path(td) / "own", ["claude"])
+            self._mark_repair_row(repo)
+            judge, _ = self._judge([verdict(90, "pass", findings=HIGH)])  # high on eav2.txt
             report = self._run(repo, self._spawn([]), judge, expect_exit="3")
             self.assertIn("stopped because: **review_loop:eav2.txt**", report)
-            self.assertIn("admit one structural repair row", report)
-            self.assertIn("reason: review_loop", report)
-            self.assertIn("| EAV-2 | pass | pass | 88 |", report)
-            self.assertNotIn("EAV-2-R1", queue.read_text(encoding="utf-8"))
-            self.assertEqual(self._events(repo, "review_residuals")[0]["loop_file"], "eav2.txt")
+            self.assertIn("One repair round is the limit", report)
+            self.assertIn("Do not admit another repair row", report)
+            self.assertNotIn("## Full acceptance", report)
             self.assertEqual(self._events(repo, "run_end")[-1]["stop"], "review_loop:eav2.txt")
+            # A high finding elsewhere is an ordinary failed review.
+            repo = judged_runner_repo(Path(td) / "other", ["claude"])
+            self._mark_repair_row(repo)
+            judge, _ = self._judge([verdict(90, "pass", findings=[
+                self._finding("high", "wrong", file="other.txt")])])
+            report = self._run(repo, self._spawn([]), judge, expect_exit="3")
+            self.assertIn("stopped because: **review_failed:EAV-2**", report)
 
-    def test_generation_is_per_finding_in_a_mixed_review(self) -> None:
+    def test_runs_of_one_task_share_one_review_and_one_full_oracle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            repo = committed_runner_repo(Path(td), ["claude"])
-            queue = repo / "TASK_QUEUE.md"
-            queue.write_text(queue.read_text(encoding="utf-8")
-                             + "<!-- task:EAV-2 origin: review -->\n<!-- task:EAV-2 gen: 1 -->\n",
-                             encoding="utf-8")
-            added, review = self._append(
-                repo, ["EAV-2", "EAV-3"],
-                [self._finding("low", "on the review row"),
-                 self._finding("low", "on the ordinary task", file="eav3.txt"),
-                 # Not a loop: the row did not declare this file.
-                 self._finding("medium", "elsewhere", file="other.txt")],
-                files={"EAV-2": ["eav2.txt"], "EAV-3": ["eav3.txt"]})
-            self.assertEqual(added, ["EAV-2-EAV-3-R1"])
-            text = queue.read_text(encoding="utf-8")
-            self.assertIn("| EAV-2-EAV-3-R1 | on the ordinary task |", text)
-            self.assertIn("<!-- task:EAV-2-EAV-3-R1 gen: 1 -->", text)
-            self.assertNotIn("loop_file", review)
-            self.assertEqual([(f["issue"], f["reason"]) for f in review["residuals"]],
-                             [("on the review row", "max_gen:1"), ("elsewhere", "max_gen:1")])
+            repo = judged_runner_repo(Path(td), ["claude"], max_tasks=1, rows=2)
+            never, _ = self._judge([])
+            report = self._run(repo, self._spawn([]), never)
+            self.assertIn("stopped because: **budget**", report)
+            self.assertIn("deferred to the package boundary: 1 closed task(s)", report)
+            self.assertNotIn("## Full acceptance", report)
+            self.assertIn("## Waiting on you\n\n- nothing", report)
+            judge, calls = self._judge([verdict(90, "pass", findings=[])])
+            report = self._run(repo, self._spawn([]), judge)
+            self.assertEqual(calls["n"], 1)
+            self.assertIn("Tasks under review: EAV-2, EAV-3.", calls["prompts"][0])
+            self.assertIn("| EAV-2, EAV-3 | pass | pass | 90 |", report)
+            self.assertIn("-> **PASS**", report)
+            self.assertEqual(len(self._events(repo, "review_start")), 1)
+            accepted = self._events(repo, "full_acceptance")
+            self.assertEqual([e["tasks"] for e in accepted], [["EAV-2", "EAV-3"]])
 
-    def test_max_gen_is_configurable(self) -> None:
+    def test_a_run_with_nothing_to_dispatch_closes_the_package(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            repo = committed_runner_repo(Path(td), ["claude"])
-            queue = repo / "TASK_QUEUE.md"
-            queue.write_text(queue.read_text(encoding="utf-8")
-                             + "<!-- task:EAV-2 origin: review -->\n", encoding="utf-8")
-            cfg = {**self._cfg(repo), "review_rows": {"max_gen": 2}}
-            added, _ = self._append(repo, ["EAV-2"], [self._finding("low", "again")], cfg=cfg)
-            self.assertEqual(added, ["EAV-2-R1"])
-            self.assertIn("<!-- task:EAV-2-R1 gen: 2 -->", queue.read_text(encoding="utf-8"))
-            added, review = self._append(repo, ["EAV-2-R1"], [self._finding("low", "third")], cfg=cfg)
-            self.assertEqual(added, [])
-            self.assertEqual(review["residuals"][0]["reason"], "max_gen:2")
+            repo = judged_runner_repo(Path(td), ["claude"])
+            base = run("git", "-C", str(repo), "rev-parse", "HEAD").stdout.strip()
+            self._spawn([])(repo, {}, "claude", "task EAV-2", None)
+            head = run("git", "-C", str(repo), "rev-parse", "HEAD").stdout.strip()
+            self.gate.journal(repo, {"event": "task_done", "task": "EAV-2", "worker": "claude",
+                                     "base": base, "commit": head, "seconds": 1})
+            judge, calls = self._judge([verdict(90, "pass", findings=[])])
+            seen: list = []
+            report = self._run(repo, self._spawn(seen), judge)
+            self.assertEqual(seen, [])
+            self.assertEqual(calls["n"], 1)
+            self.assertIn("stopped because: **queue_empty**", report)
+            self.assertIn("| EAV-2 | pass | pass | 90 |", report)
+            self.assertIn("-> **PASS**", report)
+            # The boundary is closed: a further run has nothing to review.
+            never, _ = self._judge([])
+            self._run(repo, self._spawn(seen), never, expect_exit="3")
 
-    def test_replay_of_the_four_alltom_rounds_creates_rows_once(self) -> None:
+    def test_replay_of_the_alltom_incident_ends_after_round_one(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            repo = committed_runner_repo(Path(td), ["claude"])
-            queue = repo / "TASK_QUEUE.md"
-            added, review = self._append(repo, ["EAV-2"], [
+            repo = judged_runner_repo(Path(td), ["claude"])
+            judge, calls = self._judge([verdict(86, "pass", findings=[
                 self._finding("medium", "r1 medium"), self._finding("low", "r1 low a"),
-                self._finding("low", "r1 low b")])
-            self.assertEqual(added, ["EAV-2-R1", "EAV-2-R2", "EAV-2-R3"])
-            self.assertNotIn("residuals", review)
-            after_round_1 = queue.read_text(encoding="utf-8")
-            rounds = [
-                ("EAV-2-R1", [self._finding("low", "a missing space"),
-                              self._finding("low", "a vaguer-than-ideal message")]),
-                ("EAV-2-R2", [self._finding("low", "an unreachable fallback"),
-                              self._finding("low", "use the last separator")]),
-                ("EAV-2-R3", [self._finding("low", "No change is required under the "
-                                            "minimal-scope rule", "none")]),
-            ]
-            for tid, findings in rounds:
-                added, review = self._append(repo, [tid], findings)
-                self.assertEqual(added, [], tid)
-                self.assertNotIn("loop_file", review)
-                self.assertEqual(queue.read_text(encoding="utf-8"), after_round_1)
-            residuals = (repo / "REVIEW-RESIDUALS.md").read_text(encoding="utf-8")
-            for _, findings in rounds:
-                for f in findings:
-                    self.assertIn("issue: " + f["issue"], residuals)
-                    self.assertIn("fix: " + f["fix"], residuals)
-            self.assertEqual(len(self._events(repo, "review_residuals")), 3)
-            self.assertEqual(len(self._events(repo, "review_rows_added")), 1)
-            self.assertEqual(run("git", "-C", str(repo), "status", "--porcelain", "--",
-                                 "REVIEW-RESIDUALS.md").stdout.strip(), "")
+                self._finding("low", "r1 low b")])])
+            self._run(repo, self._spawn([]), judge)
+            queue = (repo / "TASK_QUEUE.md").read_text(encoding="utf-8")
+            self.assertNotIn("TODO", queue)   # rounds 2 to 4 have nothing to run
+            seen: list = []
+            self._run(repo, self._spawn(seen), judge, expect_exit="3")
+            self.assertEqual((seen, calls["n"]), ([], 1))
+            self.assertEqual(len(self._events(repo, "full_acceptance")), 1)
+            notes = (repo / "REVIEW-NOTES.md").read_text(encoding="utf-8")
+            for issue in ("r1 medium", "r1 low a", "r1 low b"):
+                self.assertIn("issue: " + issue, notes)
 
 
 class JudgeChainTests(unittest.TestCase):

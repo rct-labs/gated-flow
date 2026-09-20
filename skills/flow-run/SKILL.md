@@ -97,7 +97,9 @@ and `judge.chain` when the project wants a package review, `judge.checkpoints`
 for rows that must be reviewed on their own, `max_model_calls` for the run.
 Never raise limits or weaken admission to get a task through.
 
-Count remaining TODO rows and pass that as `--MaxTasks`. Then follow
+Count remaining TODO rows and pass that as `--MaxTasks`: the review and the
+full oracle run once, when the queue has no TODO left, so one launch per
+package is the cheap shape and a launch per task buys nothing. Then follow
 `run-queue`: detached launch, one validated watcher, narrate, read the report.
 Never mark DONE, never `--no-verify`, never take over IN_PROGRESS, never
 push unless the user or CONTEXT already allowed it.
@@ -108,16 +110,23 @@ Read `RUN-REPORT.md` bottom-up: **Waiting on you** first, then **Review**,
 then **Full acceptance**, then the task table. Relay those in the user's
 language, leading with the measured result or the blocking fact.
 
-- `review_failed:<ids>`: read the findings; admit one repair row inside the
-  same package with the findings as its acceptance, then relaunch. Never
-  revise by hand or lower the bar.
-- `review_loop:<file>`: review rows keep producing findings on that file.
-  Read the residuals; admit one structural repair row, never another patch.
+- `review_failed:<ids>`: read the findings; admit ONE repair row for all of
+  them inside the same package, tagged `<!-- task:ID origin: review -->`,
+  with the findings as its acceptance, then relaunch. Never revise by hand or
+  lower the bar.
+- `review_loop:<file>`: the repair row drew another high finding on its own
+  file. No second repair row. Take the findings to the user: the spec for
+  that block is revised through `$flow`, or the user accepts the risk.
 - `full_acceptance_failed:<ids>`: read the tail; admit one repair row.
 - `scope_request:<id>`: widen the declared files or split the task.
 - `prompt_too_large:<id>`: shorten the spec acceptance or split the task.
 - `needs_approval:<id>`: show the scope line, ask once, add the line on yes.
-- review rows the runner added (`origin: review`) run on the next launch.
+
+A package is finished when the review passed and the full acceptance is
+green. Findings below high are in `REVIEW-NOTES.md`: a record for planning,
+never a task source. Do not write rows from it, alone or merged, to tidy up
+a finished package. When a note matters, it becomes part of the next planned
+work through `$flow`, with an acceptance of its own.
 
 Rebuild `CONTEXT.md`. If the user asked to finish everything and TODO rows
 remain for a reason other than a genuine blocker, say so and launch again.

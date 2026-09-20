@@ -3,8 +3,8 @@ name: run-queue
 description: >
   $run: the launch protocol for a task queue that is already written and
   admitted. Admission-checked tasks, one worker process per task, a
-  machine-checked verdict after each, one package review and one full
-  acceptance per run, progress reported as it happens, and a stop at the
+  machine-checked verdict after each, one review and one full acceptance
+  per package, progress reported as it happens, and a stop at the
   first thing that needs a human. Normally loaded by $flow-run at its launch
   step. Use directly only when the user types $run or /run-queue, or asks to
   run the existing queue as it stands. Not for a single task, and not for
@@ -15,8 +15,8 @@ description: >
 
 You are the launcher and the narrator. The loop belongs to `gate.py run`: a
 deterministic script that spawns one CLI process per task, checks each
-commit with the pre-commit hook, reviews the closed tasks once, runs the full
-oracle once, and decides when to stop.
+commit with the pre-commit hook, reviews the closed tasks once and runs the
+full oracle once when the queue has no TODO left, and decides when to stop.
 
 Why the loop is not you: an agent that supervises its own work can be talked
 out of stopping and can convince itself a task is done. The verdict comes
@@ -75,9 +75,8 @@ Then watch the journal: append-only NDJSON at `<repo>/.gate/journal.ndjson`.
 | `scope_drift` | the task's commits touched undeclared paths; listed under Waiting on you, not a stop |
 | `scope_request` / `prompt_too_large` | needs the host; run stops |
 | `review_start` / `review_verdict` / `review_skipped` | the one package review (or a checkpoint) |
-| `review_rows_added` | `required` lesser findings appended as TODO rows (`gen: N`) |
-| `review_residuals` | findings that did not become rows, full text: `action` not `required`, task at `review_rows.max_gen`, or `review_loop`; also in the report and in `REVIEW-RESIDUALS.md` next to the queue |
-| `full_acceptance` | the full oracle after the review: `result`, `count` |
+| `review_findings` | findings below high, full text; recorded in the report and `REVIEW-NOTES.md`, never rows |
+| `full_acceptance` | the full oracle after the review, once per package: `result`, `count` |
 | `needs_approval` | head task touches an irreversible path without approval |
 | `tool_disabled` | a CLI hit its quota and was benched |
 | `task_end` / `run_end` | outcome per task / stop reason |
@@ -116,7 +115,7 @@ One short line per new event, nothing between events:
 WP-A -> claude, started
 WP-A running 12m, last: "pytest tests/test_a.py -q"
 WP-A DONE in 56m, commit 8ebf530
-review of WP-A, WP-4: pass (fable), 2 findings -> 2 rows added
+review of WP-A, WP-4: pass (fable), 2 findings recorded
 full acceptance: PASS, 561 passed
 ```
 
@@ -134,6 +133,7 @@ task did not close, quote the last lines of its log from `.gate/runs/<run-id>/`.
 - Never mark a task done, edit the queue status, or touch a verify command.
 - Never `git commit --no-verify`, and never suggest it. The block is the product.
 - Never take over an IN_PROGRESS task. Never push, merge or open a PR.
+- Never turn a review finding into a queue row. `REVIEW-NOTES.md` is a record.
 - Never restart a run just because it stopped, and never raise `--max-tasks`,
   `max_model_calls` or `max_task_files` to push past a stop.
 
@@ -153,7 +153,7 @@ task did not close, quote the last lines of its log from `.gate/runs/<run-id>/`.
 | `timeout:<id>` | worker exceeded `task_timeout_s` | check for a half-finished tree |
 | `no_workers` | every CLI is benched | wait for the cooldown (`.gate/tool-status.json`) |
 | `review_failed:<ids>` | review reported a high finding or did not pass | read the findings; a `score 0 / escalate / no findings` verdict means the reviewer could not run its tools: fix the tool, then `gate.py review --tasks <ids>`; otherwise admit one repair row |
-| `review_loop:<file>` | a review row got another `required` medium finding on a file it declared; no patch row was created | read the residuals; admit one structural repair row for that block (restructure, not another patch), or accept the residuals |
+| `review_loop:<file>` | the repair row (`origin: review`) drew another high finding on a file it declared | no second repair row; take the findings to the user: revise the spec, or accept the risk |
 | `full_acceptance_failed:<ids>` | the full oracle fails after the run | admit one repair row |
 | `needs_approval:<id>` | irreversible path without `approved:` | the user approves that task, then relaunch |
 

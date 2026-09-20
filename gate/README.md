@@ -186,16 +186,16 @@ same tree with a hint; a second attempt that still does not close the task stops
 run with `worker_left_changes:<id>`. A worker that asks for a scope decision stops the
 run with `scope_request:<id>`.
 
-**One review per run** (`judge`, default off). After the last task closes, the review
-chain (`judge.chain`, next member on outage or unparsable output) reads the run's
-commits once and returns strict JSON (`score`, `verdict`, `findings[]`,
-`revision_brief`). Pass means verdict `pass` and no `high` finding; the score is
-recorded only. Each finding carries `action` (`required` / `optional` / `none`);
-`required` medium and low findings are appended to the queue as TODO rows with
-`<!-- task:ID origin: review -->` and `<!-- task:ID gen: N -->`. Rows stop at
-`review_rows.max_gen` (default 1), a repeated medium on a review row's own file stops
-the run with `review_loop:<file>`, and every finding that did not become a row is kept
-in `REVIEW-RESIDUALS.md` next to the queue (details: docs/autonomy.md). A failed review stops with `review_failed:<ids>`;
+**One review per package** (`judge`, default off). When the queue has no eligible TODO
+left, the review chain (`judge.chain`, next member on outage or unparsable output) reads
+once everything closed since the last full acceptance, earlier runs included, and returns
+strict JSON (`score`, `verdict`, `findings[]`, `revision_brief`). Pass means verdict `pass`
+and no `high` finding; the score is recorded only. The review is a gate and never writes
+queue rows: findings below high go, in full, to the report, the `review_findings` journal
+event and `REVIEW-NOTES.md` next to the queue (committed). The full oracle follows once.
+A run that ends with TODO rows left defers both. A failed review stops with
+`review_failed:<ids>` and gets one repair round: a repair row (`origin: review`) that draws
+another high finding on its own file stops with `review_loop:<file>`;
 a chain outage journals `review_skipped` and the run continues. Rows in
 `judge.checkpoints` are reviewed alone right after they close. There is no revision
 loop: the host admits one repair row.

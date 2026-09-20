@@ -148,3 +148,23 @@ work. All of it is gone. What replaced it: task-local verify bound to file
 bytes, one package review per run gated on high findings, a flat call budget,
 one retry on a dirty tree, and a bounded worker packet. The archive branch
 `archive/codex-rework-20260918` keeps the removed code for reference.
+
+## 10. Removed on 2026-09-20, and why
+
+The lean rebuild still let the review write queue rows: every finding below
+high became a TODO row, and the review plus the full oracle ran at the end of
+every run. Runs were launched one task at a time, and review rows were
+reviewed like any other row. Measured over two days on two projects: 165 rows
+made from findings, 36 of them closed; on one project a third of the worker
+time went into them and 27 of 28 reviews covered a single task; on the other
+the full oracle took longer than the work (8.1 h against 5.8 h). One block of
+string parsing took four rounds and two hours for a few lines of wording.
+
+A first repair bounded the chain (a generation counter on review rows and a
+configurable depth); a second added a history check with three thresholds
+fitted to one project. Both were removed the same day. Bounding a loop keeps
+the loop. What replaced them is section 2 applied to the review: a reviewing
+model is not an acceptance authority, so it can block a package and cannot
+create work; the review and the full oracle belong to the package boundary;
+a failed review gets one repair round. No thresholds (docs/autonomy.md
+section 5).

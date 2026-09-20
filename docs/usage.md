@@ -126,11 +126,13 @@ the next CLI takes over without burning an attempt.
   (`<!-- task:ID verify: {"cmd": ..., "timeout_s": N} -->`); the worker runs
   `flow verify --task ID` and the hook accepts the DONE commit while the
   declared files keep the tested bytes.
-- **One review per run.** With `judge.enabled`, a read-only reviewer reads
-  the run's commits once. It passes unless it reports a high finding; lesser
-  findings become TODO rows for the next run. No revision loop, no score
-  threshold.
-- **Full acceptance once.** After the review the runner runs `verify_cmd`
+- **One review per package.** With `judge.enabled`, a read-only reviewer reads
+  the commits once, when the queue has no TODO left; tasks closed by earlier
+  runs are included. It passes unless it reports a high finding. Lesser
+  findings are kept in `REVIEW-NOTES.md` next to the queue and never become
+  rows: work enters the queue only through planning. No revision loop, no
+  score threshold.
+- **Full acceptance once.** After that review the runner runs `verify_cmd`
   once and stops with `full_acceptance_failed` when it fails.
 - **Bounded spend.** `max_model_calls` and `run_timeout_s` cap a run.
 - **Irreversible actions need prior approval.** A task whose declared files
@@ -147,8 +149,8 @@ the next CLI takes over without burning an attempt.
 | `worker_left_changes:<id>` | Two attempts left the tree dirty without closing the task |
 | `scope_request:<id>` / `prompt_too_large:<id>` | Widen or split the task |
 | `no_workers` | Every CLI is benched; wait for the cooldown |
-| `review_failed:<ids>` | The reviewer found something high; admit one repair row |
-| `review_loop:<file>` | A review row got another required finding on its own file; admit one structural repair row instead of another patch, or accept the residuals in `REVIEW-RESIDUALS.md` |
+| `review_failed:<ids>` | The reviewer found something high; admit one repair row tagged `origin: review` |
+| `review_loop:<file>` | The repair row drew another high finding on its own file; no second repair row: revise the spec or decide to accept the risk |
 | `full_acceptance_failed:<ids>` | The full oracle fails after the run; admit one repair row |
 | `needs_approval:<id>` | Add the task's `approved:` line after reading its scope |
 

@@ -1,4 +1,4 @@
-# flow-run autonomy: probe, one review per run, one full acceptance, bounded spend
+# flow-run autonomy: probe, one review and one full acceptance per package, bounded spend
 
 > Design contract for the unattended half of `gate/gate.py` and the
 > `flow-run` / `run-queue` skills. Config keys below are the single source of
@@ -61,54 +61,67 @@ Probes count against `max_model_calls`.
   task-scoped verdict bound to the bytes of the declared files. The commit
   hook accepts the DONE flip of that task while those bytes are unchanged.
 - `gate.py verify --queue` runs the full `verify_cmd`. The runner does this
-  once after the review, journals `full_acceptance`, and stops with
-  `full_acceptance_failed:<ids>` when it fails. Nothing is rolled back.
+  once per package, after the review (section 5), journals `full_acceptance`,
+  and stops with `full_acceptance_failed:<ids>` when it fails. Nothing is
+  rolled back.
 - No verdict cache. Re-running a local check is the cheap path.
 
-## 5. One review per run
+## 5. The review is a gate, once per package
 
-When `judge.enabled` is true, after the last task of the run closes the
-runner spawns the review chain once with `judge_prompt` (tasks, commit range,
-declared files, verify tail). Rows listed in `judge.checkpoints` are reviewed
-on their own right after they close.
+Three rules. None has a threshold to tune, so none is fitted to a project.
+
+**1. A review blocks or it does not. It never creates work.** With
+`judge.enabled`, the review chain reads the commits once with `judge_prompt`
+(tasks, commit range, declared files, verify tail).
 
 - Pass: verdict `pass` and no `high` finding. The score is recorded, never
-  gated on. A single-model score varies by several points between rounds; a
-  threshold on it is a coin flip, and the five-round revise loop it produced
-  on a real project is why this design exists.
-- Every finding carries `action`: `required` (the acceptance is not met, or a
-  nameable defect remains), `optional` (an improvement) or `none` (an
-  observation). A missing value counts as `required`. The definition is
-  appended to the review prompt after the project's `judge_prompt`, so an
-  override cannot drop it.
-- `required` medium and low findings on a passing review become TODO rows of
-  the same package (`<!-- task:ID origin: review -->`, scope from the
-  finding's file), admitted like any other row on the next run.
-- Review rows are reviewed too, so the chain is bounded. A row carries
-  `<!-- task:ID gen: N -->`: one more than the generation of the task the
-  finding landed on (the task that declared the finding's file; without one,
-  the highest among the reviewed tasks). Ordinary rows are generation 0; an
-  `origin: review` row without `gen` counts as 1. A finding on a task already
-  at `review_rows.max_gen` (default 1) creates no row.
-- A `required` medium finding on a file that a review row declared itself
-  means patching is not converging. No row is created; the run stops with
-  `review_loop:<file>` and the report asks the host for one structural repair
-  row. The 2026-09-19 incident this rule comes from: four generations of
-  patch rows on one block of string parsing, about two hours and five full
-  oracles for a few lines of wording.
-- No finding is dropped. Those that do not become rows are the residual
-  record, in full (severity, action, reason, file, issue, fix): the
-  `review_residuals` journal event, a residuals block in the report's Review
-  section, and `REVIEW-RESIDUALS.md` next to the queue file, committed
-  together with the queue. It lives there because `.gate/` is gitignored in
-  some projects and the queue's directory is the one tracked place the gate
-  already commits to.
-- None of this touches `high` findings: they always fail the review, whatever
-  their action or the generation, and never enter the residual record.
-- Fail: stop with `review_failed:<ids>` and the findings in the report. The
-  host admits one repair task; the runner never revises on its own.
-- Chain down or unparsable: `review_skipped`, the run continues to full
-  acceptance, the report says so. Visibility replaces a silent quality-off.
+  gated on: a single-model score moves by several points between rounds, and a
+  threshold on it produced a five-round revise loop on a real project.
+- Every finding carries `action` (`required`, `optional`, `none`; a missing
+  value reads as `required`). Its definition is appended after the project's
+  `judge_prompt`, so an override cannot drop it. It is information for the
+  people planning the next work; the runner gates on nothing but `high`.
+- Findings below high are recorded in full and never become queue rows: the
+  `review_findings` journal event, the report's Review section, and
+  `REVIEW-NOTES.md` next to the queue file, committed (`.gate/` is gitignored
+  in some projects; the queue's directory is the one tracked place the gate
+  already commits to). What is worth doing from that record enters the queue
+  the way all work does: planned through `$flow`, with an acceptance of its
+  own. Acceptance is a command and its exit code (design.md section 2); a
+  reviewing model is not an acceptance authority, and any new diff gives it
+  something to say, so a review that feeds the queue has no last round.
+- Chain down or unparsable: `review_skipped`, the full acceptance still runs,
+  the report says so. Visibility replaces a silent quality-off.
+
+**2. The boundary is the package, not the run.** The review and the full
+oracle run when the queue has no eligible TODO left, and cover every task
+closed since the last full acceptance, including tasks of earlier runs
+(`task_done` events in the journal; a `full_acceptance` event or a failed
+review closes the boundary). A run that ends with TODO rows left reports the
+closed tasks as deferred and costs nothing more. A run that finds nothing to
+dispatch but tasks still waiting closes the package. Rows in
+`judge.checkpoints` are still reviewed alone right after they close, and
+`gate.py review --tasks <ids>` reviews on demand.
+
+**3. A failed review gets one repair round.** `review_failed:<ids>` stops the
+run with the findings; the host admits one repair row for all of them, tagged
+`<!-- task:ID origin: review -->`. When that row draws another high finding on
+a file it declared itself, the stop is `review_loop:<file>`: a second repair
+row is not admissible, the answer is a spec revision or the user's decision
+to accept the risk. The runner never revises on its own. The gate cannot see
+who wrote a row, so tagging the repair row is the host's duty under the
+`flow-run` skill; everything else in this section is mechanical.
+
+Why, measured on the three live projects between 2026-09-18 and 2026-09-20,
+when findings below high became TODO rows and the boundary was the run:
+
+| measurement | value |
+|---|---|
+| reviews that covered exactly one task (alltom) | 27 of 28 |
+| full oracle time against worker time (AugurNext) | 8.1 h against 5.8 h |
+| rows made from findings, and closed (both projects) | 165 made, 36 closed |
+| share of worker time spent on those rows (alltom) | 5.5 h of 16.6 h |
+| one block of string parsing (alltom, 2026-09-19) | 4 rounds, 5 full oracles, about 2 h, a few lines of wording |
 
 ## 6. Spend
 
@@ -143,7 +156,7 @@ and the host decides whether to start one.
 
 Events: `probe`, `attempt_start`, `heartbeat`, `task_done`, `scope_drift`, `worker_left_changes`,
 `scope_request`, `prompt_too_large`, `review_start`, `review_verdict`,
-`review_skipped`, `review_rows_added`, `review_residuals`, `full_acceptance`, `needs_approval`,
+`review_skipped`, `review_findings`, `full_acceptance`, `needs_approval`,
 `task_end`, `tool_disabled`, `run_end`.
 
 Stop reasons that need a human: `review_failed:<ids>`, `review_loop:<file>`,
@@ -153,5 +166,6 @@ Stop reasons that need a human: `review_failed:<ids>`, `review_loop:<file>`,
 ## 10. What the user reads
 
 `RUN-REPORT.md`: the task table, a **Review** section, a **Full acceptance**
-line, and **Waiting on you**, which is empty on a clean run and is the only
+line (or the note that both are deferred to the package boundary), and
+**Waiting on you**, which is empty on a clean run and is the only
 section the user has to read.
