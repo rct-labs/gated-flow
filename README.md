@@ -26,8 +26,14 @@ Unattended agents converge on a specific lie: a commit that flips a task to
 DONE while touching only the queue file. The engine in `gate/` closes that hole
 mechanically — a git `pre-commit` hook derives the verdict from the diff and the
 acceptance command's exit code, so there is no field to lie in. Everything else
-here (admission control, journal narration, one package review per run) is
+here (admission control, journal narration, stage and impact checks) is
 built on that one property. `docs/design.md` is the contract.
+
+Development and module batches run scoped checks; integration adds interface
+checks; delivery runs complete acceptance. Ordinary defects are recorded and
+batched at checkpoints, while safety and due acceptance defects block the
+affected scope. Repair reviews check original defects and direct regressions,
+not the entire system again. See [the stage policy](docs/autonomy.md).
 
 ## How the pieces fit
 

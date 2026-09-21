@@ -171,6 +171,13 @@ configurable depth); a second added a history check with three thresholds
 fitted to one project. Both were removed the same day. Bounding a loop keeps
 the loop. What replaced them is section 2 applied to the review: a reviewing
 model is not an acceptance authority, so it can block a package and cannot
-create work; the review and the full oracle belong to the package boundary;
-a failed review gets one repair round. No thresholds (docs/autonomy.md
-section 5).
+create work; review and acceptance belong to a planned boundary, not every
+worker invocation. The later stage-aware contract is in docs/autonomy.md.
+
+Repair verification is now explicitly targeted: original blockers and direct
+repair regressions, not a fresh audit. No-progress on stable defect ids stops
+repeated repair; a fixed one-round limit is no longer the policy. Development,
+module and integration checks follow impact; delivery requires the full oracle.
+Ordinary defects have checkpoints instead of automatically creating tasks.
+New task IDs do not reset the delivery budget. Small reversible tools default to
+acceptance without a model review; sensitive invariants retain focused review.

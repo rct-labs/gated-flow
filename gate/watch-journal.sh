@@ -11,7 +11,7 @@
 set -u
 repo="${1:?repo}"; mode="${2:?N or --selftest}"
 journal="$repo/.gate/journal.ndjson"
-pattern='"event": ?"(run_start|attempt_start|task_done|judge_verdict|revision_start|revision_end|judge_escalated|judge_skipped|needs_approval|task_end|tool_disabled|admit_refused|run_end)"'
+pattern='"event": ?"(run_start|attempt_start|task_done|review_start|review_verdict|review_skipped|review_findings|stage_acceptance|full_acceptance|full_acceptance_wait|scope_request|prompt_too_large|needs_approval|task_end|tool_disabled|admit_refused|run_end)"'
 filter() { grep --line-buffered -oE "^.{0,320}" | grep --line-buffered -E "$pattern"; }
 if [ "$mode" = "--selftest" ]; then
   n=$(tail -n 400 "$journal" | filter | wc -l)

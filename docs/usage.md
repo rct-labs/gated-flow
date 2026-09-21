@@ -126,17 +126,25 @@ the next CLI takes over without burning an attempt.
   (`<!-- task:ID verify: {"cmd": ..., "timeout_s": N} -->`); the worker runs
   `flow verify --task ID` and the hook accepts the DONE commit while the
   declared files keep the tested bytes.
-- **One review per package.** With `judge.enabled`, a read-only reviewer reads
+- **One review per batch.** With `judge.enabled`, a read-only reviewer reads
   the commits once, when the queue has no TODO left; tasks closed by earlier
-  runs are included. It passes unless it reports a high finding. Lesser
-  findings are kept in `REVIEW-NOTES.md` next to the queue and never become
-  rows: work enters the queue only through planning. No revision loop, no
-  score threshold.
-- **Full acceptance once.** After that review the runner runs `verify_cmd`
-  once and stops with `full_acceptance_failed` when it fails. Several projects
+  runs are included. Current-scope safety and due acceptance defects block;
+  ordinary defects go to `REVIEW-NOTES.md` with stable BUG ids and checkpoints.
+  They never automatically become rows. No automatic revision loop, no
+  score threshold. Ordinary small reversible tools leave review off by default;
+  sensitive behavior gets a focused review. Repairs verify the original
+  blockers and direct regressions only, not another general audit.
+- **Stage and impact select checks.** Set `delivery.stage` to development,
+  module, integration or delivery. Declare each task's `impact: local`,
+  `shared` or `unknown`; shared work needs caller checks in `delivery.checks`.
+  Full acceptance is for delivery, broad or unknown impact; local batches use
+  task checks and mapped callers. Integration also runs `integration_cmd`.
+  Missing declarations conservatively fall back to full checks. Several projects
   can run at the same time on one machine; their full oracles take turns, so
   one never slows another into false failures.
-- **Bounded spend.** `max_model_calls` and `run_timeout_s` cap a run.
+- **Bounded spend.** `max_model_calls` and `run_timeout_s` cap a run. The host
+  also carries the agreed delivery budget across restarts in CONTEXT; this
+  cumulative planning limit is not enforced by an engine ledger.
 - **Irreversible actions need prior approval.** A task whose declared files
   hit `irreversible_globs` runs only with `<!-- task:ID approved: <who/date> -->`.
 
@@ -144,19 +152,27 @@ the next CLI takes over without burning an attempt.
 
 | Stop reason | Meaning |
 |---|---|
-| `queue_empty` | Everything ran, also when the task limit was reached on the last row; the package was reviewed and accepted |
+| `queue_empty` | The batch closed at its configured stage; this is not automatically product delivery |
 | `budget` / `budget:model_calls` / `run_timeout` | A configured limit with work left; start another run if you want more. The review and the full oracle wait for the package boundary |
 | `blocked:<id>` / `admit_refused:<id>` | The task needs decisions or a smaller shape |
 | `no_progress:<id>` / `not_done:<id>` | The system refused to record work it could not verify; read the log under `.gate/runs/<run-id>/` |
 | `worker_left_changes:<id>` | Two attempts left the tree dirty without closing the task |
 | `scope_request:<id>` / `prompt_too_large:<id>` | Widen or split the task |
 | `no_workers` | Every CLI is benched; wait for the cooldown |
-| `review_failed:<ids>` | The reviewer found something high; admit one repair row tagged `origin: review` |
-| `review_loop:<file>` | The repair row drew another high finding on its own file; no second repair row: revise the spec or decide to accept the risk |
+| `review_failed:<ids>` | Current-scope safety/due blockers or unclear acceptance; consolidate evidenced repairs tagged `origin: review` |
+| `review_loop:<location-or-task>` | Recorded repair blockers show no progress; diagnose the cause before dispatching again |
+| `stage_acceptance_failed:<ids>` | A selected check failed or a due defect is unresolved; read the named logs and defect records |
 | `full_acceptance_failed:<ids>` | The full oracle fails after the run; its whole output is in `.gate/runs/<run-id>/full-acceptance.log`; admit one repair row |
 | `needs_approval:<id>` | Add the task's `approved:` line after reading its scope |
 
 **Stopping is good. The only unacceptable outcome is a green light that lies.**
+
+At a planned checkpoint without new implementation tasks, use
+`flow verify --stage module --tasks A,B` or `flow verify --stage delivery`.
+New projects start in development; old configs keep full acceptance until an
+explicit stage is set. Read [autonomy.md](autonomy.md) for the complete mapping,
+defect-resolution and migration contract. A local PASS never substitutes for
+the delivery candidate's complete check.
 
 ## 3. The project is getting messy
 

@@ -134,6 +134,43 @@ class TaskLocalVerifyTests(unittest.TestCase):
             self.assertEqual(verdict["scope"], "queue")
             self.assertEqual(verdict["count"], 99)
 
+    def test_full_verdict_cannot_close_code_changed_after_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = local_repo(Path(td))
+            (repo / "eav2.txt").write_text("tested bytes", encoding="utf-8")
+            result = run(sys.executable, str(GATE), "verify", "--repo", str(repo), "--queue")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            (repo / "eav2.txt").write_text("different bytes", encoding="utf-8")
+            flip_done(repo, "EAV-2")
+            run("git", "-C", str(repo), "add", "TASK_QUEUE.md", "eav2.txt")
+            result = commit(repo, "close after stale full check")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("changed after full acceptance", result.stderr)
+
+    def test_full_candidate_fingerprint_tracks_non_ascii_filenames(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = local_repo(Path(td))
+            gate = load_gate_module()
+            cfg = gate.load_config(repo)
+            path = repo / "caf\u00e9.py"
+            path.write_text("x = 1\n", encoding="utf-8")
+            before = gate.candidate_fingerprint(repo, cfg)
+            path.write_text("x = 2\n", encoding="utf-8")
+            self.assertNotEqual(before, gate.candidate_fingerprint(repo, cfg))
+
+    def test_stage_verdict_cannot_close_an_individual_task(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = local_repo(Path(td))
+            gate = load_gate_module()
+            cfg = gate.load_config(repo)
+            (repo / "eav2.txt").write_text("implemented", encoding="utf-8")
+            gate.run_acceptance(repo, cfg, LOCAL_CHECK, scope="stage")
+            flip_done(repo, "EAV-2")
+            run("git", "-C", str(repo), "add", "TASK_QUEUE.md", "eav2.txt")
+            result = commit(repo, "close using checkpoint")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("stage checkpoint cannot close", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

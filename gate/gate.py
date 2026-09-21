@@ -24,8 +24,8 @@ Subcommands
   admit         sweet-spot admission report for every TODO task in the queue
   usage         probe every worker / judge CLI now; bench the quota-dead ones
   doctor        report what is configured and whether it is usable
-  run           unattended loop: probe, dispatch, verify, one review, one full acceptance
-  review        host-driven review of DONE tasks (--tasks A,B [--base SHA]) plus full acceptance
+  run           unattended loop: probe, dispatch, verify, risk review, stage acceptance
+  review        host-driven review of DONE tasks (--tasks A,B [--base SHA]) plus stage acceptance
 """
 
 from __future__ import annotations
@@ -74,6 +74,14 @@ DEFAULT_CONFIG = {
     # The acceptance oracle. Must exit non-zero when the requirement is violated.
     "verify_cmd": "uv run pytest tests -q",
     "verify_timeout_s": 1800,
+    # Missing stage declarations retain the old full-acceptance behavior.
+    # New flow projects explicitly start in development (flow/flow.py).
+    "delivery": {
+        "stage": "delivery",
+        "checks": [],  # {files: [globs], cmd: ..., timeout_s: ...}; includes callers
+        "full_globs": [],
+        "integration_cmd": "",
+    },
     # How the oracle reports its count, for the non-vacuity check.
     "count_regex": r"(\d+)\s+passed",
     # Paths whose git diff must be empty during a refactor package.
@@ -151,7 +159,7 @@ DEFAULT_CONFIG = {
     # a probe that never reached the provider (timeout, not installed, other
     # error) benches it for retry_s only — it must not occupy the quota window.
     "probe": {"enabled": True, "timeout_s": 90, "retry_s": 600},
-    # One read-only package review, then the full oracle once, when the queue
+    # One optional batch review, then selected stage checks, when the queue
     # has no eligible TODO left: the package boundary, not the run boundary, so
     # a run of one task does not pay a review and a full oracle for one task.
     # The review is a gate, never a source of work: it passes when its verdict
@@ -198,20 +206,45 @@ DEFAULT_CONFIG = {
 }
 
 FINDING_ACTIONS = ("required", "optional", "none")
+STAGES = ("development", "module", "integration", "delivery")
 
 # Appended to every review prompt after the project's judge_prompt has been
 # formatted, so a project override cannot drop the definition of `action`.
 JUDGE_ACTION_CONTRACT = (
+    "\n\nReview only the agreed acceptance and the changed behavior. A blocking "
+    "finding must state the concrete trigger, observed evidence or a traceable "
+    "code path, and the violated acceptance or safety invariant in its issue. "
+    "Missing tests alone, speculative misuse outside supported inputs, style, "
+    "future extensibility and preference are not high findings. Do not expand "
+    "acceptance or audit unrelated modules. Report all evidenced blockers in "
+    "this pass; do not hold findings back for another round.\n"
     "\n\nEvery finding carries `action`: 'required' when the acceptance is not met "
     "or a nameable defect remains and the code must change; 'optional' for an "
     "improvement the work is correct without; 'none' for an observation that "
-    "needs no change. No finding becomes a task on its own: a high finding blocks "
-    "the package, every other finding is recorded in full for the people planning "
-    "the next work. So never raise a severity or an action to get a finding noticed.\n"
+    "needs no change. No finding becomes a task on its own. Reserve high for "
+    "concrete safety/data-loss defects or a broken current core flow. Ordinary "
+    "defects may be deferred to a named checkpoint; recommendations do not block. "
+    "Set due to module, integration, delivery or backlog; use blocking='stage' "
+    "only when the agreed acceptance requires resolution by that stage, otherwise "
+    "blocking='none'. Include evidence in the issue. Reuse a BUG id from "
+    "REVIEW-NOTES.md when reporting the same defect; use an empty id for a new one. "
+    "Never raise severity to get noticed. verdict='revise' is a recommendation; "
+    "the gate decides whether findings block the current stage.\n"
     "If you could not read the repository or run your tools, you have no basis for a "
     "verdict: return verdict 'escalate', score 0, no findings, and the reason in "
     "revision_brief.\n"
     "Return ONLY JSON matching the schema."
+)
+
+REPAIR_REVIEW_CONTRACT = (
+    "\n\nTARGETED REPAIR VERIFICATION for: {repairs}. These tasks repair an "
+    "earlier review; they are NOT a new general review. Read their acceptance "
+    "and the prior findings referenced there. Check whether those defects are "
+    "fixed and whether the repair diff directly introduced a regression. Do "
+    "not search for unrelated pre-existing defects or add new requirements. "
+    "If an independently evidenced serious defect is encountered incidentally, "
+    "report it honestly and distinguish it from a repair regression. If the original findings "
+    "cannot be identified, escalate rather than substitute a broad audit.\n"
 )
 
 JUDGE_SCHEMA = {
@@ -229,10 +262,13 @@ JUDGE_SCHEMA = {
                     "issue": {"type": "string"},
                     "fix": {"type": "string"},
                     "action": {"type": "string", "enum": list(FINDING_ACTIONS)},
+                    "id": {"type": "string"},
+                    "blocking": {"type": "string", "enum": ["stage", "none"]},
+                    "due": {"type": "string", "enum": [*STAGES, "backlog"]},
                 },
                 # Codex strict structured output requires every property here.
                 # Empty strings represent findings without a location or fix.
-                "required": ["severity", "file", "issue", "fix", "action"],
+                "required": ["severity", "file", "issue", "fix", "action", "id", "blocking", "due"],
                 "additionalProperties": False,
             },
         },
@@ -828,6 +864,17 @@ def files_fingerprint(repo: Path, cfg: dict, files: list[str]) -> str:
     return h.hexdigest()[:16]
 
 
+def candidate_fingerprint(repo: Path, cfg: dict) -> str:
+    """Bind a full verdict to project content, excluding gate output/state flips."""
+    paths = git(repo, "ls-files", "-c", "-o", "--exclude-standard", "-z").split("\0")
+    ignored = [*cfg["doc_only_globs"], cfg["queue_file"], cfg["context_file"],
+               str(Path(cfg["queue_file"]).parent / REVIEW_NOTES_NAME).replace("\\", "/")]
+    files = [project_rel(cfg, p) for p in paths if p and in_project(cfg, p)
+             and (not p.startswith(GATE_DIR + "/") or p == GATE_DIR + "/" + CONFIG_NAME)
+             and not matches_any(project_rel(cfg, p), ignored)]
+    return files_fingerprint(repo, cfg, sorted(set(files)))
+
+
 # -------------------------------------------------------------- subcommands
 
 
@@ -1027,6 +1074,8 @@ def cmd_check_commit(args) -> None:
                 f"last verdict is {v.get('result')}, not PASS.",
                 json.dumps(v, indent=2, ensure_ascii=False),
             )
+        if v.get("scope") == "stage":
+            fail("a stage checkpoint cannot close an individual task; run verify --task <id>")
         if v.get("scope") == "task":
             # A task-local PASS closes exactly the task it measured, and only
             # while the declared files still hold the bytes that were tested.
@@ -1043,6 +1092,8 @@ def cmd_check_commit(args) -> None:
                     "Re-run: gate.py verify --task " + str(v["task"]),
                 )
         else:
+            if v.get("candidate_fingerprint") and candidate_fingerprint(repo, cfg) != v["candidate_fingerprint"]:
+                fail("project content changed after full acceptance; verify the current candidate")
             expected = end_baseline_for(repo, cfg, ":", flipped[0])
             if expected is not None and v.get("count") is not None:
                 if int(v["count"]) != int(expected):
@@ -1078,7 +1129,15 @@ def cmd_verify(args) -> None:
     `--queue` or no flag runs the full oracle (scope "queue")."""
     repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
-    if args.task:
+    if getattr(args, "stage", None):
+        if args.task or args.queue or args.cmd:
+            die("--stage cannot be combined with --task, --queue or --cmd")
+        cfg = dict(cfg, delivery=dict(sub_cfg(cfg, "delivery"), stage=args.stage))
+        tasks = [t.strip() for t in (getattr(args, "tasks", None) or "").split(",") if t.strip()]
+        if delivery_stage(cfg) != "delivery" and not tasks:
+            die("--tasks is required for a non-delivery stage check")
+        payload = run_stage_acceptance(repo, cfg, tasks, None)
+    elif args.task:
         cmd, timeout, files = task_verify_spec(repo, cfg, args.task)
         payload = run_acceptance(repo, cfg, args.cmd or cmd, task=args.task,
                                  timeout_s=timeout, files=files)
@@ -1092,6 +1151,109 @@ def cmd_verify(args) -> None:
     if payload["result"] != "PASS":
         print(payload["tail"], file=sys.stderr)
         raise SystemExit(2)
+
+
+def delivery_stage(cfg: dict) -> str:
+    stage = sub_cfg(cfg, "delivery").get("stage", "delivery")
+    if stage not in STAGES:
+        die(f"invalid delivery.stage: {stage!r}; choose {', '.join(STAGES)}")
+    return stage
+
+
+def stage_check_plan(repo: Path, cfg: dict, tasks: list[str], base: str | None) -> dict:
+    """Select checks from admitted impact and actual changes; unknown means full.
+
+    Maps are explicit engineering declarations, not dependency guesses based on
+    directory names. A local declaration must include a task check. Shared
+    changes need check mappings covering their declared and actual paths.
+    """
+    stage = delivery_stage(cfg)
+    policy = sub_cfg(cfg, "delivery")
+    full = lambda reason: {"stage": stage, "scope": "queue", "reason": reason,
+                           "checks": [{"cmd": cfg["verify_cmd"], "timeout_s": cfg["verify_timeout_s"]}]}
+    if stage == "delivery":
+        return full("delivery candidate requires complete acceptance")
+    text = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
+    rows = parse_queue(text)
+    if any(rows.get(t, {}).get("status") not in cfg["done_markers"] for t in tasks):
+        die("stage acceptance only covers DONE tasks")
+    declared = parse_task_files(text)
+    local = parse_task_verify(text)
+    impacts = dict(re.findall(r"<!--\s*task:(\S+)\s+impact:\s*(\w+)\s*-->", text))
+    files = {f for t in tasks for f in declared.get(t, [])}
+    if not tasks or not files:
+        return full("no bounded task scope")
+    if base:
+        # Verify the base exists: an invalid diff must not look like no changes.
+        git(repo, "rev-parse", "--verify", base)
+        changed = git(repo, "diff", "--name-only", base, "HEAD").splitlines()
+        ignored = [cfg["queue_file"], cfg["context_file"], "docs/work/**", REVIEW_NOTES_NAME]
+        actual = {project_rel(cfg, p) for p in changed if in_project(cfg, p)
+                  and not matches_any(project_rel(cfg, p), ignored)}
+        if actual - files:
+            return full("actual changes exceed declared impact: " + ", ".join(sorted(actual - files)))
+    if any(matches_any(f, policy.get("full_globs") or []) for f in files):
+        return full("shared infrastructure matched delivery.full_globs")
+    if any(impacts.get(t, "unknown") not in ("local", "shared") for t in tasks):
+        return full("impact is undeclared or unknown")
+    selected: list[dict] = []
+    covered: set[str] = set()
+    affected_patterns = set(files)
+    for rule in policy.get("checks") or []:
+        matched = {f for f in files if matches_any(f, rule.get("files") or [])}
+        if matched and str(rule.get("cmd") or "").strip():
+            selected.append({"cmd": rule["cmd"], "timeout_s": int(rule.get("timeout_s", cfg["verify_timeout_s"]))})
+            covered.update(matched)
+            affected_patterns.update(rule["files"])
+    for tid in tasks:
+        if tid not in local:
+            return full(f"{tid} has no admitted task check")
+        if impacts[tid] == "shared" and set(declared.get(tid, [])) - covered:
+            return full(f"{tid} has shared impact without complete caller-check mappings")
+        selected.append(local[tid])
+    if stage == "integration":
+        cmd = policy.get("integration_cmd")
+        if not cmd:
+            return full("integration check is undeclared")
+        selected.append({"cmd": cmd, "timeout_s": cfg["verify_timeout_s"]})
+    unique = {c["cmd"]: c for c in selected}
+    return {"stage": stage, "scope": "stage", "reason": "admitted task checks and affected callers",
+            "checks": list(unique.values()),
+            "affected": sorted(affected_patterns) if stage != "integration" else None}
+
+
+def run_stage_acceptance(repo: Path, cfg: dict, tasks: list[str], base: str | None,
+                         run_dir: Path | None = None, run_id: str = "") -> dict:
+    plan = stage_check_plan(repo, cfg, tasks, base)
+    run_dir = run_dir or repo / GATE_DIR
+    print(f"GATE: {plan['stage']} acceptance ({plan['scope']}): {plan['reason']}")
+    blockers = open_stage_defects(repo, cfg, plan.get("affected"))
+    if blockers:
+        payload = {"result": "FAIL", "exit_code": 1, "count": None, "cmd": "defect checkpoint",
+                   "elapsed_s": 0, "tail": "Unresolved checkpoint defects: " + ", ".join(blockers),
+                   "log": "", "scope": "stage", "head": git(repo, "rev-parse", "HEAD").strip(),
+                   "at_epoch": time.time()}
+    else:
+        checked = []
+        for i, check in enumerate(plan["checks"]):
+            checked.append(run_acceptance(repo, cfg, check["cmd"], timeout_s=check["timeout_s"],
+                           scope=plan["scope"], log_path=run_dir / (
+                               "full-acceptance.log" if plan["scope"] == "queue" else f"stage-acceptance-{i+1}.log")))
+            if checked[-1]["result"] != "PASS":
+                break
+        payload = dict(checked[-1], elapsed_s=round(sum(c["elapsed_s"] for c in checked), 1))
+        payload["checks"] = [{k: c[k] for k in ("cmd", "result", "count", "log")} for c in checked]
+    payload.update(stage=plan["stage"], selection_reason=plan["reason"], tasks=tasks,
+                   affected=plan.get("affected"),
+                   full_suite=plan["scope"] == "queue" and not blockers,
+                   unverified="" if plan["scope"] == "queue" and not blockers else "unrelated modules; full delivery acceptance not established")
+    write_verdict(repo, payload)
+    journal(repo, {"event": "full_acceptance" if payload["full_suite"] else "stage_acceptance",
+                   "run": run_id, "tasks": tasks, "stage": plan["stage"],
+                   "result": payload["result"], "count": payload["count"],
+                   "seconds": payload["elapsed_s"], "log": payload["log"],
+                   "reason": plan["reason"], "head": payload["head"]})
+    return payload
 
 
 def _try_os_lock(handle) -> bool:
@@ -1162,7 +1324,8 @@ def full_oracle_turn(repo: Path, cfg: dict):
 
 def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
                    task: str | None = None, timeout_s: int | None = None,
-                   files: list[str] | None = None, log_path: Path | None = None) -> dict:
+                   files: list[str] | None = None, log_path: Path | None = None,
+                   scope: str | None = None) -> dict:
     """Run an acceptance command, write the verdict, return it. Shared by
     `verify` and by the runner's own full acceptance at the end of a run.
     A task-scoped verdict records the task and a fingerprint of its declared
@@ -1173,27 +1336,31 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
     not their tracebacks, and an oracle that takes twenty minutes must not
     have to run again just to be read."""
     cmd = cmd or cfg["verify_cmd"]
+    candidate = candidate_fingerprint(repo, cfg) if task is None and scope != "stage" else ""
     # The oracle runs where the project lives, not at the repo root — a repo
     # can host several projects.
     workdir = repo / (cfg.get("project_prefix") or "")
 
     # The full oracle takes its turn on the machine; a task-local check does not.
-    turn = full_oracle_turn(repo, cfg) if task is None else contextlib.nullcontext(0.0)
+    turn = full_oracle_turn(repo, cfg) if task is None and scope != "stage" else contextlib.nullcontext(0.0)
     with turn as waited:
         print(f"GATE: running acceptance command in {workdir}: {cmd}")
         started = time.time()
-        proc = subprocess.run(
-            cmd,
-            cwd=str(workdir),
-            shell=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout_s or cfg["verify_timeout_s"],
-        )
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(workdir), shell=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=timeout_s or cfg["verify_timeout_s"],
+            )
+        except subprocess.TimeoutExpired as exc:
+            output = exc.stdout or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            proc = subprocess.CompletedProcess(cmd, 124, output, "Acceptance command timed out")
         elapsed = round(time.time() - started, 1)
     output = (proc.stdout or "") + (proc.stderr or "")
+    content_changed = bool(candidate and candidate_fingerprint(repo, cfg) != candidate)
+    if content_changed:
+        output += "\nProject content changed during full acceptance; verify a stable candidate."
     quality = quality_phase(repo, cfg, "task")
     if quality is not None:
         output += "\n" + quality["tail"]
@@ -1214,6 +1381,8 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
         count = int(m.group(1))
 
     result = "PASS" if proc.returncode == 0 else "FAIL"
+    if content_changed:
+        result = "FAIL"
     if quality is not None and quality["result"] != "PASS" and quality_required(cfg):
         result = "FAIL"
 
@@ -1231,7 +1400,8 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
         "at_epoch": time.time(),
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "head": git(repo, "rev-parse", "HEAD", check=False).strip(),
-        "scope": "task" if task else "queue",
+        "candidate_fingerprint": candidate,
+        "scope": "task" if task else (scope or "queue"),
         "task": task,
         "files": sorted(files or []),
         "fingerprint": files_fingerprint(repo, cfg, files or []) if task else "",
@@ -1940,6 +2110,9 @@ def normalize_judge_verdict(obj: dict) -> dict:
                 "fix": f.get("fix") or "",
                 # A missing or unknown action is `required`, the stronger reading.
                 "action": f.get("action") if f.get("action") in FINDING_ACTIONS else "required",
+                "id": str(f.get("id") or ""),
+                "blocking": "stage" if f.get("blocking") == "stage" else "none",
+                "due": f.get("due") if f.get("due") in (*STAGES, "backlog") else "backlog",
             })
     return {
         "score": int(obj["score"]),
@@ -2049,13 +2222,15 @@ def review_package(
     Returns {"final": pass|failed|skipped, "score", "verdict", "member",
     "findings", "brief", "tasks"}. Passing means verdict "pass" and no
     high-severity finding. The queue rows are never touched; lesser findings
-    are appended as TODO rows by the caller.
+    are recorded as notes. Repair tasks receive targeted verification only.
     """
     jcfg = sub_cfg(cfg, "judge")
     head = git(repo, "rev-parse", "HEAD").strip()
     commits = [c[:10] for c in git(repo, "rev-list", f"{base_head}..{head}", check=False).split()]
     files = sorted({f for t in tasks for f in files_by_task.get(t, [])})
     v = read_verdict(repo) or {}
+    qtext = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
+    repairs = [t for t in tasks if t in parse_review_origin(qtext)]
     template = review_prompt_template(cfg)
     if template is not cfg.get("judge_prompt"):
         journal(repo, {"event": "judge_prompt_reset",
@@ -2065,7 +2240,13 @@ def review_package(
         commits=", ".join(commits) or head[:10],
         files=", ".join(files) or "(undeclared)",
         verify_tail=(v.get("tail") or "")[-1500:],
-    ) + JUDGE_ACTION_CONTRACT
+    )
+    if repairs:
+        prompt += REPAIR_REVIEW_CONTRACT.format(repairs=", ".join(repairs))
+    prompt += (f"\nCurrent stage: {delivery_stage(cfg)}. Read REVIEW-NOTES.md if present "
+               "for existing defect ids and due checkpoints. Do not turn ordinary "
+               "development defects into delivery blockers.\n")
+    prompt += JUDGE_ACTION_CONTRACT
     tag = "review-" + "-".join(tasks)[:60]
     journal(repo, {"event": "review_start", "tasks": tasks, "commit": head})
     print(f"  review of {', '.join(tasks)} ...")
@@ -2076,26 +2257,29 @@ def review_package(
         return {"final": "skipped", "reason": member, "tasks": tasks, "findings": [],
                 "score": None, "verdict": None, "member": None, "brief": ""}
     high = [f for f in verdict["findings"] if f.get("severity") in ("high", "critical")]
-    passed = verdict["verdict"] == "pass" and not high
+    affected = stage_check_plan(repo, cfg, tasks, base_head).get("affected")
+    blockers = [f for f in verdict["findings"] if finding_blocks(f, delivery_stage(cfg))
+                and defect_in_scope(f, affected)]
+    # A model's request to polish ordinary defects must not overrule stage policy.
+    passed = verdict["verdict"] != "escalate" and not blockers
     info = {"final": "pass" if passed else "failed", "reason": "" if passed else
-            (f"{len(high)} high finding(s)" if high else f"verdict {verdict['verdict']}"),
+            (f"{len(high)} high finding(s)" if high else
+             f"{len(blockers)} checkpoint defect(s)" if blockers else f"verdict {verdict['verdict']}"),
             "score": verdict["score"], "verdict": verdict["verdict"], "member": member,
             "findings": verdict["findings"], "brief": verdict["revision_brief"],
             "tasks": tasks}
-    # One repair round per failed review. A repair row (`origin: review`) that
-    # draws another high finding on a file it declared itself is not
-    # converging; the answer is a spec revision, not a second repair row.
-    qtext = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
-    repairs = parse_review_origin(qtext)
-    for f in high:
-        if any(t in repairs and f.get("file") and f["file"] in files_by_task.get(t, [])
-               for t in tasks):
-            info["loop_file"] = f["file"]
-            break
+    # Stop on unchanged blockers, not simply because this is a repair task.
+    # Persisted ids survive line changes and process restarts; never compare
+    # raw 'file.py:359' strings with declared file paths.
+    blocker_ids = sorted(defect_id(f) for f in blockers)
+    previous = last_review_blockers(repo, blocker_ids)
+    if repairs and blocker_ids and previous and set(previous) <= set(blocker_ids):
+        info["loop_file"] = finding_path(blockers[0].get("file") or repairs[0])
     record_review_findings(repo, cfg, info)
     journal(repo, {"event": "review_verdict", "tasks": tasks, "score": verdict["score"],
                    "verdict": verdict["verdict"], "member": member,
-                   "findings": len(verdict["findings"]), "high": len(high), "passed": passed})
+                   "findings": len(verdict["findings"]), "high": len(high), "passed": passed,
+                   "blocker_ids": blocker_ids, "stage": delivery_stage(cfg)})
     print(f"  review ({member}): {verdict['verdict']}, score {verdict['score']}, "
           f"{len(verdict['findings'])} finding(s), {len(high)} high")
     notify(cfg, repo, f"review of {', '.join(tasks)}: {info['final']} ({member})",
@@ -2106,22 +2290,114 @@ def review_package(
 REVIEW_NOTES_NAME = "REVIEW-NOTES.md"
 
 
+def finding_path(value: str) -> str:
+    value = value.strip().strip("`").replace("\\", "/")
+    return re.sub(r":\d+(?::\d+)?(?:-\d+)?$", "", value)
+
+
+def defect_id(finding: dict) -> str:
+    import hashlib
+    explicit = finding.get("id") or ""
+    if re.fullmatch(r"BUG-[a-f0-9]{12}", explicit):
+        return explicit
+    key = finding_path(finding.get("file") or "") + "\n" + " ".join(finding["issue"].lower().split())
+    return "BUG-" + hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
+def finding_blocks(finding: dict, stage: str) -> bool:
+    if finding.get("severity") in ("high", "critical"):
+        return True
+    due = finding.get("due", "backlog")
+    return (finding.get("blocking") == "stage" and finding.get("action", "required") == "required" and due in STAGES
+            and STAGES.index(stage) >= STAGES.index(due))
+
+
+def review_notes_path(repo: Path, cfg: dict) -> Path:
+    return repo / Path(prefixed(cfg, cfg["queue_file"])).parent / REVIEW_NOTES_NAME
+
+
+def recorded_defects(repo: Path, cfg: dict) -> dict[str, dict]:
+    """Metadata stays in the existing human-readable notes, not a second queue.
+
+    Older unstructured entries remain readable. New records have stable ids,
+    a due checkpoint, status and resolution evidence. Latest record wins.
+    """
+    path = review_notes_path(repo, cfg)
+    records: dict[str, dict] = {}
+    if path.exists():
+        for raw in re.findall(r"^<!-- defect: (.*) -->$", path.read_text(encoding="utf-8"), re.M):
+            try:
+                item = json.loads(raw)
+                if (not isinstance(item, dict) or not re.fullmatch(r"BUG-[a-f0-9]{12}", item.get("id", ""))
+                        or item.get("status") not in ("open", "resolved", "deferred")
+                        or item.get("severity") not in ("low", "medium", "high", "critical")
+                        or item.get("action") not in FINDING_ACTIONS
+                        or item.get("blocking") not in ("none", "stage")
+                        or not isinstance(item.get("issue"), str) or not item["issue"].strip()
+                        or item.get("due") not in (*STAGES, "backlog")):
+                    raise ValueError("invalid defect metadata")
+            except (ValueError, TypeError):
+                die(f"invalid defect record in {path}; correct metadata before acceptance")
+            records[item["id"]] = item
+    return records
+
+
+def defect_in_scope(finding: dict, affected: list[str] | None) -> bool:
+    path = finding_path(finding.get("file") or "")
+    uncertain = path.startswith("/") or ":" in path or ".." in path.split("/")
+    return affected is None or not path or uncertain or matches_any(path.removeprefix("./"), affected)
+
+
+def open_stage_defects(repo: Path, cfg: dict, affected: list[str] | None = None) -> list[str]:
+    blocked = []
+    for key, item in recorded_defects(repo, cfg).items():
+        if item["status"] == "resolved" and str(item.get("resolution") or "").strip():
+            continue
+        # A status label alone cannot waive a known safety/current-stage defect.
+        if finding_blocks(item, delivery_stage(cfg)) and defect_in_scope(item, affected):
+            blocked.append(key)
+    return blocked
+
+
+def last_review_blockers(repo: Path, ids: list[str]) -> list[str]:
+    path = repo / GATE_DIR / "journal.ndjson"
+    if path.exists():
+        for line in reversed(path.read_text(encoding="utf-8").splitlines()):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            previous = event.get("blocker_ids") or []
+            if event.get("event") == "review_verdict" and set(previous) & set(ids):
+                return previous
+    return []
+
+
 def record_review_findings(repo: Path, cfg: dict, review: dict) -> None:
-    """Keep every finding below high, in full, and make none of them a task.
+    """Deduplicate defects in existing review notes; never create queue tasks.
 
-    A review is a gate: a high finding blocks the package, and that is all a
-    review can do to the queue. Until 2026-09-20 lesser findings became TODO
-    rows; measured on two real projects, 165 such rows produced 36 closed
-    tasks, a third of one project's worker time went into them, and the rows
-    were reviewed in turn, which has no end. What is worth doing from this
-    record enters the queue the way all work does: planned by the host, with
-    an acceptance of its own.
-
-    The record is the `review_findings` journal event and REVIEW-NOTES.md next
-    to the queue file, committed: .gate/ is gitignored in some projects and
-    the queue's directory is the one tracked place the gate already commits to.
-    High findings are not recorded here; they stop the run and are in the report."""
-    notes = [f for f in review.get("findings", []) if f.get("severity") not in ("high", "critical")]
+    Stable metadata supports checkpoint triage and verified resolution. Old
+    prose notes remain intact. A new finding for a resolved id reopens it.
+    """
+    existing = recorded_defects(repo, cfg)
+    notes = []
+    for finding in review.get("findings", []):
+        item = dict(finding, id=defect_id(finding))
+        old = existing.get(item["id"])
+        item.setdefault("action", "required")
+        item.setdefault("blocking", "none")
+        item.setdefault("due", "backlog")
+        if old:
+            # Reappearance reopens a resolved defect; repeating an open note
+            # does not generate duplicate bugs or reset its due checkpoint.
+            item["due"] = old["due"]
+            if old.get("blocking") == "stage":
+                item["blocking"] = "stage"
+            if old["status"] != "resolved" and all(old.get(k) == item.get(k) for k in
+                    ("severity", "action", "blocking", "due", "issue", "fix")):
+                continue
+        item.update(status="open", resolution="")
+        notes.append(item)
     if not notes:
         return
     journal(repo, {"event": "review_findings", "tasks": review["tasks"], "findings": notes})
@@ -2129,13 +2405,17 @@ def record_review_findings(repo: Path, cfg: dict, review: dict) -> None:
     path = repo / rel
     out = [] if path.exists() else [
         "# Review notes", "",
-        "Findings below high from package reviews (gate.py, append-only). A record for",
-        "planning, not a task list: none of these blocked its package.", ""]
+        "Defect and observation records, not an executable task list. Batch ordinary",
+        "defects at their due checkpoint. Resolve with verification evidence; record",
+        "a reason when deferring. Blocking defects cannot be waived by a status label.", ""]
     head = git(repo, "rev-parse", "--short", "HEAD", check=False).strip()
     out += [f"## {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())} - "
             f"{', '.join(review['tasks'])} ({review.get('member') or '-'}, at {head})", ""]
     for f in notes:
-        out += [f"- severity: {f['severity']} | action: {f.get('action', 'required')}",
+        out += [f"<!-- defect: {json.dumps(f, ensure_ascii=True)} -->",
+                f"### {f['id']}", "",
+                f"- severity: {f['severity']} | action: {f.get('action', 'required')}",
+                f"  - status: open | due: {f['due']} | blocking: {f['blocking']}",
                 f"  - file: {f.get('file') or '-'}",
                 f"  - issue: {f['issue']}",
                 f"  - fix: {f.get('fix') or '-'}"]
@@ -2149,7 +2429,7 @@ def record_review_findings(repo: Path, cfg: dict, review: dict) -> None:
 
 
 def pending_closeout(repo: Path) -> tuple[list[dict], set[str]]:
-    """Closed tasks that no full acceptance has covered yet, oldest first, and
+    """Closed tasks not yet covered by their acceptance checkpoint, oldest first, and
     the ids among them that a checkpoint review already passed.
 
     The package boundary is a journal fact: a `full_acceptance` event or a
@@ -2171,6 +2451,10 @@ def pending_closeout(repo: Path) -> tuple[list[dict], set[str]]:
             pending[e["task"]] = e
         elif kind == "review_verdict" and e.get("passed"):
             reviewed.update(e.get("tasks") or [])
+        elif kind == "stage_acceptance" and e.get("result") == "PASS":
+            for tid in e.get("tasks") or []:
+                pending.pop(tid, None)
+                reviewed.discard(tid)
         elif kind == "full_acceptance" or (kind == "review_verdict" and not e.get("passed")):
             pending.clear()
             reviewed.clear()
@@ -2675,8 +2959,8 @@ def cmd_run(args) -> None:
                            else f"review_failed:{tid}")
             break
 
-    # ---- closeout at the package boundary: one review of everything that
-    # closed since the last full acceptance, then the full oracle once. It waits
+    # ---- closeout at the batch boundary: optional review of pending tasks,
+    # then checks selected by stage and impact. It waits
     # for a queue with no eligible TODO, so runs of one task do not each pay for
     # a review and a full oracle; the tasks of earlier runs are in the journal.
     clean_stop = stop_reason in ("budget", "queue_empty", "run_timeout", "budget:model_calls")
@@ -2696,6 +2980,9 @@ def cmd_run(args) -> None:
         else:
             if stop_reason == "budget":
                 stop_reason = "queue_empty"  # the task limit was reached on the last row
+            first = pending[0]
+            base = first.get("base") or git(repo, "rev-parse", first["commit"] + "~1",
+                                            check=False).strip() or run_base
             if unreviewed:
                 declared = parse_task_files(qtext)
                 for t in unreviewed:
@@ -2709,13 +2996,10 @@ def cmd_run(args) -> None:
                                    if review_info.get("loop_file")
                                    else "review_failed:" + ",".join(unreviewed))
             if not stop_reason.startswith(("review_failed", "review_loop")):
-                print("GATE: full acceptance at the package boundary ...")
-                acceptance = run_acceptance(repo, cfg, log_path=run_dir / "full-acceptance.log")
-                journal(repo, {"event": "full_acceptance", "run": run_id, "tasks": ids,
-                               "result": acceptance["result"], "count": acceptance["count"],
-                               "seconds": acceptance["elapsed_s"], "log": acceptance["log"]})
+                acceptance = run_stage_acceptance(repo, cfg, ids, base, run_dir, run_id)
                 if acceptance["result"] != "PASS":
-                    stop_reason = "full_acceptance_failed:" + ",".join(ids)
+                    stop_reason = ("full_acceptance_failed:" if acceptance["full_suite"]
+                                   else "stage_acceptance_failed:") + ",".join(ids)
 
     elapsed = round(time.time() - started, 1)
     report = render_report(repo, cfg, run_id, results, stop_reason, elapsed,
@@ -2737,7 +3021,7 @@ def cmd_run(args) -> None:
 
     needs_human = stop_reason.split(":", 1)[0] in (
         "review_failed", "full_acceptance_failed", "needs_approval", "scope_request",
-        "prompt_too_large", "review_loop",
+        "prompt_too_large", "review_loop", "stage_acceptance_failed",
     )
     # A run that only closed out earlier tasks dispatched nothing and is fine.
     if any(r["outcome"] != "done" for r in results) or needs_human or not (results or acceptance):
@@ -2778,6 +3062,7 @@ def render_report(
         "",
         f"- elapsed: {elapsed}s",
         f"- stopped because: **{stop}**",
+        f"- stage: **{delivery_stage(cfg)}** (task DONE is not product delivery)",
         "",
         "| task | outcome | task attempts | worker dispatches | worker | pin |",
         "|---|---|---:|---:|---|---|",
@@ -2824,11 +3109,28 @@ def render_report(
                   "`gate.py review --tasks <ids>` reviews earlier on demand; its full "
                   "acceptance closes the boundary for every waiting task."]
     if acceptance:
-        lines += ["", "## Full acceptance", "",
+        lines += ["", "## Full acceptance" if acceptance.get("full_suite", True) else "## Stage acceptance", "",
                   f"- `{acceptance['cmd']}` -> **{acceptance['result']}** "
                   f"(exit {acceptance['exit_code']}, count {acceptance.get('count')}, "
                   f"{acceptance['elapsed_s']}s)"
                   + (f"; full output: `{acceptance['log']}`" if acceptance.get("log") else "")]
+        if acceptance.get("selection_reason"):
+            lines += [f"- selection: {acceptance['selection_reason']}"]
+        if acceptance.get("unverified"):
+            lines += [f"- not verified: {acceptance['unverified']}"]
+        if acceptance.get("result") != "PASS":
+            lines += [f"- failure: {acceptance.get('tail', '')[-800:]}"]
+        for check in acceptance.get("checks", []):
+            lines += [f"- check: `{check['cmd']}` -> {check['result']} (`{check['log']}`)"]
+    defects = recorded_defects(repo, cfg)
+    unresolved = [f for f in defects.values() if f.get("status") != "resolved" or not f.get("resolution")]
+    if unresolved:
+        lines += ["", "## Defect checkpoints", "", "| id | severity | status | due | blocks now |",
+                  "|---|---|---|---|---|"]
+        for f in unresolved:
+            lines.append(f"| {f['id']} | {f['severity']} | {f['status']} | {f['due']} | "
+                         f"{'yes' if finding_blocks(f, delivery_stage(cfg)) and defect_in_scope(f, (acceptance or {}).get('affected')) else 'no'} |")
+        lines += ["", "Batch ordinary defects by checkpoint; this is not an automatic task queue."]
 
     st = tool_state(repo)
     now = time.time()
@@ -2884,11 +3186,13 @@ def render_report(
         )
     if stop.startswith("review_loop:"):
         waiting.append(
-            f"- A repair row drew another high finding on its own file "
-            f"`{stop.split(':', 1)[1]}`. One repair round is the limit: a second patch "
-            "is not admissible. Read the Review section with the user, then revise the "
-            "spec (what the block must do, and the test that proves it) and queue that "
-            "as new planned work, or accept the risk in writing.")
+            f"- Repair made no progress on the recorded blockers at `{stop.split(':', 1)[1]}`. "
+            "Do not repeat the same patch strategy. Diagnose the common cause, report the "
+            "usable work and blocker, and decide whether a different approach fits the "
+            "remaining scope and budget. Task renaming does not erase defect history.")
+    if stop.startswith("stage_acceptance_failed:"):
+        waiting.append("- The stage checkpoint failed. Read the selected check logs or resolve "
+                       "the due defects with verification evidence; do not reopen a general audit.")
     if stop.startswith("full_acceptance_failed:"):
         tids = stop.split(":", 1)[1]
         waiting.append(
@@ -2943,8 +3247,11 @@ def render_report(
         lines.append("- The tasks are DONE and committed; the review, not the work, stopped "
                      "the run. Admit one repair row for the findings above, then run again.")
     elif stop.startswith("review_loop:"):
-        lines.append("- The repair did not converge. Do not admit another repair row; take the "
-                     "findings to the user and revise the spec.")
+        lines.append("- The same blockers remain. Diagnose the cause before further dispatch; "
+                     "escalate only if scope, risk acceptance or budget needs a user decision.")
+    elif stop.startswith("stage_acceptance_failed:"):
+        lines.append("- Fix the demonstrated checkpoint failure within its impact scope. "
+                     "Ordinary unrelated defects stay in the defect list.")
     elif stop.startswith("full_acceptance_failed:"):
         lines.append("- Local checks passed but the full oracle did not. Admit one repair "
                      "row with the failing test as its local check, then run again.")
@@ -2960,7 +3267,7 @@ def render_report(
 def cmd_review(args) -> None:
     """Host-driven review of DONE tasks outside a run: after a review chain
     outage, or for tasks closed by hand. Same chain, same pass rule, same
-    record of findings; then the full oracle once unless --no-acceptance."""
+    record of findings; then stage checks unless --no-acceptance."""
     repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
     tasks = [t.strip() for t in (args.tasks or "").split(",") if t.strip()]
@@ -2993,14 +3300,10 @@ def cmd_review(args) -> None:
             stop = (f"review_loop:{info['loop_file']}" if info.get("loop_file")
                     else "review_failed:" + ",".join(tasks))
     if (info is None or info["final"] != "failed") and not args.no_acceptance:
-        # Closes the package boundary for every task pending in the journal.
-        print("GATE: full acceptance ...")
-        acceptance = run_acceptance(repo, cfg, log_path=run_dir / "full-acceptance.log")
-        journal(repo, {"event": "full_acceptance", "run": run_id, "tasks": tasks,
-                       "result": acceptance["result"], "count": acceptance["count"],
-                       "seconds": acceptance["elapsed_s"], "log": acceptance["log"]})
+        acceptance = run_stage_acceptance(repo, cfg, tasks, base, run_dir, run_id)
         if acceptance["result"] != "PASS":
-            stop = "full_acceptance_failed:" + ",".join(tasks)
+            stop = ("full_acceptance_failed:" if acceptance["full_suite"]
+                    else "stage_acceptance_failed:") + ",".join(tasks)
     results = [{"task": t, "outcome": "done", "attempts": 0, "dispatches": 0,
                 "worker": "", "pin": "", "checkpoint": None} for t in tasks]
     report = render_report(repo, cfg, run_id, results, stop, 0.0, review=info, acceptance=acceptance)
@@ -3040,6 +3343,7 @@ def cmd_doctor(args) -> None:
     installed, hook_mode = hook_installation(repo)
     print(f"pre-commit gate : {'INSTALLED' if installed else 'not installed'} ({hook_mode})")
     print(f"verify_cmd      : {cfg['verify_cmd']}")
+    print(f"delivery stage  : {delivery_stage(cfg)}")
     if review_prompt_template(cfg) is not cfg.get("judge_prompt"):
         print("judge_prompt    : per-task template from an older engine; the default "
               "package-review prompt will be used (delete the key to silence this)")
@@ -3059,7 +3363,8 @@ def main() -> None:
         ("init", cmd_init, [("--force", "store_true")]),
         ("install-hook", cmd_install_hook, [("--force", "store_true")]),
         ("check-commit", cmd_check_commit, []),
-        ("verify", cmd_verify, [("--cmd", "str"), ("--task", "str"), ("--queue", "store_true")]),
+        ("verify", cmd_verify, [("--cmd", "str"), ("--task", "str"), ("--queue", "store_true"),
+                                ("--stage", "str"), ("--tasks", "str")]),
         ("audit", cmd_audit, [("--last", "int")]),
         ("admit", cmd_admit, []),
         ("usage", cmd_usage, []),

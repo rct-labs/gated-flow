@@ -105,10 +105,20 @@ A task whose declared files hit the project's `irreversible_globs`
 (migrations, `data/**`, hooks, settings) goes to the **tail** of the queue and
 is dispatched only with its own `<!-- task:ID approved: <who/date> -->` line.
 Write that line only when the user said yes to that task; otherwise `admit`
-shows `APPROVAL` and the run stops there for them. Every closed task is then
-scored by the read-only judge chain when the project enables `judge.enabled`;
-its acceptance in `spec.md` is what the judge reads, so write acceptance the
-judge can check.
+shows `APPROVAL` and the run stops there for them. Plan a usable vertical
+delivery, not a separate reviewed package for every module. Ordinary small
+reversible tools default to acceptance without model review. For sensitive
+behavior, keep one focused review at the delivery boundary when enabling
+`judge.enabled`; honor explicit project review requirements. Write concrete
+acceptance, supported inputs, non-goals and a delivery time budget in the spec.
+Repair acceptance preserves original findings and their evidence; repair
+verification is targeted, not a new audit. Plan development/module/integration/
+delivery checkpoints in the existing spec, along with test impact and defect
+due dates. Declare `<!-- task:ID impact: local|shared|unknown -->` (choose one).
+Shared changes include affected callers; an unknown impact expands verification.
+Group ordinary defects at checkpoints instead of creating a task per finding.
+Repeated repairs depend on measured progress and budget, not a fixed count;
+follow `flow-run`'s no-progress policy.
 
 Then run `flow admit --repo <project>` and show the report. A task refused
 admission is re-shaped now (split it, narrow it), not argued with later.

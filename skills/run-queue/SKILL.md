@@ -3,8 +3,8 @@ name: run-queue
 description: >
   $run: the launch protocol for a task queue that is already written and
   admitted. Admission-checked tasks, one worker process per task, a
-  machine-checked verdict after each, one review and one full acceptance
-  per package, progress reported as it happens, and a stop at the
+  machine-checked verdict after each, risk-based review and stage/impact
+  acceptance per batch, progress reported as it happens, and a stop at the
   first thing that needs a human. Normally loaded by $flow-run at its launch
   step. Use directly only when the user types $run or /run-queue, or asks to
   run the existing queue as it stands. Not for a single task, and not for
@@ -15,14 +15,24 @@ description: >
 
 You are the launcher and the narrator. The loop belongs to `gate.py run`: a
 deterministic script that spawns one CLI process per task, checks each
-commit with the pre-commit hook, reviews the closed tasks once and runs the
-full oracle once when the queue has no TODO left, and decides when to stop.
+commit with the pre-commit hook, reviews closed tasks when configured and runs
+selected stage checks when the queue has no TODO left, and decides when to stop.
 
 Why the loop is not you: an agent that supervises its own work can be talked
 out of stopping and can convince itself a task is done. The verdict comes
 from a command's exit code.
 
 ## 1. Find the runner and preflight
+
+Use the delivery scope and risk choice made by `flow-run`: ordinary small
+tools need acceptance, not an automatically enabled model review. Honor
+explicit project requirements. When review is enabled, review once at the
+delivery boundary; repairs get targeted verification of original blockers
+and directly introduced regressions, never another general audit. Preserve
+the original findings and BUG ids in the repair acceptance. Stage checks are
+selected by `delivery.stage` and declared impact; queue exhaustion is not
+product delivery. A new run does not reset the host-managed delivery budget.
+Further repair requires evidence of progress, not a fixed round allowance.
 
 `flow home` prints the checkout; `gate.py` is `<home>/gate/gate.py`.
 
@@ -47,8 +57,8 @@ the configured default. Do not ask again for decisions already settled.
 
 ## 3. Detach it from your session
 
-A task takes 30 to 60 minutes. A foreground call, and a background tool
-shell alike, can die with your session and orphan a worker mid-task. Launch
+An unattended task can outlive the interactive session. A foreground call,
+and a background tool shell alike, can die and orphan a worker mid-task. Launch
 through Task Scheduler, which owns the process:
 
 ```
@@ -75,9 +85,10 @@ Then watch the journal: append-only NDJSON at `<repo>/.gate/journal.ndjson`.
 | `scope_drift` | the task's commits touched undeclared paths; listed under Waiting on you, not a stop |
 | `scope_request` / `prompt_too_large` | needs the host; run stops |
 | `review_start` / `review_verdict` / `review_skipped` | the one package review (or a checkpoint); a skip reason `<member>:no_access` means that reviewer could not read the repository: fix its tool or sandbox, then `gate.py review --tasks <ids>` |
-| `review_findings` | findings below high, full text; recorded in the report and `REVIEW-NOTES.md`, never rows |
+| `review_findings` | defect records with stable ids and due checkpoints; recorded in `REVIEW-NOTES.md`, never automatic rows |
 | `full_acceptance_wait` | another project's full oracle is running on this machine; this one waits for its turn (`holder`), nothing is wrong |
-| `full_acceptance` | the full oracle after the review, once per package: `result`, `count` |
+| `full_acceptance` | complete suite selected for delivery or broad/unknown impact: `result`, `count`, `reason` |
+| `stage_acceptance` | selected local/module/integration checks or a due-defect stop; never proof of full delivery |
 | `needs_approval` | head task touches an irreversible path without approval |
 | `tool_disabled` | a CLI hit its quota and was benched |
 | `task_end` / `run_end` | outcome per task / stop reason |
@@ -88,7 +99,7 @@ gate.py writes `"event": "run_start"` with a space after the colon. Use the
 tolerant form and validate it against an earlier run before arming:
 
 ```
-'"event": ?"(run_start|attempt_start|task_done|worker_left_changes|scope_request|prompt_too_large|review_verdict|review_skipped|full_acceptance|needs_approval|task_end|tool_disabled|admit_refused|run_end)"'
+'"event": ?"(run_start|attempt_start|task_done|worker_left_changes|scope_request|prompt_too_large|review_verdict|review_skipped|stage_acceptance|full_acceptance|needs_approval|task_end|tool_disabled|admit_refused|run_end)"'
 grep -cE '<pattern>' <repo>/.gate/journal.ndjson     # must be > 0
 N=$(wc -l < <repo>/.gate/journal.ndjson)             # BEFORE launching
 ```
@@ -153,9 +164,10 @@ task did not close, quote the last lines of its log from `.gate/runs/<run-id>/`.
 | `prompt_too_large:<id>` | packet over `worker_packet_max_bytes` | shorten the spec acceptance or split |
 | `timeout:<id>` | worker exceeded `task_timeout_s` | check for a half-finished tree |
 | `no_workers` | every CLI is benched | wait for the cooldown (`.gate/tool-status.json`) |
-| `review_failed:<ids>` | review reported a high finding or did not pass | read the findings; admit ONE repair row for all the findings, tagged `<!-- task:ID origin: review -->` |
-| `review_loop:<file>` | the repair row (`origin: review`) drew another high finding on a file it declared | no second repair row; take the findings to the user: revise the spec, or accept the risk |
-| `full_acceptance_failed:<ids>` | the full oracle fails after the run | read the whole output in `.gate/runs/<run-id>/full-acceptance.log` (do not rerun the oracle to see it); admit one repair row with the failing test as its check |
+| `review_failed:<ids>` | safety/current-stage defects or ambiguous acceptance | consolidate evidenced blockers, preserve BUG ids and tag repairs `origin: review`; targeted verification only |
+| `review_loop:<location-or-task>` | recorded repair blockers show no progress | diagnose the common cause before another dispatch; escalate only for scope, risk or budget decisions |
+| `stage_acceptance_failed:<ids>` | a selected stage check failed or due defects remain open | read the named logs/defect records, fix within the affected scope |
+| `full_acceptance_failed:<ids>` | the full oracle fails | read `.gate/runs/<run-id>/full-acceptance.log`; repair the cause with a regression test, never blindly repeat it |
 | `needs_approval:<id>` | irreversible path without `approved:` | the user approves that task, then relaunch |
 
 Stopping is good. The only unacceptable outcome is a green light that lies.

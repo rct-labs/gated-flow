@@ -392,28 +392,63 @@ class ReviewIsAGateTests(ReviewHarness):
             self.assertNotIn("## Full acceptance", report)
             notes = (repo / "REVIEW-NOTES.md").read_text(encoding="utf-8")
             self.assertIn("issue: cosmetic", notes)   # no finding is dropped
-            self.assertNotIn("issue: wrong", notes)   # a high finding is a stop, not a note
+            self.assertIn("issue: wrong", notes)   # safety defects persist until verified resolved
 
-    def test_a_repair_row_gets_one_round(self) -> None:
+    def test_a_repair_stops_only_when_recorded_blockers_do_not_improve(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             (Path(td) / "own").mkdir()
             (Path(td) / "other").mkdir()
             repo = judged_runner_repo(Path(td) / "own", ["claude"])
             self._mark_repair_row(repo)
+            self.gate.journal(repo, {"event": "review_verdict", "passed": False,
+                                    "blocker_ids": [self.gate.defect_id(HIGH[0])]})
             judge, _ = self._judge([verdict(90, "pass", findings=HIGH)])  # high on eav2.txt
             report = self._run(repo, self._spawn([]), judge, expect_exit="3")
             self.assertIn("stopped because: **review_loop:eav2.txt**", report)
-            self.assertIn("One repair round is the limit", report)
-            self.assertIn("Do not admit another repair row", report)
+            self.assertIn("Repair made no progress", report)
             self.assertNotIn("## Full acceptance", report)
             self.assertEqual(self._events(repo, "run_end")[-1]["stop"], "review_loop:eav2.txt")
-            # A high finding elsewhere is an ordinary failed review.
+            # A genuinely different blocker is not automatically no-progress.
             repo = judged_runner_repo(Path(td) / "other", ["claude"])
             self._mark_repair_row(repo)
             judge, _ = self._judge([verdict(90, "pass", findings=[
                 self._finding("high", "wrong", file="other.txt")])])
             report = self._run(repo, self._spawn([]), judge, expect_exit="3")
             self.assertIn("stopped because: **review_failed:EAV-2**", report)
+
+    def test_repair_failure_with_line_number_or_no_location_stops(self) -> None:
+        for location, kind, findings, expected in [
+            ("eav2.txt:359", "revise", True, "eav2.txt"),
+            ("eav2.txt:359:12", "revise", True, "eav2.txt"),
+            ("", "revise", True, "EAV-2"),
+            ("", "escalate", False, "EAV-2"),
+        ]:
+            with self.subTest(location=location, kind=kind), tempfile.TemporaryDirectory() as td:
+                repo = judged_runner_repo(Path(td), ["claude"])
+                self._mark_repair_row(repo)
+                if findings:
+                    old = self._finding("high", "not fixed", file=location)
+                    self.gate.journal(repo, {"event": "review_verdict", "passed": False,
+                                            "blocker_ids": [self.gate.defect_id(old)]})
+                judge, calls = self._judge([verdict(70, kind, findings=[
+                    self._finding("high", "not fixed", file=location)] if findings else [])])
+                report = self._run(repo, self._spawn([]), judge, expect_exit="3")
+                stop = f"review_loop:{expected}" if findings else "review_failed:EAV-2"
+                self.assertIn(f"stopped because: **{stop}**", report)
+                self.assertEqual(calls["n"], 1)
+                self.assertNotIn("## Full acceptance", report)
+
+    def test_repair_passes_targeted_verification_without_another_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"], extra={
+                "judge_prompt": "Project reviewer. Look at {tasks} since {base}."})
+            self._mark_repair_row(repo)
+            judge, calls = self._judge([verdict(80, "pass", findings=[])])
+            report = self._run(repo, self._spawn([]), judge)
+            self.assertEqual(calls["n"], 1)
+            self.assertIn("TARGETED REPAIR VERIFICATION for: EAV-2", calls["prompts"][0])
+            self.assertIn("## Full acceptance", report)
+            self.assertIn("## Waiting on you\n\n- nothing", report)
 
     def test_runs_of_one_task_share_one_review_and_one_full_oracle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -492,6 +527,191 @@ class ReviewIsAGateTests(ReviewHarness):
             notes = (repo / "REVIEW-NOTES.md").read_text(encoding="utf-8")
             for issue in ("r1 medium", "r1 low a", "r1 low b"):
                 self.assertIn("issue: " + issue, notes)
+
+
+class StagePolicyTests(ReviewHarness):
+    LOCAL = "python -c \"from pathlib import Path; Path('.gate/local-called').write_text('yes'); print('2 passed')\""
+    FULL = "python -c \"from pathlib import Path; Path('.gate/full-called').write_text('yes'); print('9 passed')\""
+
+    def _repo(self, root, stage="development", impact="local", policy=None):
+        repo = judged_runner_repo(root, ["claude"], verify_cmd=self.FULL,
+                                  extra={"delivery": {"stage": stage, **(policy or {})}})
+        queue = repo / "TASK_QUEUE.md"
+        queue.write_text(queue.read_text(encoding="utf-8") +
+                         f"<!-- task:EAV-2 impact: {impact} -->\n" +
+                         "<!-- task:EAV-2 verify: " + json.dumps({"cmd": self.LOCAL, "timeout_s": 30}) + " -->\n",
+                         encoding="utf-8")
+        run("git", "-C", str(repo), "commit", "-qam", "declare impact")
+        return repo
+
+    def test_local_development_check_does_not_execute_full_suite(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td))
+            judge, calls = self._judge([verdict(90, "pass", [])])
+            report = self._run(repo, self._spawn([]), judge)
+            self.assertTrue((repo / ".gate/local-called").exists())
+            self.assertFalse((repo / ".gate/full-called").exists())
+            self.assertIn("## Stage acceptance", report)
+            self.assertIn("full delivery acceptance not established", report)
+            self.assertEqual(self.gate.pending_closeout(repo)[0], [])
+            never, _ = self._judge([])
+            self._run(repo, self._spawn([]), never, expect_exit="3")
+            self.assertEqual(calls["n"], 1)
+
+    def test_delivery_runs_full_after_a_local_checkpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td), stage="module")
+            judge, _ = self._judge([verdict(90, "pass", [])])
+            self._run(repo, self._spawn([]), judge)
+            (repo / "eav2.txt").write_text("changed after module check", encoding="utf-8")
+            self.gate.cmd_verify(SimpleNamespace(repo=str(repo), stage="delivery", task=None,
+                                                queue=False, cmd=None, tasks=None))
+            self.assertTrue((repo / ".gate/full-called").exists())
+            saved = self.gate.read_verdict(repo)
+            self.assertTrue(saved["full_suite"])
+            self.assertEqual(saved["stage"], "delivery")
+
+    def test_shared_impact_runs_mapped_callers_and_unknown_runs_full(self):
+        for impact, mapped, full in [("shared", True, False), ("shared", False, True), ("unknown", False, True)]:
+            with self.subTest(impact=impact, mapped=mapped), tempfile.TemporaryDirectory() as td:
+                cmd = "python -c \"from pathlib import Path; Path('.gate/caller-called').write_text('yes'); print('3 passed')\""
+                policy = {"checks": [{"files": ["eav2.txt"], "cmd": cmd}]} if mapped else {}
+                repo = self._repo(Path(td), impact=impact, policy=policy)
+                judge, _ = self._judge([verdict(90, "pass", [])])
+                self._run(repo, self._spawn([]), judge)
+                self.assertEqual((repo / ".gate/full-called").exists(), full)
+                self.assertEqual((repo / ".gate/caller-called").exists(), mapped)
+
+    def test_shared_infrastructure_and_undeclared_actual_changes_escalate(self):
+        for drift in (False, True):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as td:
+                repo = self._repo(Path(td), policy={} if drift else {"full_globs": ["eav2.txt"]})
+                spawn = self._spawn([])
+                def changed(*args, **kwargs):
+                    result = spawn(*args, **kwargs)
+                    if drift:
+                        (repo / "outside.txt").write_text("shared change", encoding="utf-8")
+                        run("git", "-C", str(repo), "add", "outside.txt")
+                        run("git", "-C", str(repo), "commit", "-qm", "outside scope")
+                    return result
+                judge, _ = self._judge([verdict(90, "pass", [])])
+                self._run(repo, changed, judge)
+                self.assertTrue((repo / ".gate/full-called").exists())
+
+    def test_integration_adds_flow_check_without_full_suite(self):
+        with tempfile.TemporaryDirectory() as td:
+            cmd = "python -c \"from pathlib import Path; Path('.gate/integration-called').write_text('yes'); print('4 passed')\""
+            repo = self._repo(Path(td), stage="integration", policy={"integration_cmd": cmd})
+            judge, _ = self._judge([verdict(90, "pass", [])])
+            self._run(repo, self._spawn([]), judge)
+            self.assertTrue((repo / ".gate/integration-called").exists())
+            self.assertFalse((repo / ".gate/full-called").exists())
+
+    def test_ordinary_defect_defers_until_checkpoint_and_does_not_spawn_tasks(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td))
+            finding = {"severity": "medium", "file": "eav2.txt:42", "issue": "export label incorrect",
+                       "fix": "correct label", "action": "required", "blocking": "stage", "due": "integration"}
+            judge, _ = self._judge([verdict(75, "revise", [finding])])
+            report = self._run(repo, self._spawn([]), judge)
+            self.assertIn("stopped because: **queue_empty**", report)
+            self.assertNotIn("TODO", (repo / "TASK_QUEUE.md").read_text(encoding="utf-8"))
+            cfg = self.gate.load_config(repo)
+            cfg["delivery"] = {"stage": "delivery"}
+            result = self.gate.run_stage_acceptance(repo, cfg, ["EAV-2"], None)
+            self.assertEqual(result["result"], "FAIL")
+            self.assertIn("Unresolved checkpoint defects", result["tail"])
+            self.assertFalse((repo / ".gate/full-called").exists())
+            notes = self.gate.review_notes_path(repo, cfg)
+            text = notes.read_text(encoding="utf-8")
+            item = next(iter(self.gate.recorded_defects(repo, cfg).values()))
+            item.update(status="resolved", resolution="regression test for export label passes")
+            notes.write_text(text + "\n<!-- defect: " + json.dumps(item) + " -->\n", encoding="utf-8")
+            result = self.gate.run_stage_acceptance(repo, cfg, ["EAV-2"], None)
+            self.assertEqual(result["result"], "PASS")
+
+    def test_optional_suggestion_does_not_block_delivery(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td), stage="delivery")
+            finding = {"severity": "low", "file": "eav2.txt", "issue": "naming preference",
+                       "fix": "rename", "action": "optional", "blocking": "stage", "due": "delivery"}
+            judge, _ = self._judge([verdict(80, "revise", [finding])])
+            report = self._run(repo, self._spawn([]), judge)
+            self.assertIn("stopped because: **queue_empty**", report)
+            self.assertTrue((repo / ".gate/full-called").exists())
+
+    def test_identical_notes_are_deduplicated_and_high_defects_cannot_be_deferred(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td))
+            cfg = self.gate.load_config(repo)
+            data = {"tasks": ["EAV-2"], "findings": HIGH, "member": "test"}
+            self.gate.record_review_findings(repo, cfg, data)
+            path = self.gate.review_notes_path(repo, cfg)
+            before = path.read_bytes()
+            self.gate.record_review_findings(repo, cfg, data)
+            self.assertEqual(path.read_bytes(), before)
+            item = next(iter(self.gate.recorded_defects(repo, cfg).values()))
+            item.update(status="deferred", due="backlog")
+            with path.open("a", encoding="utf-8") as out:
+                out.write("\n<!-- defect: " + json.dumps(item) + " -->\n")
+            self.assertTrue(self.gate.open_stage_defects(repo, cfg))
+
+    def test_unrelated_located_blocker_does_not_stop_local_work_but_blocks_delivery(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td), stage="module")
+            finding = dict(HIGH[0], file="other-module.txt")
+            judge, _ = self._judge([verdict(70, "revise", [finding])])
+            report = self._run(repo, self._spawn([]), judge)
+            self.assertIn("stopped because: **queue_empty**", report)
+            cfg = self.gate.load_config(repo)
+            cfg["delivery"] = {"stage": "delivery"}
+            outcome = self.gate.run_stage_acceptance(repo, cfg, [], None)
+            self.assertEqual(outcome["result"], "FAIL")
+            self.assertFalse((repo / ".gate/full-called").exists())
+
+    def test_due_defect_without_resolution_evidence_and_invalid_stage_fail_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td))
+            cfg = self.gate.load_config(repo)
+            self.gate.record_review_findings(repo, cfg, {"tasks": ["EAV-2"], "findings": HIGH})
+            item = next(iter(self.gate.recorded_defects(repo, cfg).values()))
+            item["status"] = "resolved"
+            with self.gate.review_notes_path(repo, cfg).open("a", encoding="utf-8") as out:
+                out.write("\n<!-- defect: " + json.dumps(item) + " -->\n")
+            self.assertTrue(self.gate.open_stage_defects(repo, cfg))
+            cfg["delivery"] = {"stage": "typo"}
+            with self.assertRaises(SystemExit):
+                self.gate.run_stage_acceptance(repo, cfg, ["EAV-2"], None)
+
+    def test_failed_scoped_check_preserves_boundary_without_another_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td))
+            queue = repo / "TASK_QUEUE.md"
+            cmd = "python -c \"from pathlib import Path; import sys; print('1 passed'); sys.exit(0 if Path('.gate/ready').exists() else 1)\""
+            text = queue.read_text(encoding="utf-8").replace(json.dumps(self.LOCAL), json.dumps(cmd))
+            queue.write_text(text, encoding="utf-8")
+            run("git", "-C", str(repo), "commit", "-qam", "checkpoint fails until ready")
+            judge, calls = self._judge([verdict(90, "pass", [])])
+            self._run(repo, self._spawn([]), judge, expect_exit="3")
+            self.assertTrue(self.gate.pending_closeout(repo)[0])
+            (repo / ".gate/ready").touch()
+            never, _ = self._judge([])
+            report = self._run(repo, self._spawn([]), never)
+            self.assertEqual(calls["n"], 1)
+            self.assertIn("## Stage acceptance", report)
+
+    def test_a_repair_that_reduces_blockers_is_not_a_loop(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(Path(td))
+            queue = repo / "TASK_QUEUE.md"
+            queue.write_text(queue.read_text(encoding="utf-8") + "<!-- task:EAV-2 origin: review -->\n", encoding="utf-8")
+            run("git", "-C", str(repo), "commit", "-qam", "repair")
+            self.gate.journal(repo, {"event": "review_verdict", "passed": False,
+                                    "blocker_ids": [self.gate.defect_id(HIGH[0]), "BUG-000000000000"]})
+            judge, _ = self._judge([verdict(80, "revise", HIGH)])
+            report = self._run(repo, self._spawn([]), judge, expect_exit="3")
+            self.assertIn("stopped because: **review_failed:EAV-2**", report)
+            self.assertNotIn("review_loop:", report)
 
 
 class FullOracleTurnTests(unittest.TestCase):

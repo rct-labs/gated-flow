@@ -57,6 +57,47 @@ or IN_PROGRESS, or the worktree is dirty with work you did not make. No
 
 ## 2. Decide
 
+Read `<home>/docs/autonomy.md` for the stage/check selection and defect record
+contract. Set `delivery.stage` for the next batch, before launch:
+
+| stage | completion check |
+|---|---|
+| development | runnable progress; local tests, ordinary defects recorded |
+| module | module behavior and affected callers |
+| integration | interfaces and critical user flows; batch due defects |
+| delivery | complete acceptance on the candidate and required risk review |
+
+Queue exhaustion closes a batch, not the product. Never run every module's
+batch as a delivery. Conversely, a scoped PASS is not a delivery PASS.
+Advance stages based on the planned milestone, not to escape a failed check.
+
+Choose the cheapest delivery process that fits the actual risk:
+
+- Small, reversible local tools: implement a usable end-to-end slice, run its
+  acceptance, deliver. Leave `judge.enabled` false by default; do not add a
+  debate, scorecard, hardening audit or a review for each module. Keep existing
+  explicit project review requirements; never toggle a live run's config.
+- Sensitive data, permissions, money, destructive operations or difficult
+  rollback: keep one focused review of those invariants at the delivery
+  boundary. Risk attaches to behavior, not every file in that project.
+  A redactor needs deletion/privacy checks; ordinary UI and dictionary
+  plumbing do not each need a fresh security audit.
+- Explicit comprehensive audit requests retain their requested scope.
+
+Fix observable acceptance, supported inputs, non-goals and a reasonable
+delivery time budget in the existing spec before dispatch. Carry the start
+time, time already spent and remaining allowance in CONTEXT across restarts.
+This is a host planning limit, not an engine-enforced cumulative timer. Never
+reset it with a new run, task ID or spec revision. At the limit, stop automatic
+dispatch and report usable work and actual blockers; never label an unsafe
+or failing result complete. Choose the budget for the scope and user constraint,
+not a universal two-hour limit.
+
+Prefer vertical tasks that produce a runnable user flow early. Necessary
+implementation slices share a delivery acceptance; do not split each module
+into a separately reviewed package merely to satisfy a file cap. Cleanup and
+future extensibility stay outside the current delivery.
+
 Survey only the code and docs the next step touches. If CONTEXT section 4 is
 already a testable slice, use it; otherwise write or update
 `docs/work/<id>/brief.md` and `spec.md` from the flow templates and rebuild
@@ -77,6 +118,7 @@ behaviour per row, implementation and tests together. Each row needs:
 | N | ID | name | `TODO` | 12 passed | 14 passed |
 <!-- task:ID files: src/a.py, tests/test_a.py -->
 <!-- task:ID verify: {"cmd": "pytest tests/test_a.py -q", "timeout_s": 900} -->
+<!-- task:ID impact: local -->
 ```
 
 At most 6 files, no overlap with other TODO rows unless
@@ -84,6 +126,14 @@ At most 6 files, no overlap with other TODO rows unless
 name, English ids and names. `<!-- task:ID spec: docs/work/x/spec.md -->`
 points the worker packet at the acceptance section. Keep that section short:
 the packet is capped at `worker_packet_max_bytes`.
+
+Declare impact from callers and shared behavior, not the directory name:
+`local`, `shared`, or `unknown`. Shared changes need `delivery.checks` mappings
+including affected callers; `delivery.full_globs` names project-wide impact.
+An undeclared/unknown impact, uncovered shared paths or undeclared actual code
+changes escalates to full acceptance. Do not mark uncertain work local merely
+to avoid a slow test. At integration, configure `delivery.integration_cmd` or
+accept the full-suite fallback. Delivery always uses `verify_cmd`.
 
 Optional `worker` column per row; `admit` refuses an unknown id. A task whose
 files match `irreversible_globs` goes to the tail and needs
@@ -101,8 +151,8 @@ and `judge.chain` when the project wants a package review, `judge.checkpoints`
 for rows that must be reviewed on their own, `max_model_calls` for the run.
 Never raise limits or weaken admission to get a task through.
 
-Count remaining TODO rows and pass that as `--MaxTasks`: the review and the
-full oracle run once, when the queue has no TODO left, so one launch per
+Count remaining TODO rows and pass that as `--MaxTasks`: any enabled review
+and the selected stage checks run when the queue has no TODO left, so one launch per
 package is the cheap shape and a launch per task buys nothing. Then follow
 `run-queue`: detached launch, one validated watcher, narrate, read the report.
 Never mark DONE, never `--no-verify`, never take over IN_PROGRESS, never
@@ -111,26 +161,43 @@ push unless the user or CONTEXT already allowed it.
 ## 5. After the run
 
 Read `RUN-REPORT.md` bottom-up: **Waiting on you** first, then **Review**,
-then **Full acceptance**, then the task table. Relay those in the user's
+then **Stage acceptance** / **Full acceptance** and **Defect checkpoints**,
+then the task table. Relay those in the user's
 language, leading with the measured result or the blocking fact.
 
-- `review_failed:<ids>`: read the findings; admit ONE repair row for all of
-  them inside the same package, tagged `<!-- task:ID origin: review -->`,
-  with the findings as its acceptance, then relaunch. Never revise by hand or
-  lower the bar.
-- `review_loop:<file>`: the repair row drew another high finding on its own
-  file. No second repair row. Take the findings to the user: the spec for
-  that block is revised through `$flow`, or the user accepts the risk.
-- `full_acceptance_failed:<ids>`: read the tail; admit one repair row.
+- `review_failed:<ids>`: safety defects, a broken current core flow or due
+  acceptance blockers need repair. Consolidate related blockers into a bounded
+  batch tagged `<!-- task:ID origin: review -->`; preserve BUG ids, original
+  evidence and a failing regression check. Verify the repair and direct
+  regressions only. Continued repair is allowed when progress, scope and
+  remaining budget justify it; no fixed one-repair rule. Ambiguous findings
+  need evidence clarification, not an invented patch.
+- `review_loop:<location-or-task>`: the same recorded blockers remain without
+  improvement. Stop repeating the approach, reproduce the common cause and
+  choose a materially different fix within the authorized scope if possible.
+  Escalate only when scope, risk acceptance or budget needs a user decision.
+  Never rename bugs/tasks to erase history or accept a privacy leak for speed.
+- `stage_acceptance_failed:<ids>` / `full_acceptance_failed:<ids>`: read the
+  saved selected-check logs or due-defect list. Repair the demonstrated cause;
+  do not restart broad review, rerun a long check just to read its output, or
+  repeatedly retry an unchanged failure.
 - `scope_request:<id>`: widen the declared files or split the task.
 - `prompt_too_large:<id>`: shorten the spec acceptance or split the task.
 - `needs_approval:<id>`: show the scope line, ask once, add the line on yes.
 
-A package is finished when the review passed and the full acceptance is
-green. Findings below high are in `REVIEW-NOTES.md`: a record for planning,
-never a task source. Do not write rows from it, alone or merged, to tidy up
-a finished package. When a note matters, it becomes part of the next planned
-work through `$flow`, with an acceptance of its own.
+A stage is finished when its selected checks and required reviews pass.
+Disclose untested scope and unavailable reviews. A final delivery needs
+`delivery` acceptance; when no new tasks remain, run `flow verify --stage
+delivery --repo .` instead of inventing a task or claiming an old local PASS.
+
+`REVIEW-NOTES.md` holds defects, not a second task queue. Ordinary defects get
+a due checkpoint and are grouped at that checkpoint, not dispatched on each
+finding. Preserve structured ids and severity. To resolve a defect, update its
+latest metadata to `status: resolved` with nonempty `resolution` naming actual
+verification evidence, and keep the visible note consistent. Deferral needs a
+reason and next checkpoint; it cannot waive safety or an agreed stage blocker.
+Only revise acceptance with the user's authorization where product promises
+change. Do not reopen finished work for style or optional hardening.
 
 Rebuild `CONTEXT.md`: a stopped or interrupted task is written as such, with
 its failing command, the uncommitted paths and the log path, never as done.

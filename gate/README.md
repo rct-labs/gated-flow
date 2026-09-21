@@ -186,33 +186,43 @@ same tree with a hint; a second attempt that still does not close the task stops
 run with `worker_left_changes:<id>`. A worker that asks for a scope decision stops the
 run with `scope_request:<id>`.
 
-**One review per package** (`judge`, default off). When the queue has no eligible TODO
+**One review per batch** (`judge`, default off). When the queue has no eligible TODO
 left, the review chain (`judge.chain`, next member on outage or unparsable output) reads
 once everything closed since the last full acceptance, earlier runs included, and returns
 strict JSON (`score`, `verdict`, `findings[]`, `revision_brief`). A member that answers
 `escalate`, score 0, no findings has said it could not read the repository: that is
-`<member>:no_access`, and the next member reviews. Pass means verdict `pass`
-and no `high` finding; the score is recorded only. The review is a gate and never writes
-queue rows: findings below high go, in full, to the report, the `review_findings` journal
-event and `REVIEW-NOTES.md` next to the queue (committed). The full oracle follows once.
+`<member>:no_access`, and the next member reviews. Pass means no current-scope
+safety or due-stage defect and no unresolved escalation; a `revise` recommendation
+alone does not block. The score is recorded only. The review never writes queue
+rows: defects go to `REVIEW-NOTES.md` with stable ids, due checkpoints and status.
+The host groups ordinary defects at planned checkpoints. Stage checks follow.
 A run that ends with TODO rows left defers both. Full oracles of different projects
 take turns on the machine (an OS lock under `~/.gate/`, config
 `serialize_full_acceptance`); tasks never wait. A failed review stops with
-`review_failed:<ids>` and gets one repair round: a repair row (`origin: review`) that draws
-another high finding on its own file stops with `review_loop:<file>`;
+`review_failed:<ids>`. Related blockers are repaired together. Repair rows
+(`origin: review`) receive targeted verification of original findings and
+direct repair regressions, not another general audit. The same recorded blocker
+set persisting on a repair stops with `review_loop:<location-or-task>`;
 a chain outage journals `review_skipped` and the run continues. Rows in
 `judge.checkpoints` are reviewed alone right after they close. There is no revision
-loop: the host admits one repair row.
+loop: the host decides further repair from progress, impact and remaining budget,
+not a fixed round count. Renaming defects does not erase history. Small tools
+default to acceptance without model review; sensitive behavior receives focused
+review at the delivery boundary. Explicit project requirements still apply.
 
-**Full acceptance once.** After a passing (or skipped) review the runner runs
-`verify_cmd` once, journals `full_acceptance`, and stops with
-`full_acceptance_failed:<ids>` when it fails. Nothing is rolled back.
+**Stage acceptance.** `delivery.stage` selects development, module, integration
+or delivery. Task `impact` declarations and `delivery.checks` caller mappings
+select local checks. Integration adds its declared command. Delivery, broad or
+unknown impact selects full `verify_cmd`. Reports name the reason and untested
+scope. A `stage_acceptance` PASS is not full acceptance; a stage verdict cannot
+close a task. See [the policy](../docs/autonomy.md) for configuration and defect
+metadata. `verify --stage delivery` establishes a new delivery checkpoint.
 
 **Budget.** `max_model_calls` counts every model process of the run (workers,
 reviewers, probes); reaching it stops the run with `budget:model_calls`.
 
 **Host-driven review.** `gate.py review --repo <p> --tasks A,B [--base SHA]` runs the
-same package review and full acceptance for DONE tasks outside a run: after a review
+same batch review and stage acceptance for DONE tasks outside a run: after a review
 chain outage, or for tasks closed by hand. Windows note: `codex exec --sandbox read-only`
 needs its elevation helper, which cannot show a UAC prompt inside a Task Scheduler
 session (error 1223). Give the reviewer `-c windows.sandbox=unelevated` in `judge_cmds`.
@@ -222,8 +232,9 @@ is refused `needs-approval` by `admit` unless the queue carries
 `<!-- task:ID approved: <who/date> -->`; `run` stops on it with `needs_approval:<id>`
 even in advisory mode.
 
-Exit code 3 covers every stop that needs a human: `review_failed`, `review_loop`,
-`full_acceptance_failed`, `scope_request`, `prompt_too_large`, `needs_approval`.
+Exit code 3 covers stops needing host action: `review_failed`, `review_loop`,
+`stage_acceptance_failed`, `full_acceptance_failed`, `scope_request`,
+`prompt_too_large`, `needs_approval`. Only user-owned decisions need a person.
 
 ## What it checks, after the fact
 

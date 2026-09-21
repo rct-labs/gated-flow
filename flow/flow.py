@@ -182,6 +182,7 @@ def cmd_init(argv: list[str]) -> int:
             return rc
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
         cfg["verify_cmd"] = args.verify_cmd
+        cfg["delivery"]["stage"] = "development"
         cfg["queue_file"] = str(queue_rel).replace("\\", "/")
         cfg["context_file"] = str(context_rel).replace("\\", "/")
         cfg["external_context"] = bool(args.external_context)

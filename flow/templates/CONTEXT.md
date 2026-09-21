@@ -9,6 +9,8 @@
 
 ## 2. Now
 <!-- The active work package / task id and one sentence of state.
+     Include current development/module/integration/delivery stage, selected
+     check scope, and delivery time spent/remaining across restarts.
      If work is interrupted, say so; it is not done until the gate says so.
      Keep: the failing command exactly as run and its key error line, the
      uncommitted paths (`git status --short`) or "tree clean", and where the
@@ -21,7 +23,8 @@
 
 ## 4. Next step
 <!-- The single next action, concrete enough to start cold, without
-     replaying the conversation. -->
+     replaying the conversation. Name the next checkpoint and any due defect
+     batch in REVIEW-NOTES.md; do not create a second executable task list. -->
 
 ## 5. Waiting on a human
 <!-- Decisions only a person can make. Empty section = nothing blocked. -->

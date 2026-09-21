@@ -10,6 +10,14 @@ revision: 1
 <!-- Commands or observable checks. These become verify_cmd / queue
      baselines; a spec whose acceptance can't fail is not finished. -->
 
+## Checkpoints and impact
+<!-- Current stage: development / module / integration / delivery.
+     Name the observable completion condition for each relevant checkpoint.
+     Declare local/shared/unknown impact, affected callers and commands.
+     State when full acceptance is needed; unknown impact is conservative.
+     Record the delivery budget and ordinary-defect handling checkpoints.
+     Keep supported inputs and non-goals explicit; review does not expand them. -->
+
 ## Decisions
 <!-- Choices made and why, one line each. Long-lived ones graduate to
      docs/adr/. -->

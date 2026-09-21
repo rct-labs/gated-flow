@@ -1,202 +1,202 @@
-# flow-run autonomy: probe, one review and one full acceptance per package, bounded spend
+# Staged acceptance and bounded unattended execution
 
-> Design contract for the unattended half of `gate/gate.py` and the
-> `flow-run` / `run-queue` skills. Config keys below are the single source of
-> truth; `gate/README.md` documents mechanics, `docs/usage.md` the human view.
-> `$flow` settles the requirement interactively; `$flow-run` runs it unattended.
+The host plans and interprets evidence; `gate.py` executes admitted work. A task
+DONE means its implementation passed its admitted check, not that the product
+is ready to deliver. Do not manufacture tasks to keep a review busy.
 
-## 0. Goal
+## 1. Stage, impact and risk
 
-One `$flow-run` ends in one of two states, without a human in between:
-
-1. every admitted task closed, reviewed once as a package, and the full
-   oracle green; or
-2. a short list of things that genuinely need the user: a review with a high
-   finding, a failing full oracle, a scope request, or an irreversible task
-   waiting for approval.
-
-Everything else (worker choice, quota outages, a worker that stopped halfway)
-is handled by the runner. The runner's own machinery must cost less than the
-work it supervises: no evidence caches, no receipts, no environment hashing,
-no revision loops.
-
-## 1. Roles
-
-| role | who | model |
+| Stage | Objective | Default checkpoint |
 |---|---|---|
-| host | the interactive CLI running `$flow-run`: inspects, decides, writes the queue | whatever the user is talking to |
-| worker | one headless process per task attempt | `workers` list and row pins; `worker_cmds` / `worker_models` in `.gate/config.json` |
-| reviewer | one read-only headless process per run (plus checkpoints) | `judge.chain`, tried in order, next member on outage or unparsable output |
+| development | A runnable user flow; tolerate recorded ordinary defects | Task checks and mapped affected callers |
+| module | The module behaves correctly within its supported inputs | Module checks and mapped affected callers |
+| integration | Interfaces and critical cross-module user flows work | Scoped checks plus the declared integration command |
+| delivery | The candidate meets the delivery promise | Complete `verify_cmd` and any required risk review |
 
-Model names in the shipped defaults are the authors' choices, not a contract.
-The `pi` worker runs any OpenRouter model (`worker_models.pi`); pi reads
-`OPENROUTER_API_KEY` from the environment.
+`delivery.stage` is set before a batch starts. New `flow init` projects start
+in development. Existing projects with no declaration retain delivery/full
+acceptance, so installing a new engine cannot silently weaken their checks.
+A stage transition is a planned milestone, never a way to bypass a failure.
 
-## 2. Probe before spend
+Keep observable acceptance, supported inputs, non-goals, the delivery budget
+and defect checkpoints in the existing work spec. CONTEXT carries current
+stage, actual progress and time spent/remaining across sessions. No second
+queue, workflow directory, or permanent budget service is introduced.
 
-At run start every candidate CLI (run-wide list, row pins, review chain) gets
-one tiny real request. A quota-shaped answer benches it for `quota_cooldown_s`;
-a probe that never reached the provider benches it for `probe.retry_s` only.
-State lives in `.gate/tool-status.json`; `gate.py usage` prints it on demand.
-Probes count against `max_model_calls`.
+Ordinary small reversible tools leave `judge.enabled` off unless the project
+explicitly requires it. Sensitive data, money, permissions or destructive
+behavior justify focused review of those invariants. Explicit comprehensive
+audit requests keep their requested scope. Do not review every module as if
+it were a fresh whole-project security audit.
 
-## 3. Dispatch
+## 2. Test selection
 
-- The worker prompt is `worker_prompt` plus a **task packet**: the queue row,
-  declared files, the local check command, the acceptance section of the work
-  package spec, and `git diff --stat`. A packet over `worker_packet_max_bytes`
-  is refused (`prompt_too_large:<id>`), never trimmed silently.
-- A worker that exits with uncommitted changes and no DONE gets one retry on
-  the same tree with a one-line hint. A second attempt that still does not
-  close the task stops the run (`worker_left_changes:<id>`).
-- A worker that stops to ask for a scope decision stops the run
-  (`scope_request:<id>`) instead of being asked the same question again.
-- Two identical failures stop the task (`no_progress`). Tool outages bench
-  the CLI and restore the row without spending an attempt.
+Each task declares its implementation files, local check and impact:
 
-## 4. Verification
-
-- `gate.py verify --task ID` runs the task's admitted local command
-  (`<!-- task:ID verify: {"cmd": ..., "timeout_s": N} -->`) and records a
-  task-scoped verdict bound to the bytes of the declared files. The commit
-  hook accepts the DONE flip of that task while those bytes are unchanged.
-- `gate.py verify --queue` runs the full `verify_cmd`. The runner does this
-  once per package, after the review (section 5), journals `full_acceptance`,
-  and stops with `full_acceptance_failed:<ids>` when it fails. Nothing is
-  rolled back.
-- The verdict keeps a 15-line tail; the whole output is kept too, so a long
-  oracle never has to run again just to be read:
-  `.gate/runs/<run-id>/full-acceptance.log` for the runner's full acceptance
-  (its path is in the verdict, the journal event and the report), and
-  `.gate/acceptance.log`, last run only, for `gate.py verify`.
-- One full oracle at a time on the machine, across projects. Runners of
-  different projects share nothing but the machine, and the full oracle is the
-  one step that loads it for many minutes; two at once slow each other and
-  make time-sensitive tests fail for reasons that are not in the code. The
-  turn is an OS file lock under the user's home
-  (`~/.gate/full-acceptance.lock`), which the OS releases when the process
-  ends, however it ends: no stale lock, no timeout to choose. A waiting runner
-  journals `full_acceptance_wait` once and the verdict records `waited_s`.
-  Tasks and task-local checks never wait. `"serialize_full_acceptance": false`
-  opts a project out.
-- No verdict cache. Re-running a local check is the cheap path.
-
-## 5. The review is a gate, once per package
-
-Three rules. None has a threshold to tune, so none is fitted to a project.
-
-**1. A review blocks or it does not. It never creates work.** With
-`judge.enabled`, the review chain reads the commits once with `judge_prompt`
-(tasks, commit range, declared files, verify tail).
-
-- Pass: verdict `pass` and no `high` finding. The score is recorded, never
-  gated on: a single-model score moves by several points between rounds, and a
-  threshold on it produced a five-round revise loop on a real project.
-- Every finding carries `action` (`required`, `optional`, `none`; a missing
-  value reads as `required`). Its definition is appended after the project's
-  `judge_prompt`, so an override cannot drop it. It is information for the
-  people planning the next work; the runner gates on nothing but `high`.
-- Findings below high are recorded in full and never become queue rows: the
-  `review_findings` journal event, the report's Review section, and
-  `REVIEW-NOTES.md` next to the queue file, committed (`.gate/` is gitignored
-  in some projects; the queue's directory is the one tracked place the gate
-  already commits to). What is worth doing from that record enters the queue
-  the way all work does: planned through `$flow`, with an acceptance of its
-  own. Acceptance is a command and its exit code (design.md section 2); a
-  reviewing model is not an acceptance authority, and any new diff gives it
-  something to say, so a review that feeds the queue has no last round.
-- A member that could not read the repository is an outage, not a verdict.
-  The prompt tells a reviewer without tool access to answer `escalate`, score
-  0, no findings; the chain records `<member>:no_access` and asks the next
-  member. Measured 2026-09-20: Codex 0.155 with `--sandbox read-only` on
-  Windows could not start a process, answered exactly that, and the run
-  stopped as if the work had failed review.
-- A review's spend ceiling is `judge.budget_usd_per_task` times the tasks it
-  covers (`{budget_usd}` in the claude review commands): a package review
-  reads every task's diff, so a flat ceiling that fits one task starves it.
-  A CLI that reports its own failure is named in the skip reason
-  (`opus:error_max_budget_usd`), not folded into `unparsable`.
-- Chain down, unparsable or without access: `review_skipped`, the full
-  acceptance still runs, the report says so. Visibility replaces a silent
-  quality-off.
-
-**2. The boundary is the package, not the run.** The review and the full
-oracle run when the queue has no eligible TODO left, and cover every task
-closed since the last full acceptance, including tasks of earlier runs
-(`task_done` events in the journal; a `full_acceptance` event or a failed
-review closes the boundary). A run that ends with TODO rows left reports the
-closed tasks as deferred and costs nothing more; so does a run whose model
-call budget is spent before the review, because a full oracle without the
-review would close the boundary unreviewed. A run that finds nothing to
-dispatch but tasks still waiting closes the package. Rows in
-`judge.checkpoints` are still reviewed alone right after they close, and
-`gate.py review --tasks <ids>` reviews on demand; its full acceptance closes
-the boundary for every waiting task.
-
-**3. A failed review gets one repair round.** `review_failed:<ids>` stops the
-run with the findings; the host admits one repair row for all of them, tagged
-`<!-- task:ID origin: review -->`. When that row draws another high finding on
-a file it declared itself, the stop is `review_loop:<file>`: a second repair
-row is not admissible, the answer is a spec revision or the user's decision
-to accept the risk. The runner never revises on its own. The gate cannot see
-who wrote a row, so tagging the repair row is the host's duty under the
-`flow-run` skill; everything else in this section is mechanical.
-
-Why, measured on the three live projects between 2026-09-18 and 2026-09-20,
-when findings below high became TODO rows and the boundary was the run:
-
-| measurement | value |
-|---|---|
-| reviews that covered exactly one task (alltom) | 27 of 28 |
-| full oracle time against worker time (AugurNext) | 8.1 h against 5.8 h |
-| rows made from findings, and closed (both projects) | 165 made, 36 closed |
-| share of worker time spent on those rows (alltom) | 5.5 h of 16.6 h |
-| one block of string parsing (alltom, 2026-09-19) | 4 rounds, 5 full oracles, about 2 h, a few lines of wording |
-
-## 6. Spend
-
-Two numbers: `max_model_calls` (workers, reviewers and probes of one run)
-and `run_timeout_s`. Reaching either stops the run with `budget:model_calls`
-or `run_timeout`. No persistent ledger; a new run is a new budget by design,
-and the host decides whether to start one.
-
-## 7. Reversibility tiers
-
-| tier | examples | runner behaviour |
-|---|---|---|
-| read-only | tests, git diff, code queries | free |
-| reversible | src edits, local commits | free; every commit is in the journal |
-| external | `git push`, broadcasts | worker prompt forbids; the host does it after the run when allowed |
-| irreversible | `irreversible_globs`: migrations, `data/**`, hooks, settings | needs `<!-- task:ID approved: <who/date> -->`; `run` stops with `needs_approval:<id>` even in advisory mode |
-
-## 8. Config keys (defaults)
-
-```json
-"probe": { "enabled": true, "timeout_s": 90, "retry_s": 600 },
-"judge": { "enabled": false, "chain": ["fable", "opus", "codex"], "checkpoints": [], "timeout_s": 1200, "budget_usd_per_task": 5 },
-"judge_cmds": { "fable": [...], "opus": [...], "codex": [...] },
-"judge_prompt": "<template; {tasks} {base} {commits} {files} {verify_tail}>",
-"max_model_calls": 40,
-"serialize_full_acceptance": true,
-"worker_packet_max_bytes": 6000,
-"worker_models": { "pi": "" },
-"irreversible_globs": ["drizzle/**", "data/**", ".git/hooks/**", ".claude/settings*", "scripts/apply-*"]
+```markdown
+<!-- task:WP-1 files: src/export.py, tests/test_export.py -->
+<!-- task:WP-1 verify: {"cmd": "pytest tests/test_export.py -q", "timeout_s": 900} -->
+<!-- task:WP-1 impact: local -->
 ```
 
-## 9. Journal events and stop reasons
+Choose `local`, `shared`, or `unknown` from the actual callers, contracts and
+data effects, not the number of files or directory name. Shared changes need
+explicit test mappings covering the declared paths, including affected callers.
+No static dependency inference is promised by this engine.
 
-Events: `probe`, `attempt_start`, `heartbeat`, `task_done`, `scope_drift`, `worker_left_changes`,
-`scope_request`, `prompt_too_large`, `review_start`, `review_verdict`,
-`review_skipped`, `review_findings`, `full_acceptance_wait`, `full_acceptance`, `needs_approval`,
-`task_end`, `tool_disabled`, `run_end`.
+```json
+"delivery": {
+  "stage": "module",
+  "checks": [
+    {"files": ["src/export.py", "tests/test_export.py"],
+     "cmd": "pytest tests/test_export.py tests/test_export_callers.py -q",
+     "timeout_s": 900}
+  ],
+  "full_globs": ["src/shared/**", "requirements.lock"],
+  "integration_cmd": "pytest tests/integration -q"
+}
+```
 
-Stop reasons that need a human: `review_failed:<ids>`, `review_loop:<file>`,
-`full_acceptance_failed:<ids>`,
-`scope_request:<id>`, `prompt_too_large:<id>`, `needs_approval:<id>`.
+At queue exhaustion, the runner checks the current stage. For development or
+module work it deduplicates admitted task commands and selected mapping commands.
+Integration adds `integration_cmd`. Commands execute separately, stopping on a
+failure; no string-built shell pipeline joins them.
 
-## 10. What the user reads
+Full acceptance is selected for delivery, unknown/missing impact, a missing
+local check, shared paths without a complete caller mapping, a `full_globs`
+match, undeclared actual code changes, or integration without its declared
+command. The reason appears in the verdict, journal and report. Unknown scope
+must not be marked local merely to avoid an expensive test.
 
-`RUN-REPORT.md`: the task table, a **Review** section, a **Full acceptance**
-line (or the note that both are deferred to the package boundary), and
-**Waiting on you**, which is empty on a clean run and is the only
-section the user has to read.
+Task DONE still requires `verify --task ID`, a real command exit code and the
+existing file-byte guard. A scoped stage verdict cannot close an individual
+task. `verify --queue` remains the explicit full-suite command. For a planned
+stage transition without new implementation tasks:
+
+```bash
+flow verify --stage module --tasks WP-1,WP-2 --repo <project>
+flow verify --stage delivery --repo <project>
+```
+
+A manual scoped check trusts the listed tasks' admitted impact; use the runner
+or `review --tasks ... --base SHA` when actual commit-range checking is needed.
+Neither an old local PASS nor an old full PASS proves modified code correct.
+Run the checks for the new impact and use a complete candidate check at delivery.
+There is no acceptance cache.
+
+Full verdicts also fingerprint the project content (including non-ASCII paths),
+excluding gate output and task status documents. A later code change invalidates
+that verdict at the commit hook; a check that changes candidate content is not
+a passing validation of a stable candidate. No environment hashing is used.
+
+Only complete-suite commands take the machine-wide OS file lock under
+`~/.gate/full-acceptance.lock`; task and scoped checks do not wait on that lock.
+`serialize_full_acceptance: false` opts out. This lock protects resource use,
+not an external permission boundary.
+
+## 3. Review and defect records
+
+Review the agreed change and acceptance. A blocker needs a concrete trigger,
+reproduction or traceable code path, and the violated invariant. Missing tests
+alone, style, hypothetical unsupported use and future extensibility are not
+high findings. Scores are informational. One read-only reviewer is used, with
+fallback chain members only for unavailable/unparseable results.
+
+The structured finding fields are `severity`, `file`, `issue`, `fix`, `action`,
+`id`, `blocking`, `due`. Existing outputs without new fields remain readable:
+missing `blocking` means none and missing `due` means backlog; high still blocks.
+Use `high` for demonstrated safety/data-loss defects or a broken current core
+flow. Ordinary findings can set `blocking: stage` and a named due checkpoint
+when the agreed acceptance requires fixing them by then. Optional suggestions
+use `blocking: none`; they never create mandatory delivery work by themselves.
+`revise` alone does not block an otherwise passing stage. `escalate` means an
+unresolved decision, not permission to invent another repair task.
+
+Findings are recorded in the existing `REVIEW-NOTES.md` next to the queue, with
+stable BUG ids, issue/evidence, location, fix, due checkpoint, status and resolution.
+Repeated identical findings reuse an id; line-number changes do not create a new
+bug. The record is committed separately and never adds queue rows. Older prose
+notes remain intact. The host groups ordinary defects by common cause at module,
+integration or delivery checkpoints instead of interrupting work for each one.
+
+Structured metadata is a one-line `<!-- defect: {...} -->` comment above the
+visible finding. Update the latest record and visible note together. A resolved
+record needs `status: resolved` and nonempty `resolution` naming the actual
+verification evidence. A status label alone cannot waive a high or due blocker.
+A repeated finding reopens a resolved record. Deferral records its reason and
+next checkpoint; changing product promises requires the user's decision.
+
+For a bounded local/module check, a located blocker outside the selected files
+and mapped caller scope is recorded but does not stop unrelated work. Unlocated
+blockers, full acceptance and integration are conservative: all relevant open
+blockers must be resolved. The report still lists unresolved records. The host
+can continue independent work after a safety stop without claiming that the
+blocked capability is ready.
+
+At each checkpoint the gate refuses acceptance when a blocking record is due
+and unresolved. Ordinary nonblocking records remain a visible defect list, not
+a task generator. Invalid structured records stop with a diagnostic rather than
+silently dropping defects. Resolution evidence is an auditable host assertion;
+the gate does not infer that a prose claim proves the fix. The selected executable
+checks still have to pass.
+
+## 4. Repair verification and progress
+
+Tag repair tasks `origin: review`, preserve original BUG ids and evidence, and
+add a failing regression before fixing the cause where practical. The reviewer
+checks original defects and direct repair regressions, not unrelated old code
+or newly invented requirements. Incidentally encountered serious defects are
+reported honestly, never hidden to force a pass.
+
+A fixed one-repair allowance is not the policy. Further bounded repair is allowed
+when scope, evidence of progress and the remaining budget justify it. The journal
+records blocker ids. A tagged repair with the same prior blocker set still
+present (or enlarged) stops as `review_loop`; reducing the set is progress and
+returns an ordinary `review_failed` when blockers remain. Existing BUG ids should
+be reused even if wording changes. This is not semantic similarity inference:
+the host must also recognize repeated symptoms and avoid renaming them to retry.
+
+No-progress means diagnose the shared cause or choose a materially different
+approach, not demand another identical patch. Ask the user only when product
+scope, risk acceptance or additional budget needs their decision. Local commands
+that fail repeatedly keep the existing worker no-progress guard. Never alternate
+review and test failures to justify blind retries.
+
+## 5. Execution, evidence and limits
+
+The existing dispatch guarantees remain: one worker per task attempt, a bounded
+task packet, one retry on a dirty tree, quota fallback without spending an attempt,
+per-task irreversibility approval, and no unrequested push or PR. Model processes
+and probes consume `max_model_calls`; `run_timeout_s` bounds the run. These are
+per-run limits. The host preserves the agreed overall delivery budget in CONTEXT
+and must not reset it with a new run or task name.
+
+At queue exhaustion the optional review and stage checks cover tasks closed in
+this or previous runs. Successful `stage_acceptance` closes only its named tasks;
+full acceptance covers the complete candidate. Failed scoped checks leave their
+boundary pending, so a later acceptance retry need not repeat a passed review.
+A configured review outage is reported as unreviewed, not passed. Tests may still
+run, but the host cannot claim a required review was completed.
+
+Reports show stage, selection reason, each selected command/log, unverified scope,
+unresolved defect checkpoints and the stopping fact. A task DONE, a stage PASS
+and a product delivery are deliberately distinct outcomes.
+
+| Stop | Meaning |
+|---|---|
+| review_failed | Current-scope safety/due blockers, or an unresolved decision |
+| review_loop | Same recorded blockers persist without improvement |
+| stage_acceptance_failed | A scoped check failed or due defect records remain |
+| full_acceptance_failed | The selected full oracle failed |
+| scope_request / prompt_too_large | Re-shape the task before dispatch |
+| needs_approval | An irreversible task lacks its own approval |
+| budget:model_calls / run_timeout | Per-run limit; also respect the host's delivery budget |
+
+Keep full output under `.gate/runs/<run-id>/`: `full-acceptance.log` or selected
+`stage-acceptance-N.log`. `verify` uses `.gate/` directly. Read saved output rather
+than rerunning a long test merely to see a traceback.
+
+Measure delivery lead time, time in checks, repeated defects, defect backlog and
+post-delivery failures. Fewer reviews alone is not success. Stage records and
+existing journal events supply evidence; do not add another monitoring system
+just to measure the workflow.
