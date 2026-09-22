@@ -394,6 +394,53 @@ class ReviewIsAGateTests(ReviewHarness):
             self.assertIn("issue: cosmetic", notes)   # no finding is dropped
             self.assertIn("issue: wrong", notes)   # safety defects persist until verified resolved
 
+    def test_failed_repair_prevents_renamed_followup_dispatch(self):
+        never = mock.Mock(side_effect=AssertionError("unexpected model call"))
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"])
+            self._mark_repair_row(repo)
+            self.gate.journal(repo, {"event": "review_verdict", "passed": False,
+                                    "repair_tasks": ["OLD-REPAIR"], "blocker_ids": []})
+            report = self._run(repo, never, never, expect_exit="3")
+            self.assertIn("repair_paused:EAV-2", report)
+            self.assertEqual(self._events(repo, "attempt_start"), [])
+
+    def test_failed_repair_worker_cannot_restart_without_authorization(self):
+        never = mock.Mock(side_effect=AssertionError("unexpected model call"))
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"])
+            self._mark_repair_row(repo)
+            self._run(repo, lambda *a, **kw: (SimpleNamespace(stdout="", stderr="", returncode=0), None), never, expect_exit="3")
+            self.assertTrue(self.gate.repair_continuation_required(repo))
+            report = self._run(repo, never, never, expect_exit="3")
+            self.assertIn("repair_paused:EAV-2", report)
+
+    def test_continuation_grant_requires_explicit_scope_and_expiry(self):
+        grant = {"enabled": True, "approved_by": "user, current request",
+                 "tasks": ["FIX-2"], "expires_at": time.time() + 60}
+        allowed = self.gate.repair_continuation_allowed
+        self.assertFalse(allowed({}, "FIX-2"))
+        self.assertTrue(allowed({"repair_continuation": grant}, "FIX-2"))
+        self.assertFalse(allowed({"repair_continuation": grant}, "FIX-3"))
+        for change in ({"enabled": False}, {"approved_by": ""},
+                       {"expires_at": time.time() - 1}, {"tasks": []},
+                       {"expires_at": "tomorrow"}):
+            self.assertFalse(allowed({"repair_continuation": grant | change}, "FIX-2"))
+
+    def test_explicit_continuation_can_run_a_named_repair(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"], extra={
+                "repair_continuation": {"enabled": True, "approved_by": "user",
+                    "tasks": ["EAV-2"], "expires_at": time.time() + 600}})
+            self._mark_repair_row(repo)
+            self.gate.journal(repo, {"event": "review_verdict", "passed": False,
+                                    "repair_tasks": ["OLD-REPAIR"]})
+            judge, calls = self._judge([verdict(95, "pass")])
+            report = self._run(repo, self._spawn([]), judge)
+            self.assertNotIn("repair_paused:", report)
+            self.assertEqual(calls["n"], 1)
+            self.assertFalse(self.gate.repair_continuation_required(repo))
+
     def test_a_repair_stops_only_when_recorded_blockers_do_not_improve(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             (Path(td) / "own").mkdir()

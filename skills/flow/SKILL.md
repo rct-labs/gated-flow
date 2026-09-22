@@ -117,8 +117,8 @@ delivery checkpoints in the existing spec, along with test impact and defect
 due dates. Declare `<!-- task:ID impact: local|shared|unknown -->` (choose one).
 Shared changes include affected callers; an unknown impact expands verification.
 Group ordinary defects at checkpoints instead of creating a task per finding.
-Repeated repairs depend on measured progress and budget, not a fixed count;
-follow `flow-run`'s no-progress policy.
+One repair batch is the default; further rounds require explicit user
+authorization. Follow `flow-run`'s continuation policy.
 
 Then run `flow admit --repo <project>` and show the report. A task refused
 admission is re-shaped now (split it, narrow it), not argued with later.
@@ -225,3 +225,13 @@ Kept apart from the rules above because it differs per CLI. As known on
 - A figure, if a host ever provides one, needs its window size from that
   host's own metadata, and cached tokens counted once. Never assume a window
   size from a model name.
+
+
+## Repair continuation
+
+Automatic continuation is OFF by default, including when blockers decrease.
+Allow one consolidated high-risk/core-flow repair batch and targeted verification;
+then stop if still blocked. Ordinary findings are recorded for later maintenance.
+Further repair requires explicit user authorization, named tasks and an expiry;
+spare budget or a generic continuation request is not authorization. Follow the
+continuation contract in `flow-run` and `docs/autonomy.md` before dispatch.

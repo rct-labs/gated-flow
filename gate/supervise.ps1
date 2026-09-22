@@ -143,7 +143,8 @@ while ($true) {
   elseif ($stop -like 'timeout:*')     { Say "STOP: $stop — worker exceeded task_timeout_s; check for a half-finished tree" }
   elseif ($stop -like 'judge_escalated:*') { Say "STOP: $stop — task is DONE but not to standard after the revision cap; read the Judge section of RUN-REPORT.md" }
   elseif ($stop -like 'revision_broke_verify:*') { Say "STOP: $stop — a judge revision left acceptance failing or the tree dirty; inspect git log/status, nothing was reset" }
-  elseif ($stop -like 'review_loop:*') { Say "STOP: $stop — the repair row drew another high finding on its own file; no second repair row, revise the spec with the user" }
+  elseif ($stop -like 'repair_paused:*') { Say "STOP: $stop - explicit continuation authorization required" }
+  elseif ($stop -like 'review_loop:*') { Say "STOP: $stop — repair blockers persist; stop and request explicit authorization before further repair" }
   elseif ($stop -like 'needs_approval:*') { Say "STOP: $stop — head task touches an irreversible path; add its approved: line after a human says yes" }
   elseif ($stop -eq 'budget' -or $stop -eq 'run_timeout') {
     Say "runner hit its own limit ($stop); progressed=$progressed"

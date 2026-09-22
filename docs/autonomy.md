@@ -148,19 +148,10 @@ checks original defects and direct repair regressions, not unrelated old code
 or newly invented requirements. Incidentally encountered serious defects are
 reported honestly, never hidden to force a pass.
 
-A fixed one-repair allowance is not the policy. Further bounded repair is allowed
-when scope, evidence of progress and the remaining budget justify it. The journal
-records blocker ids. A tagged repair with the same prior blocker set still
-present (or enlarged) stops as `review_loop`; reducing the set is progress and
-returns an ordinary `review_failed` when blockers remain. Existing BUG ids should
-be reused even if wording changes. This is not semantic similarity inference:
-the host must also recognize repeated symptoms and avoid renaming them to retry.
-
-No-progress means diagnose the shared cause or choose a materially different
-approach, not demand another identical patch. Ask the user only when product
-scope, risk acceptance or additional budget needs their decision. Local commands
-that fail repeatedly keep the existing worker no-progress guard. Never alternate
-review and test failures to justify blind retries.
+A repair with unchanged recorded blockers stops as `review_loop`.
+A smaller blocker set is progress, but does not authorize another round.
+The journal persists repair review results; subsequent review-origin tasks
+stop as `repair_paused` without a valid explicit continuation grant.
 
 ## 5. Execution, evidence and limits
 
@@ -200,3 +191,28 @@ Measure delivery lead time, time in checks, repeated defects, defect backlog and
 post-delivery failures. Fewer reviews alone is not success. Stage records and
 existing journal events supply evidence; do not add another monitoring system
 just to measure the workflow.
+
+
+## Repair continuation
+
+Automatic repair policy: consolidate evidenced high-risk defects and broken
+current core flows into one repair batch, followed by targeted verification.
+Record ordinary defects for later grouped maintenance; do not dispatch them
+just because review found them. Existing promised acceptance still cannot be
+reported as passed while failing. If the repair or its verification fails,
+stop automatic dispatch, even if blocker counts decrease or budget remains.
+This includes review, local-test and stage-acceptance failures: do not alternate
+stop types, rename tasks, or restart sessions to obtain another repair round.
+
+Continuation is OFF by default. Only explicit user authorization for this
+continuation permits setting `repair_continuation.enabled: true`, a nonempty
+`approved_by` recording that authorization, a finite `tasks` list and an
+`expires_at` Unix timestamp. Do not infer consent from "continue", spare quota,
+or permission to finish the original delivery. Before enabling it, record the
+user-authorized cumulative time, spending and round caps in the existing spec
+and CONTEXT; stop at the first cap, missing usage evidence, or no progress.
+Do not reset caps across runs. The engine enforces the named-task/expiry grant
+following a failed repair review or failed repair run; cumulative spend
+and failures outside the runner remain host-enforced. This is not a provider billing cap. Expire/disable the
+grant at the end of the authorized batch; never carry it into another project
+or delivery. Keep safety failures visible and never call them complete.

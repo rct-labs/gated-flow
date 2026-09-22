@@ -205,8 +205,8 @@ direct repair regressions, not another general audit. The same recorded blocker
 set persisting on a repair stops with `review_loop:<location-or-task>`;
 a chain outage journals `review_skipped` and the run continues. Rows in
 `judge.checkpoints` are reviewed alone right after they close. There is no revision
-loop: the host decides further repair from progress, impact and remaining budget,
-not a fixed round count. Renaming defects does not erase history. Small tools
+loop: the host requires explicit user authorization for further repair,
+after the first repair batch. Renaming defects does not erase history. Small tools
 default to acceptance without model review; sensitive behavior receives focused
 review at the delivery boundary. Explicit project requirements still apply.
 
@@ -288,3 +288,13 @@ Ten cases, run against a synthetic repo that reproduces the fake-completion shap
 8. `--no-verify` bypass → commit succeeds, `audit` reports `FAKE_COMPLETION`
 9. `admit` report → three-state ok / REFUSE / UNDECLARED per TODO task
 10. `run --strict-admit` on an undeclared head task → stops with `admit_refused`, no worker spawned
+
+
+## Repair continuation
+
+Automatic continuation is OFF by default, including when blockers decrease.
+Allow one consolidated high-risk/core-flow repair batch and targeted verification;
+then stop if still blocked. Ordinary findings are recorded for later maintenance.
+Further repair requires explicit user authorization, named tasks and an expiry;
+spare budget or a generic continuation request is not authorization. Follow the
+continuation contract in `flow-run` and `docs/autonomy.md` before dispatch.

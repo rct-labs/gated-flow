@@ -32,7 +32,7 @@ and directly introduced regressions, never another general audit. Preserve
 the original findings and BUG ids in the repair acceptance. Stage checks are
 selected by `delivery.stage` and declared impact; queue exhaustion is not
 product delivery. A new run does not reset the host-managed delivery budget.
-Further repair requires evidence of progress, not a fixed round allowance.
+Further repair requires explicit continuation authorization, not merely progress.
 
 `flow home` prints the checkout; `gate.py` is `<home>/gate/gate.py`.
 
@@ -165,9 +165,19 @@ task did not close, quote the last lines of its log from `.gate/runs/<run-id>/`.
 | `timeout:<id>` | worker exceeded `task_timeout_s` | check for a half-finished tree |
 | `no_workers` | every CLI is benched | wait for the cooldown (`.gate/tool-status.json`) |
 | `review_failed:<ids>` | safety/current-stage defects or ambiguous acceptance | consolidate evidenced blockers, preserve BUG ids and tag repairs `origin: review`; targeted verification only |
-| `review_loop:<location-or-task>` | recorded repair blockers show no progress | diagnose the common cause before another dispatch; escalate only for scope, risk or budget decisions |
+| `review_loop:<location-or-task>` | recorded repair blockers show no progress | diagnose the common cause before another dispatch; stop; further repair needs explicit continuation authorization |
 | `stage_acceptance_failed:<ids>` | a selected stage check failed or due defects remain open | read the named logs/defect records, fix within the affected scope |
 | `full_acceptance_failed:<ids>` | the full oracle fails | read `.gate/runs/<run-id>/full-acceptance.log`; repair the cause with a regression test, never blindly repeat it |
 | `needs_approval:<id>` | irreversible path without `approved:` | the user approves that task, then relaunch |
 
 Stopping is good. The only unacceptable outcome is a green light that lies.
+
+
+## Repair continuation
+
+Automatic continuation is OFF by default, including when blockers decrease.
+Allow one consolidated high-risk/core-flow repair batch and targeted verification;
+then stop if still blocked. Ordinary findings are recorded for later maintenance.
+Further repair requires explicit user authorization, named tasks and an expiry;
+spare budget or a generic continuation request is not authorization. Follow the
+continuation contract in `flow-run` and `docs/autonomy.md` before dispatch.

@@ -165,21 +165,23 @@ then **Stage acceptance** / **Full acceptance** and **Defect checkpoints**,
 then the task table. Relay those in the user's
 language, leading with the measured result or the blocking fact.
 
-- `review_failed:<ids>`: safety defects, a broken current core flow or due
-  acceptance blockers need repair. Consolidate related blockers into a bounded
+- `review_failed:<ids>`: safety defects and a broken current core flow qualify for the one
+  automatic repair batch. Other defects are recorded for grouped maintenance;
+  failed promised acceptance remains incomplete. Consolidate related blockers into a bounded
   batch tagged `<!-- task:ID origin: review -->`; preserve BUG ids, original
   evidence and a failing regression check. Verify the repair and direct
-  regressions only. Continued repair is allowed when progress, scope and
-  remaining budget justify it; no fixed one-repair rule. Ambiguous findings
+  regressions only. After this one repair batch, stop if verification still fails.
+  Further repair requires explicit continuation authorization. Ambiguous findings
   need evidence clarification, not an invented patch.
 - `review_loop:<location-or-task>`: the same recorded blockers remain without
   improvement. Stop repeating the approach, reproduce the common cause and
-  choose a materially different fix within the authorized scope if possible.
-  Escalate only when scope, risk acceptance or budget needs a user decision.
+  report the cause and stop. A different fix is still another repair round
+  and requires explicit continuation authorization.
   Never rename bugs/tasks to erase history or accept a privacy leak for speed.
 - `stage_acceptance_failed:<ids>` / `full_acceptance_failed:<ids>`: read the
-  saved selected-check logs or due-defect list. Repair the demonstrated cause;
-  do not restart broad review, rerun a long check just to read its output, or
+  saved selected-check logs or due-defect list. Repair the demonstrated high-risk/core cause only within the one-batch
+  allowance; otherwise record it and stop without claiming acceptance.
+  Do not restart broad review, rerun a long check just to read its output, or
   repeatedly retry an unchanged failure.
 - `scope_request:<id>`: widen the declared files or split the task.
 - `prompt_too_large:<id>`: shorten the spec acceptance or split the task.
@@ -212,3 +214,28 @@ Same files and commands from every CLI. `flow` is on PATH; `flow home`
 locates `gate/gate.py`. Launch with `pwsh`, not a tool-shell job object.
 Skills live once in `~/.agents/skills/<name>` and are linked into
 `~/.claude/skills` and `~/.codex/skills`.
+
+
+## Repair continuation
+
+Automatic repair policy: consolidate evidenced high-risk defects and broken
+current core flows into one repair batch, followed by targeted verification.
+Record ordinary defects for later grouped maintenance; do not dispatch them
+just because review found them. Existing promised acceptance still cannot be
+reported as passed while failing. If the repair or its verification fails,
+stop automatic dispatch, even if blocker counts decrease or budget remains.
+This includes review, local-test and stage-acceptance failures: do not alternate
+stop types, rename tasks, or restart sessions to obtain another repair round.
+
+Continuation is OFF by default. Only explicit user authorization for this
+continuation permits setting `repair_continuation.enabled: true`, a nonempty
+`approved_by` recording that authorization, a finite `tasks` list and an
+`expires_at` Unix timestamp. Do not infer consent from "continue", spare quota,
+or permission to finish the original delivery. Before enabling it, record the
+user-authorized cumulative time, spending and round caps in the existing spec
+and CONTEXT; stop at the first cap, missing usage evidence, or no progress.
+Do not reset caps across runs. The engine enforces the named-task/expiry grant
+following a failed repair review or failed repair run; cumulative spend
+and failures outside the runner remain host-enforced. This is not a provider billing cap. Expire/disable the
+grant at the end of the authorized batch; never carry it into another project
+or delivery. Keep safety failures visible and never call them complete.

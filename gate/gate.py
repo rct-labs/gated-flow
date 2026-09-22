@@ -166,6 +166,9 @@ DEFAULT_CONFIG = {
     # is "pass" and it reports no high-severity finding; the score and every
     # lesser finding are recorded, and nothing becomes a queue row. Tasks in
     # `checkpoints` are reviewed on their own right after they close.
+    # Explicit, expiring authorization for named continuation tasks only.
+    "repair_continuation": {"enabled": False, "approved_by": "",
+                            "tasks": [], "expires_at": 0},
     "judge": {
         "enabled": False,
         "chain": ["fable", "opus", "codex"],
@@ -2279,7 +2282,8 @@ def review_package(
     journal(repo, {"event": "review_verdict", "tasks": tasks, "score": verdict["score"],
                    "verdict": verdict["verdict"], "member": member,
                    "findings": len(verdict["findings"]), "high": len(high), "passed": passed,
-                   "blocker_ids": blocker_ids, "stage": delivery_stage(cfg)})
+                   "blocker_ids": blocker_ids, "stage": delivery_stage(cfg),
+                   "repair_tasks": repairs})
     print(f"  review ({member}): {verdict['verdict']}, score {verdict['score']}, "
           f"{len(verdict['findings'])} finding(s), {len(high)} high")
     notify(cfg, repo, f"review of {', '.join(tasks)}: {info['final']} ({member})",
@@ -2357,6 +2361,34 @@ def open_stage_defects(repo: Path, cfg: dict, affected: list[str] | None = None)
         if finding_blocks(item, delivery_stage(cfg)) and defect_in_scope(item, affected):
             blocked.append(key)
     return blocked
+
+
+def repair_continuation_allowed(cfg: dict, tid: str) -> bool:
+    """A bare switch or spare budget is not an authorization."""
+    grant = cfg.get("repair_continuation") or {}
+    if not isinstance(grant, dict):
+        return False
+    expiry = grant.get("expires_at")
+    tasks = grant.get("tasks")
+    return (grant.get("enabled") is True
+            and isinstance(grant.get("approved_by"), str)
+            and bool(grant["approved_by"].strip())
+            and isinstance(tasks, list) and tid in tasks
+            and isinstance(expiry, (int, float)) and time.time() < expiry < float("inf"))
+
+
+def repair_continuation_required(repo: Path) -> bool:
+    """Persist the stop across runs and renamed rows, using the existing journal."""
+    path = repo / GATE_DIR / "journal.ndjson"
+    if path.exists():
+        for line in reversed(path.read_text(encoding="utf-8").splitlines()):
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("event") in ("review_verdict", "repair_batch_result") and event.get("repair_tasks"):
+                return not event.get("passed", False)
+    return False
 
 
 def last_review_blockers(repo: Path, ids: list[str]) -> list[str]:
@@ -2515,7 +2547,11 @@ def cmd_run(args) -> None:
     # is benched before it costs a dispatch and a queue-row restore.
     run_dir = repo / GATE_DIR / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    if sub_cfg(cfg, "probe").get("enabled", True):
+    pending_tid, _ = head_task(cfg, parse_queue(qpath.read_text(encoding="utf-8")))
+    paused_repair = (pending_tid in parse_review_origin(qpath.read_text(encoding="utf-8"))
+                     and repair_continuation_required(repo)
+                     and not repair_continuation_allowed(cfg, pending_tid))
+    if sub_cfg(cfg, "probe").get("enabled", True) and not paused_repair:
         print("  probing :")
         for w in probe_candidates(cfg, pins):
             ensure_probed(repo, cfg, w, run_id, run_dir)
@@ -2552,6 +2588,12 @@ def cmd_run(args) -> None:
                 f"GATE: head task {tid} is already IN_PROGRESS — another runner may "
                 "be active. Stopping instead of taking it over."
             )
+            break
+
+        if (tid in parse_review_origin(qtext) and repair_continuation_required(repo)
+                and not repair_continuation_allowed(cfg, tid)):
+            stop_reason = f"repair_paused:{tid}"
+            journal(repo, {"event": "repair_paused", "task": tid})
             break
 
         strict = args.strict_admit or cfg.get("strict_admit", False)
@@ -3007,6 +3049,13 @@ def cmd_run(args) -> None:
     (repo / GATE_DIR / f"RUN-REPORT-{run_id}.md").write_text(report, encoding="utf-8")
     latest = repo / GATE_DIR / "RUN-REPORT.md"
     latest.write_text(report, encoding="utf-8")
+    repair_ids = parse_review_origin(qpath.read_text(encoding="utf-8"))
+    attempted_repairs = [r["task"] for r in results if r.get("task") in repair_ids]
+    if attempted_repairs and (any(r["outcome"] != "done" for r in results)
+            or stop_reason.startswith(("review_failed:", "review_loop:",
+                                       "stage_acceptance_failed:", "full_acceptance_failed:"))):
+        journal(repo, {"event": "repair_batch_result", "repair_tasks": attempted_repairs,
+                       "passed": False, "stop": stop_reason})
     journal(repo, {"event": "run_end", "run": run_id, "stop": stop_reason})
 
     print("\n" + report)
@@ -3021,7 +3070,7 @@ def cmd_run(args) -> None:
 
     needs_human = stop_reason.split(":", 1)[0] in (
         "review_failed", "full_acceptance_failed", "needs_approval", "scope_request",
-        "prompt_too_large", "review_loop", "stage_acceptance_failed",
+        "prompt_too_large", "review_loop", "repair_paused", "stage_acceptance_failed",
     )
     # A run that only closed out earlier tasks dispatched nothing and is fine.
     if any(r["outcome"] != "done" for r in results) or needs_human or not (results or acceptance):
@@ -3177,19 +3226,25 @@ def render_report(
             f"- **{tid}** touches an irreversible path. Review its scope, then add "
             f"`<!-- task:{tid} approved: <who/date> -->` to the queue and start another run."
         )
+    if stop.startswith("repair_paused:"):
+        waiting.append("- The repair batch has already been verified and remains blocked. "
+                       "Automatic continuation is off. Report unresolved blockers; only an "
+                       "explicit, expiring authorization for named tasks permits continuation.")
     if stop.startswith("review_failed:"):
         tids = stop.split(":", 1)[1]
         waiting.append(
             f"- **{tids}**: DONE by the acceptance gate, but the review did not pass "
             f"({review_reason(results, review)}). Read the Review section; admit one "
-            "repair task or accept the risk."
+            "consolidated repair batch only if none has been attempted; otherwise stop. "
+            "Further repair requires explicit continuation authorization. Never waive safety."
         )
     if stop.startswith("review_loop:"):
         waiting.append(
             f"- Repair made no progress on the recorded blockers at `{stop.split(':', 1)[1]}`. "
             "Do not repeat the same patch strategy. Diagnose the common cause, report the "
             "usable work and blocker, and decide whether a different approach fits the "
-            "remaining scope and budget. Task renaming does not erase defect history.")
+            "remaining scope and budget, with explicit continuation authorization. "
+            "Task renaming does not erase defect history.")
     if stop.startswith("stage_acceptance_failed:"):
         waiting.append("- The stage checkpoint failed. Read the selected check logs or resolve "
                        "the due defects with verification evidence; do not reopen a general audit.")
@@ -3243,12 +3298,16 @@ def render_report(
         lines.append("- Nothing left to do. The queue has no eligible task.")
     elif stop in ("budget", "run_timeout", "budget:model_calls"):
         lines.append("- Budget reached. Start another run to continue.")
+    elif stop.startswith("repair_paused:"):
+        lines.append("- Automatic continuation is off. Report unresolved blockers and wait "
+                     "for explicit authorization of a bounded continuation batch.")
     elif stop.startswith("review_failed:"):
         lines.append("- The tasks are DONE and committed; the review, not the work, stopped "
-                     "the run. Admit one repair row for the findings above, then run again.")
+                     "the run. Repair high-risk/core blockers once as a batch; after its verification, "
+                     "stop if blocked. Further repair requires explicit authorization.")
     elif stop.startswith("review_loop:"):
         lines.append("- The same blockers remain. Diagnose the cause before further dispatch; "
-                     "escalate only if scope, risk acceptance or budget needs a user decision.")
+                     "automatic continuation requires explicit user authorization even with spare budget.")
     elif stop.startswith("stage_acceptance_failed:"):
         lines.append("- Fix the demonstrated checkpoint failure within its impact scope. "
                      "Ordinary unrelated defects stay in the defect list.")
