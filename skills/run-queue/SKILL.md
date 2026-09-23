@@ -38,10 +38,12 @@ Further repair requires explicit continuation authorization, not merely progress
 
 ```
 flow doctor --repo <project>
-flow admit  --repo <project>
+flow admit --plan --repo <project>
 ```
 
-Show both. Stop and report if the pre-commit hook is not installed, the
+Reuse flow-run's preflight if queue, spec and configuration are unchanged;
+do not repeat it just because this skill was loaded. Show actionable results.
+Stop and report if the pre-commit hook is not installed, the
 queue parses to zero tasks, or the head task is BLOCKED. If the head task is
 REFUSE or UNDECLARED, say so before launching: advisory mode proceeds with a
 warning, `strict_admit` stops. Offer to add the missing scope line:
@@ -76,7 +78,7 @@ Then watch the journal: append-only NDJSON at `<repo>/.gate/journal.ndjson`.
 | event | meaning |
 |---|---|
 | `run_start` | workers resolved, budget set |
-| `probe` | usage probe per CLI (`usable`, `reason`) |
+| `probe` | on-demand probe before a worker/reviewer is used (`usable`, `reason`, `seconds`); unused fallbacks are not probed |
 | `admit_refused` | task outside the sweet spot; strict mode stops here |
 | `attempt_start` | a task went to a worker; `log` is the live transcript |
 | `heartbeat` | still alive: elapsed seconds, lines, last output line |
@@ -148,6 +150,11 @@ From `.gate/RUN-REPORT.md`: lead with **Waiting on you** (empty on a clean
 run), then how many tasks closed and why it stopped, then **Review** and
 **Full acceptance**, then the task table and anything left uncommitted. If a
 task did not close, quote the last lines of its log from `.gate/runs/<run-id>/`.
+
+The report also records Efficiency. `flow metrics --last 5 --repo <project>`
+compares runs without model calls or tests. Legacy missing measures are unknown;
+worker time includes its checks. Read metrics when assessing workflow cost, not
+on every poll. Do not run `flow usage` at startup: the runner probes on demand.
 
 ## Never
 

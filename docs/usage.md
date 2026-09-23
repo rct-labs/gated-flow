@@ -78,7 +78,7 @@ run admission and show you the result.
 ### 2.3 Admission check
 
 ```powershell
-flow admit --repo .
+flow admit --plan --repo .
 ```
 
 Three states:
@@ -92,7 +92,21 @@ Three states:
 The default is **advisory mode**: a refusal warns but does not block. After one
 full cycle on a real project, human-checked for false refusals, set
 `"strict_admit": true` in that project's `.gate/config.json`; from then on a
-refused task stops the run outright.
+refused task stops the run outright. A malformed table width always stops dispatch:
+a shifted test-count cell must not become a worker name.
+
+`--plan` also previews selected stage commands without executing them, flags
+invalid checks/spec links or oversized packets, and warns about earlier scope
+requests and broad/repeated checks. Errors exit 2; warnings do not rewrite
+acceptance. Inspect implementation, callers and tests before narrowing a command.
+Fresh code still needs fresh evidence. Use `verify --task` as the final task
+check rather than running the same underlying command immediately before it.
+
+For efficiency comparisons, `flow metrics --last 5 --repo .` reads recent runs;
+add `--json` for structured output. New runs record probe/model/check durations
+and lock waits. Older missing measures are unknown. Worker duration includes
+its checks, so do not add the two. Compare similar batches and defect outcomes,
+not just task or call counts. No extra monitoring service is needed.
 
 ### 2.4 Unattended → tell your agent `$run`
 

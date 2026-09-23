@@ -171,10 +171,25 @@ may pin or override this under `worker_cmds.codex` in `.gate/config.json`.
 
 Design: `../docs/autonomy.md`. Config-gated additions to `run`:
 
-**Usage probe** (`probe`, default on). At run start every candidate CLI (run-wide
-list, row pins, review chain) gets one tiny real request; `gate.py usage` does the
-same on demand. A quota-shaped reply benches it for `quota_cooldown_s`; a probe that
-never reached the provider benches it for `probe.retry_s` only.
+**Usage probe** (`probe`, default on). Probe a CLI once per run when first needed:
+the selected worker, a fallback after failure, or a reviewer at its checkpoint.
+Unused fallbacks and old row pins spend no probes. Blocked/refused work and
+oversized packets are checked first. Probes still count against `max_model_calls`;
+the last call is not spent on a probe with no allowance for useful work.
+`gate.py usage` deliberately probes every configured candidate for diagnostics.
+A quota reply benches for `quota_cooldown_s`; other probe failures use `probe.retry_s`.
+
+**Planning preview.** `flow admit --plan` lists declared stage checks without
+executing them. It catches malformed table widths, invalid checks/spec links and
+oversized packets, and warns about broad checks and earlier scope requests.
+Malformed rows cannot be dispatched even in advisory mode. Other existing
+admission rules retain their modes. Preview errors exit 2; coverage warnings
+require engineering judgment. No caller inference or command rewriting occurs.
+
+**Efficiency evidence.** `flow metrics --last 5 [--json]` reads the existing journal.
+Each run report also summarizes startup, probes, CLI calls, checks, lock waiting
+and scope stops. Worker time includes its task checks; durations are not additive.
+Legacy missing measures remain unknown. CLI requests are not token/billing usage.
 
 **Task packet.** Each worker prompt carries the queue row, declared files, the local
 check command, the spec's acceptance section and `git diff --stat`, capped at

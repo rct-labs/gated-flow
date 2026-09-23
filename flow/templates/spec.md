@@ -16,6 +16,9 @@ revision: 1
      Declare local/shared/unknown impact, affected callers and commands.
      State when full acceptance is needed; unknown impact is conservative.
      Record the delivery budget and ordinary-defect handling checkpoints.
+     Survey implementation, callers and tests before declaring files. Resolve
+     prior scope requests; use flow admit --plan to preview errors and checks.
+     Prefer affected task checks where coverage permits; delivery stays full.
      Keep supported inputs and non-goals explicit; review does not expand them. -->
 
 ## Decisions

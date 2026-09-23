@@ -6,13 +6,15 @@ Thin dispatcher; the machinery lives elsewhere and is not duplicated here:
   init          scaffold a project (create-if-missing, never overwrites)
   home          print the checkout directory (gate scripts live in <home>/gate)
   audit         read-only tree audit                    -> flow/audit.py
-  admit | doctor | run | verify | usage | install-hook | check-commit | audit-gate
+  admit | doctor | run | verify | usage | metrics | install-hook | check-commit | audit-gate
                 passthrough                             -> gate/gate.py
 
 Usage:
   flow home
   flow init  [--repo DIR] [--verify-cmd CMD]
   flow audit [DIR] [audit.py options]
+  flow admit --plan [--repo DIR]
+  flow metrics [--repo DIR] [--last N] [--json]
   flow admit|doctor|run|verify|usage|install-hook [gate.py options]
 """
 
@@ -244,7 +246,7 @@ def main() -> None:
         if not AUDIT.exists():
             die(f"missing {AUDIT}")
         sys.exit(run_py(AUDIT, rest or ["."]))
-    if cmd in ("admit", "doctor", "run", "verify", "usage", "install-hook",
+    if cmd in ("admit", "doctor", "run", "verify", "usage", "metrics", "install-hook",
                "check-commit"):
         sys.exit(run_py(GATE, [cmd, *rest]))
     if cmd == "audit-gate":  # gate.py's history audit, distinct from tree audit

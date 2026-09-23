@@ -120,8 +120,14 @@ Group ordinary defects at checkpoints instead of creating a task per finding.
 One repair batch is the default; further rounds require explicit user
 authorization. Follow `flow-run`'s continuation policy.
 
-Then run `flow admit --repo <project>` and show the report. A task refused
-admission is re-shaped now (split it, narrow it), not argued with later.
+Before admitting, inspect implementation, callers and tests together so the
+scope contains a complete verifiable behaviour. Reconcile earlier scope requests
+against the spec instead of relaunching unchanged work. Choose task checks from
+actual impact; keep full delivery acceptance. Then run
+`flow admit --plan --repo <project>`. It previews declared checks without running
+them and flags malformed rows, oversized packets and missing/broad checks.
+Fix errors before launch. Warnings need engineering judgment, not automatic
+command rewriting.
 
 **Insert an urgent task** — add the row (with scope line) ABOVE the current
 head, note the preempted task id in CONTEXT.md's checkpoint section. Small

@@ -192,6 +192,27 @@ post-delivery failures. Fewer reviews alone is not success. Stage records and
 existing journal events supply evidence; do not add another monitoring system
 just to measure the workflow.
 
+Use `flow admit --plan` before dispatch to preview scope and selected checks.
+It catches malformed rows and oversized packets, and reports missing/broad task
+checks and earlier scope requests. It cannot infer callers or validate coverage.
+The host surveys implementation, caller contracts and tests as one behaviour,
+then resolves warnings without weakening promised acceptance. Task checks are
+scoped when coverage permits; complete candidate acceptance remains mandatory
+at delivery. There is still no acceptance cache.
+
+CLI probes are lazy, once per used tool per run. Admission and packet checks
+precede probes; unused fallbacks, historical pins and future reviewers are not
+probed at startup. `usage` remains an explicit all-candidate diagnostic.
+Budget exhaustion is not a provider outage and cannot close pending review work.
+
+`flow metrics --last 5 [--json]` and the report's Efficiency section expose the
+existing journal's timings: startup, probes, CLI requests, checks, lock waits
+and scope stops. Worker time includes task checks; the durations overlap.
+Legacy missing measures and unfinished calls are unknown. Commands outside the
+gate are not measured, and CLI request counts are not provider token/billing
+records. Compare similar completed delivery batches and actual defect outcomes;
+do not claim a production speedup from a synthetic call-count reduction.
+
 
 ## Repair continuation
 

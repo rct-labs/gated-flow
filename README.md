@@ -34,6 +34,10 @@ checks; delivery runs complete acceptance. Ordinary defects are recorded and
 batched at checkpoints, while safety and due acceptance defects block the
 affected scope. Repair reviews check original defects and direct regressions,
 not the entire system again. See [the stage policy](docs/autonomy.md).
+Before dispatch, `flow admit --plan` previews scope and selected checks without
+running them. Model probes occur only when a worker or reviewer is needed.
+`flow metrics --last 5` compares recent run timings using the existing journal;
+missing historical measurements remain unknown.
 
 ## How the pieces fit
 

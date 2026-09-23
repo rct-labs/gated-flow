@@ -140,8 +140,20 @@ files match `irreversible_globs` goes to the tail and needs
 `<!-- task:ID approved: <who/date> -->`, written only when the user approved
 that task in this conversation. `git push` is never a task.
 
-Then `flow admit --repo .`; split or declare a REFUSE / UNDECLARED head task
-now.
+Before dispatch, inspect implementation, affected callers and tests for each
+behaviour. Include the files needed to connect the vertical slice; a file cap
+is not a reason to omit a necessary caller. Order or split connected work
+before launch. Reconcile earlier scope requests against the spec and saved log;
+do not relaunch an unchanged request or automatically accept every requested file.
+
+Then `flow admit --plan --repo .`. This read-only preview catches malformed rows,
+invalid checks/spec links and oversized packets, shows earlier scope requests,
+and lists declared stage checks. Fix errors and resolve relevant warnings.
+It does not infer dependencies or prove coverage. Broad task checks can be
+justified; otherwise select affected tests and mapped callers before admission.
+Do not mark shared work local or weaken accepted requirements for speed.
+Use `verify --task` for the final task check, avoiding a separate identical run
+immediately before it. Changed candidates still require fresh evidence.
 
 ## 4. Configure and launch
 
@@ -153,7 +165,10 @@ Never raise limits or weaken admission to get a task through.
 
 Count remaining TODO rows and pass that as `--MaxTasks`: any enabled review
 and the selected stage checks run when the queue has no TODO left, so one launch per
-package is the cheap shape and a launch per task buys nothing. Then follow
+package is the cheap shape and a launch per task buys nothing. Probes are lazy:
+only the selected CLI, a needed fallback, or a reviewer about to run is probed.
+Do not run `flow usage` as routine preflight; it probes every configured candidate.
+Then follow
 `run-queue`: detached launch, one incremental event watcher, report meaningful changes,
 read the final report. Keep a byte cursor; do not repeatedly scan full journals or
 worker transcripts. Prefer event notifications; otherwise use idle backoff within
@@ -213,6 +228,12 @@ lesson); otherwise none. If the user asked to finish everything and TODO rows
 remain for a reason other than a genuine blocker, say so and launch again.
 
 ## Host notes
+
+When evaluating efficiency, use `flow metrics --last 5 --repo .` and the report's
+Efficiency section. Compare similar delivery batches, check time, scope stops and
+defect outcomes. Worker duration includes its tests; do not add overlapping times.
+Legacy missing measures are unknown. CLI calls are not token or spending measures.
+A smaller call count alone does not prove faster correct delivery.
 
 Same files and commands from every CLI. `flow` is on PATH; `flow home`
 locates `gate/gate.py`. Launch with `pwsh`, not a tool-shell job object.
