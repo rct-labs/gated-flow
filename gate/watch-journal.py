@@ -13,7 +13,7 @@ EVENTS = frozenset('run_start attempt_start task_done worker_left_changes scope_
     'needs_approval task_end tool_disabled admit_refused run_end'.split())
 FIELDS = ('at', 'event', 'run', 'task', 'worker', 'commit', 'stop', 'result',
           'count', 'reason', 'outcome', 'member', 'verdict', 'log', 'passed', 'score',
-          'stage', 'seconds')
+          'stage', 'seconds', 'runner_pid')
 MAX_LINE = 256 * 1024
 MAX_READ = 1024 * 1024
 
@@ -53,6 +53,33 @@ def compact(event):
             for key in FIELDS if isinstance((value := event.get(key)), (str, int, float, bool))}
 
 
+def process_alive(pid):
+    """Read-only liveness; unavailable/denied is unknown, never a false exit."""
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False if ctypes.get_last_error() == 87 else None
+        try:
+            code = wintypes.DWORD()
+            return code.value == 259 if kernel.GetExitCodeProcess(handle, ctypes.byref(code)) else None
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None
+
+
 def read_events(journal, cursor, limit=20):
     state = json.loads(cursor.read_text(encoding='utf-8'))
     if state['journal'] != str(journal.resolve()):
@@ -66,7 +93,7 @@ def read_events(journal, cursor, limit=20):
                      or stat.st_size < state['offset']
                      or hashlib.sha256(prefix).hexdigest() != state['prefix'])
             if reset:
-                state.update(offset=0, discard=False)
+                state.update(offset=0, discard=False, runner_pid=None, owner_exit_reported=False)
                 if state['identity'] is not None:
                     events.append({'event': 'journal_reset'})
             stream.seek(0)
@@ -100,6 +127,12 @@ def read_events(journal, cursor, limit=20):
                         raise ValueError('record is not an object')
                     if isinstance(event.get('at'), str):
                         state['last_activity_at'] = event['at'][:64]
+                    if event.get('event') == 'run_start':
+                        pid = event.get('runner_pid')
+                        state.update(runner_pid=pid if type(pid) is int and pid > 0 else None,
+                                     owner_exit_reported=False)
+                    elif event.get('event') == 'run_end':
+                        state['runner_pid'] = None
                     if event.get('event') in EVENTS:
                         events.append(compact(event))
                 except (ValueError, UnicodeError):
@@ -107,6 +140,11 @@ def read_events(journal, cursor, limit=20):
             more = not incomplete and stream.tell() < stat.st_size
     else:
         more = False
+    if (not more and state.get('runner_pid') and not state.get('owner_exit_reported')
+            and process_alive(state['runner_pid']) is False):
+        events.append({'event': 'run_interrupted', 'reason': 'runner_exited_without_run_end',
+                       'runner_pid': state['runner_pid']})
+        state['owner_exit_reported'] = True
     state['idle'] = 0 if events else min(state['idle'] + 1, 3)
     save(cursor, state)
     return {'status': 'events' if events else 'idle', 'events': events,
@@ -140,7 +178,7 @@ def main():
         result = read_events(journal, cursor, args.limit)
         if result['events'] or (not args.follow and time.monotonic() >= deadline):
             print(json.dumps(result, ensure_ascii=False), flush=True)
-            if not args.follow or any(e['event'] == 'run_end' for e in result['events']):
+            if not args.follow or any(e['event'] in ('run_end', 'run_interrupted') for e in result['events']):
                 return
         time.sleep(1)
 

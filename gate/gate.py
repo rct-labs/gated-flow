@@ -2754,7 +2754,7 @@ def cmd_run(args) -> None:
     print(f"  judge   : {'on — ' + ' → '.join(jcfg['chain']) if jcfg.get('enabled') else 'off'}")
     journal(
         repo,
-        {"event": "run_start", "run": run_id, "workers": workers, "pins": pins,
+        {"event": "run_start", "run": run_id, "runner_pid": os.getpid(), "workers": workers, "pins": pins,
          "judge": bool(jcfg.get("enabled")), "stage": delivery_stage(cfg),
          "metrics_version": 1},
     )
@@ -3567,7 +3567,7 @@ def cmd_review(args) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     RUN_BUDGET.update(max=int(cfg.get("max_model_calls") or 0), calls=0)
     files_by_task = {t: parse_task_files(text).get(t) or [] for t in tasks}
-    journal(repo, {"event": "run_start", "run": run_id, "workers": [], "pins": {},
+    journal(repo, {"event": "run_start", "run": run_id, "runner_pid": os.getpid(), "workers": [], "pins": {},
                    "judge": not args.acceptance_only, "mode": "review",
                    "stage": delivery_stage(cfg), "metrics_version": 1})
     acceptance = None

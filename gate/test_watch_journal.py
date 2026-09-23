@@ -6,6 +6,7 @@ import tempfile
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('watch_journal', Path(__file__).with_name('watch-journal.py'))
 watch = importlib.util.module_from_spec(spec)
@@ -127,6 +128,35 @@ class WatchTests(unittest.TestCase):
         for extra in (['--once'], ['--wait', '61']):
             result = subprocess.run(command + extra, capture_output=True, text=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
+
+    def test_owner_exit_without_terminal_event_is_reported_once(self):
+        watch.initialize(self.journal, self.cursor)
+        self.append({'event': 'run_start', 'runner_pid': 1234})
+        with mock.patch.object(watch, 'process_alive', return_value=True):
+            self.assertEqual(len(self.read()['events']), 1)
+        with mock.patch.object(watch, 'process_alive', return_value=False):
+            result = self.read()
+            self.assertEqual(result['events'][0]['event'], 'run_interrupted')
+            self.assertEqual(result['bytes_read'], 0)
+            self.assertEqual(self.read()['events'], [])
+
+    def test_terminal_record_drains_before_liveness_and_unknown_is_not_exit(self):
+        watch.initialize(self.journal, self.cursor)
+        self.append({'event': 'run_start', 'runner_pid': 1234})
+        with mock.patch.object(watch, 'process_alive', return_value=None):
+            self.read()
+            self.assertEqual(self.read()['events'], [])
+        self.append({'event': 'task_done'})
+        self.append({'event': 'run_end'})
+        with mock.patch.object(watch, 'process_alive', side_effect=AssertionError('must drain first')):
+            self.assertTrue(self.read(limit=1)['more'])
+            self.assertEqual(self.read()['events'], [{'event': 'run_end'}])
+
+    def test_real_process_liveness_does_not_signal_or_kill(self):
+        self.assertTrue(watch.process_alive(watch.os.getpid()))
+        proc = subprocess.Popen([sys.executable, '-c', 'pass'])
+        proc.wait(timeout=5)
+        self.assertFalse(watch.process_alive(proc.pid))
 
 
 if __name__ == '__main__':

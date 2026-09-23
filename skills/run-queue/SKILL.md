@@ -121,6 +121,12 @@ rely on a tool-shell background loop surviving the session.
 `more: true` means unread events remain: drain another bounded page immediately.
 `idle` is not success, failure or a reason to inspect the transcript. The cursor
 survives sessions; invalid or oversized records and journal resets emit warnings.
+New runners include their PID; the watcher emits `run_interrupted` once if that
+process exits without `run_end`, and follow mode exits. Treat it as missing
+completion evidence, not a failed test or success. Inspect the owner/exit status
+once, then resume only the unfinished stage using passed review evidence. For
+older runs without a PID, check owner liveness at a suspected stall before waiting
+again; do not spend the whole test timeout polling a dead runner.
 On a warning, inspect the affected journal segment before treating it as healthy.
 On `run_end`, read RUN-REPORT once, bottom-up. Review the worker's bounded final
 excerpt only for a failure/scope request, a user status question, or suspected
