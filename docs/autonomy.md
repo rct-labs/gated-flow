@@ -149,9 +149,11 @@ or newly invented requirements. Incidentally encountered serious defects are
 reported honestly, never hidden to force a pass.
 
 A repair with unchanged recorded blockers stops as `review_loop`.
-A smaller blocker set is progress, but does not authorize another round.
+A smaller blocker set is progress; the host assesses further in-goal work against
+existing authorization, actual evidence and the cumulative budget.
 The journal persists repair review results; subsequent review-origin tasks
-stop as `repair_paused` without a valid explicit continuation grant.
+stop as `repair_paused` without a bounded grant recording existing goal authorization.
+This machine checkpoint does not require the user to approve each repair again.
 
 ## 5. Execution, evidence and limits
 
@@ -216,24 +218,42 @@ do not claim a production speedup from a synthetic call-count reduction.
 
 ## Repair continuation
 
-Automatic repair policy: consolidate evidenced high-risk defects and broken
-current core flows into one repair batch, followed by targeted verification.
-Record ordinary defects for later grouped maintenance; do not dispatch them
-just because review found them. Existing promised acceptance still cannot be
-reported as passed while failing. If the repair or its verification fails,
-stop automatic dispatch, even if blocker counts decrease or budget remains.
-This includes review, local-test and stage-acceptance failures: do not alternate
-stop types, rename tasks, or restart sessions to obtain another repair round.
+Authorization attaches to the agreed goal, not to each attempt. When the user has
+authorized implementation through completion, evidenced defects in that same
+acceptance and direct repair regressions may be fixed without asking again.
+Do not expand the product scope, external effects or explicit user limits.
 
-Continuation is OFF by default. Only explicit user authorization for this
-continuation permits setting `repair_continuation.enabled: true`, a nonempty
-`approved_by` recording that authorization, a finite `tasks` list and an
-`expires_at` Unix timestamp. Do not infer consent from "continue", spare quota,
-or permission to finish the original delivery. Before enabling it, record the
-user-authorized cumulative time, spending and round caps in the existing spec
-and CONTEXT; stop at the first cap, missing usage evidence, or no progress.
-Do not reset caps across runs. The engine enforces the named-task/expiry grant
-following a failed repair review or failed repair run; cumulative spend
-and failures outside the runner remain host-enforced. This is not a provider billing cap. Expire/disable the
-grant at the end of the authorized batch; never carry it into another project
-or delivery. Keep safety failures visible and never call them complete.
+Consolidate related defects into a small repair batch. Before dispatch, record
+the failing acceptance, concrete cause, changed approach and cheapest decisive
+check. Cover the supported branches of the changed flow together, including
+refund versus reversal and save/select/use where applicable; a happy-path test
+alone does not close an agreed branch. Optional findings stay in the backlog.
+Reuse passed checks while their relevant inputs remain unchanged; run the final
+required oracle once on the final candidate. Review repairs and direct regressions,
+not the entire package again. Do not rerun commands just to retrieve their output.
+
+A runner stop returns control to the host; it is not automatically a permission
+request. On unchanged blockers, stop repeating the approach. Inspect the existing
+failure evidence once and continue only with a materially different, evidenced
+fix. If the same cause fails again without new evidence, stop model dispatch and
+report the actual technical blocker. Do not rename tasks/findings to hide history.
+New findings must map to existing acceptance or a serious direct regression;
+an endless succession of unrelated improvements is not progress toward the goal.
+
+Keep the cumulative deadline and any user-set call/token/spending caps in the
+spec and CONTEXT across runs. Host estimates/checkpoints are scheduling tools,
+not invented user-approval gates. Never silently extend an explicit user limit.
+Track actual available usage; missing currency/token data is unknown, not zero
+or a reason to invent a new spending approval. Call counts are not token costs.
+
+The engine still requires a bounded `repair_continuation` grant after a failed
+repair: `enabled: true`, `approved_by` citing the existing goal authorization,
+a finite admitted `tasks` list and a finite `expires_at` within the cumulative
+deadline. The host may update named tasks for evidenced in-goal repairs while
+the runner is stopped; this is bookkeeping, not a new user approval. A bare
+switch, spare quota or unrelated authorization is insufficient. Disable the grant
+when the goal finishes or its budget/authority ends; do not carry it elsewhere.
+
+Ask only when a necessary decision or permission is genuinely missing, an
+external action exceeds authorization, or a user-set limit needs changing.
+Otherwise continue toward the goal. Never report a failed acceptance as complete.

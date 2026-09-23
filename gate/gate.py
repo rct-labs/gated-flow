@@ -2574,7 +2574,12 @@ def open_stage_defects(repo: Path, cfg: dict, affected: list[str] | None = None)
 
 
 def repair_continuation_allowed(cfg: dict, tid: str) -> bool:
-    """A bare switch or spare budget is not an authorization."""
+    """Bound a repair to recorded goal authorization, named tasks and a deadline.
+
+    approved_by may cite the original authorized goal; it does not require a
+    new user approval for each repair. The host owns scope/progress assessment.
+    A bare switch or spare budget is still insufficient.
+    """
     grant = cfg.get("repair_continuation") or {}
     if not isinstance(grant, dict):
         return False
@@ -3435,22 +3440,24 @@ def render_report(
         )
     if stop.startswith("repair_paused:"):
         waiting.append("- The repair batch has already been verified and remains blocked. "
-                       "Automatic continuation is off. Report unresolved blockers; only an "
-                       "explicit, expiring authorization for named tasks permits continuation.")
+                       "The bounded goal grant is absent or expired. The host should check "
+                       "existing goal authorization, scope, progress and cumulative budget; "
+                       "do not ask again merely because a repair failed.")
     if stop.startswith("review_failed:"):
         tids = stop.split(":", 1)[1]
         waiting.append(
             f"- **{tids}**: DONE by the acceptance gate, but the review did not pass "
-            f"({review_reason(results, review)}). Read the Review section; admit one "
-            "consolidated repair batch only if none has been attempted; otherwise stop. "
-            "Further repair requires explicit continuation authorization. Never waive safety."
+            f"({review_reason(results, review)}). Consolidate evidenced defects within the "
+            "authorized goal and remaining cumulative budget; verify only the repair and "
+            "direct regressions. Reuse existing authorization. Never waive safety."
         )
     if stop.startswith("review_loop:"):
         waiting.append(
             f"- Repair made no progress on the recorded blockers at `{stop.split(':', 1)[1]}`. "
             "Do not repeat the same patch strategy. Diagnose the common cause, report the "
             "usable work and blocker, and decide whether a different approach fits the "
-            "remaining scope and budget, with explicit continuation authorization. "
+            "remaining authorized scope and cumulative budget. Ask the user only for a "
+            "real missing decision, permission or budget extension. "
             "Task renaming does not erase defect history.")
     if stop.startswith("stage_acceptance_failed:"):
         waiting.append("- The stage checkpoint failed. Read the selected check logs or resolve "
@@ -3510,15 +3517,17 @@ def render_report(
     elif stop in ("budget", "run_timeout", "budget:model_calls"):
         lines.append("- Budget reached. Start another run to continue.")
     elif stop.startswith("repair_paused:"):
-        lines.append("- Automatic continuation is off. Report unresolved blockers and wait "
-                     "for explicit authorization of a bounded continuation batch.")
+        lines.append("- Reconcile the bounded grant with existing goal authorization. "
+                     "The host may admit named in-goal repairs without repeated approval; "
+                     "do not extend a user limit or rerun an unchanged failed approach.")
     elif stop.startswith("review_failed:"):
         lines.append("- The tasks are DONE and committed; the review, not the work, stopped "
-                     "the run. Repair high-risk/core blockers once as a batch; after its verification, "
-                     "stop if blocked. Further repair requires explicit authorization.")
+                     "the run. Repair evidenced acceptance blockers within the authorized goal; "
+                     "reuse passed evidence and avoid another broad review.")
     elif stop.startswith("review_loop:"):
-        lines.append("- The same blockers remain. Diagnose the cause before further dispatch; "
-                     "automatic continuation requires explicit user authorization even with spare budget.")
+        lines.append("- The same blockers remain. Stop the failed approach and diagnose before "
+                     "dispatch. Continue only with a materially different evidenced fix within "
+                     "the existing goal and cumulative budget; otherwise report the real blocker.")
     elif stop.startswith("stage_acceptance_failed:"):
         lines.append("- Fix the demonstrated checkpoint failure within its impact scope. "
                      "Ordinary unrelated defects stay in the defect list.")
