@@ -93,35 +93,44 @@ Then watch the journal: append-only NDJSON at `<repo>/.gate/journal.ndjson`.
 | `tool_disabled` | a CLI hit its quota and was benched |
 | `task_end` / `run_end` | outcome per task / stop reason |
 
-### Arm one validated watcher
+### Watch incremental events, not repeated transcripts
 
-gate.py writes `"event": "run_start"` with a space after the colon. Use the
-tolerant form and validate it against an earlier run before arming:
-
-```
-'"event": ?"(run_start|attempt_start|task_done|worker_left_changes|scope_request|prompt_too_large|review_verdict|review_skipped|stage_acceptance|full_acceptance|needs_approval|task_end|tool_disabled|admit_refused|run_end)"'
-grep -cE '<pattern>' <repo>/.gate/journal.ndjson     # must be > 0
-N=$(wc -l < <repo>/.gate/journal.ndjson)             # BEFORE launching
-```
-
-Where a persistent `Monitor` exists, arm exactly one with `run_end` in the
-filter through the canonical pipeline, and run its selftest first:
+Arm a cursor BEFORE launch; initialization skips history. Use one cursor per host,
+and never reinitialize during a run (that would discard unseen events):
 
 ```
-bash "$(flow home)/gate/watch-journal.sh" <repo> --selftest     # must exit 0
-Monitor(persistent: true, command: bash "$(flow home)/gate/watch-journal.sh" <repo> $N)
+python <flow-home>/gate/watch-journal.py <repo> --init
 ```
 
-Never append `cut`, `awk`, `sed` or `head` after it (block-buffered, events
-vanish). Never use a `run_in_background` Bash `until` loop as the wake
-channel on a multi-hour run; it is reaped at ten minutes. Hosts without a
-Monitor poll `tail -n +$((N+1)) ... | grep -qE '"event": ?"run_end"'` every
-60 seconds and keep the turn open. On any status question read the journal
-and the report before answering.
+With a persistent Monitor, attach it to the same helper with `--follow`; output is
+flushed only for relevant events and it exits after `run_end`. Retire that monitor
+before starting a replacement. The existing `watch-journal.sh` remains a legacy
+line-number interface; do not stack both watchers or append buffering filters.
+
+Without a Monitor, call `--once`: the byte cursor reads only new complete records
+and returns bounded event summaries. Follow `next_poll_s` (60 → 120 → 300 seconds
+while idle; reset on events), subject to the host's wait/response limits. For a
+host that cannot wait that long, `--once --wait 55` waits internally for an event
+for at most 55 seconds; do useful independent work between checks. Keep the active
+turn open while the authorized run proceeds. Do not invent a persistent tool or
+rely on a tool-shell background loop surviving the session.
+
+`more: true` means unread events remain: drain another bounded page immediately.
+`idle` is not success, failure or a reason to inspect the transcript. The cursor
+survives sessions; invalid or oversized records and journal resets emit warnings.
+On a warning, inspect the affected journal segment before treating it as healthy.
+On `run_end`, read RUN-REPORT once, bottom-up. Review the worker's bounded final
+excerpt only for a failure/scope request, a user status question, or suspected
+stall (no journal activity for more than twice the configured heartbeat interval).
+Do not repeatedly read full logs, diffs, config or skills. Keep a separate offset
+if more worker diagnostics are needed. No acceptance/review rules are weakened.
 
 ### Narrating
 
-One short line per new event, nothing between events:
+Report task completion, blockers, review/acceptance and meaningful changes. Combine
+adjacent start/end events where possible. No repeated “still running” messages or
+minor test-by-test updates; obey any higher-priority host update requirement with
+the shortest necessary status, without extra transcript reads merely to fill it.
 
 ```
 WP-A -> claude, started

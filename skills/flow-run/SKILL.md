@@ -154,7 +154,11 @@ Never raise limits or weaken admission to get a task through.
 Count remaining TODO rows and pass that as `--MaxTasks`: any enabled review
 and the selected stage checks run when the queue has no TODO left, so one launch per
 package is the cheap shape and a launch per task buys nothing. Then follow
-`run-queue`: detached launch, one validated watcher, narrate, read the report.
+`run-queue`: detached launch, one incremental event watcher, report meaningful changes,
+read the final report. Keep a byte cursor; do not repeatedly scan full journals or
+worker transcripts. Prefer event notifications; otherwise use idle backoff within
+host responsiveness limits. Read worker log excerpts only for an error, a suspected
+stall or a user status question. Empty polls are not progress to narrate.
 Never mark DONE, never `--no-verify`, never take over IN_PROGRESS, never
 push unless the user or CONTEXT already allowed it.
 
