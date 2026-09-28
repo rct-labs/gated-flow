@@ -163,6 +163,14 @@ and `judge.chain` when the project wants a package review, `judge.checkpoints`
 for rows that must be reviewed on their own, `max_model_calls` for the run.
 Never raise limits or weaken admission to get a task through.
 
+A new package starts from a clean slate. Before its first launch, re-read every
+package-scoped key the previous package left behind: `worker_prompt`,
+`revision_prompt`, `judge_prompt`, `judge_cmds`, `delivery.checks`,
+`delivery.stage`, `repair_continuation`, `recovery_inputs`, `max_model_calls`.
+Rewrite each for the new package or reset it; disable an old repair grant. A
+review prompt that still names the old tasks reviews nothing, and old checks
+never cover the new files. `admit` does not detect this; the host must.
+
 Count remaining TODO rows and pass that as `--MaxTasks`: any enabled review
 and the selected stage checks run when the queue has no TODO left, so one launch per
 package is the cheap shape and a launch per task buys nothing. Probes are lazy:
