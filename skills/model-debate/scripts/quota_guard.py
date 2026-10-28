@@ -70,6 +70,8 @@ def candidates(plan, seat):
 def validate(plan):
     if type(plan.get("version")) is not int or plan["version"] != 1:
         raise GuardError("UNSUPPORTED_PLAN")
+    if plan.get("profile", "debate") not in ("focused", "debate"):
+        raise GuardError("INVALID_PROFILE")
     integer(plan["min_models"], 2)
     integer(plan["project_min_models"], 1)
     if plan["min_models"] < plan["project_min_models"]:
@@ -249,6 +251,15 @@ def recovery_plan(plan, failure):
     stage = failure["stage"]
     if stage not in ("research", "round-1", "round-2"):
         raise GuardError("INVALID_STAGE")
+    focused = plan.get("profile", "debate") == "focused"
+    repeats = failure.get("repeat_seats")
+    if focused:
+        # The host must supply an explicit dependency audit, including [].
+        # Missing metadata cannot silently retain peer-dependent results.
+        if (not isinstance(repeats, list) or any(not isinstance(x, str) for x in repeats)
+                or len(set(repeats)) != len(repeats)
+                or not set(repeats) <= set(assignments)):
+            raise GuardError("FOCUSED_DEPENDENCY_AUDIT_REQUIRED")
     revised = deepcopy(plan)
     revised.pop("frozen_assignments", None)
     revised["excluded_pools"] = list(set(plan["excluded_pools"]) | {failed_pool})
@@ -261,20 +272,21 @@ def recovery_plan(plan, failure):
             affected.append(seat["id"])
             # Supplied remaining-call counts must include a replacement's fresh
             # research/round1/round2, plus its probes and authorized retries.
-            minimum = 2 if failure.get("no_web") is True else 3
+            minimum = (1 + (seat["id"] in repeats)) if focused else (2 if failure.get("no_web") is True else 3)
             if seat["remaining_calls"] < minimum:
                 raise GuardError("REPLACEMENT_WORK_NOT_BUDGETED")
         else:
             seat["candidates"] = [old_ref]
-            if seat["remaining_calls"] < 1:
+            if (not focused or seat["id"] in repeats) and seat["remaining_calls"] < 1:
                 raise GuardError("REPEATED_ROUND2_NOT_BUDGETED")
     return {**base, "status": "PREFLIGHT_REQUIRED", "reason": "AUTHORIZED_POOL_REPLACEMENT",
             "affected_seats": affected, "failed_pool": failed_pool,
             "required_plan_changes": {"excluded_pools": revised["excluded_pools"],
                                       "freeze_assignments_from_ready_result": True},
             "preserve": "Other seats' successful research/round1 only when input, role, identity and isolation fingerprints match.",
-            "invalidate": "Replaced seats' active research/round1; all round2 results and the merged research/objection index.",
-            "restart": "Fresh isolated replacement research/round1; rebuild the barrier/index; rerun round2 for every seat."}, revised
+            "invalidate": ("Replaced seats and audited dependent follow-ups; rebuild merged index." if focused else "Replaced seats' active research/round1; all round2 results and the merged research/objection index."),
+            "repeat_seats": repeats if focused else list(assignments),
+            "restart": ("Fresh isolated replacement round1; repeat only audited dependent follow-ups." if focused else "Fresh isolated replacement research/round1; rebuild the barrier/index; rerun round2 for every seat.")}, revised
 
 
 def execute(plan, failure=None, reader=probe):

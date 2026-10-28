@@ -1,201 +1,84 @@
-# CLI adaptation, isolation and execution
+# Native adapters and proportional validation
 
-Read before calls. These are capability requirements and discovery hints, not
-promises about installed builds. Exact versions, availability and errors belong
-in run records.
+## Resolve once, verify before accepting results
 
-Read [quota.md](quota.md) before capability probes and model calls. Its
-`quota_guard.py` performs read-only native allowance checks and whole-remaining-
-run budget admission. Exclusions apply before probes; an account limit is not a
-reason to spend another inference on the same exhausted account.
+Inspect native executable/version, supported flags and non-secret effective
+configuration without inference. Resolve model selectors from provider metadata;
+model self-identification is not evidence. Pin selector and supported effort on
+each invocation. Record primary serving identity separately from auxiliary usage,
+including family-only or unknown reproducibility. Unknown identities cannot count
+toward distinct-model quorum; conflicts quarantine the affected answer.
 
-## Discover, resolve, lock
+Exclude paused providers before discovery or quota reads. Do not install, change
+global defaults, copy credentials merely to make isolation work, or switch to paid
+API routes. Existing authenticated subscription transport may remain available.
 
-1. Read current CLI/subcommand help, version and non-secret effective model
-   configuration. Prefer supported model-list commands/provider metadata; caches
-   are leads and can be stale. Never dump credentials or whole config/env files.
-2. Resolve selectors through the adapter. Skill-level `default` means inspect
-   configuration, not a CLI model ID. Use `latest` only when that exact selector
-   is documented. Never guess a version from a marketing name.
-3. Preflight each distinct model/adapter configuration, not merely each binary.
-   Capture runtime events. A model field merely echoing the request is not
-   resolution evidence; model prose identifying itself proves nothing.
-   Compare primary response-model fields with the request as well as usage
-   records. If an exact requested ID conflicts with the reported serving ID,
-   fail preflight pending an authoritative alias mapping or corrected runtime;
-   do not relabel the requested seat to make the mismatch disappear. Track
-   primary and auxiliary usage separately, preserving ambiguous reports.
-4. Record selector, argument array, executable/version, observed serving
-   provider/family/model, metadata origin, assurance (`exact`, `family-only`,
-   `unknown`) and web/isolation probes. Redact auth material. Each seat links to
-   its applicable preflight.
-5. Pin exact IDs on every call when supported. If only a family/alias is exposed,
-   lock it and record missing snapshot reproducibility. Two distinct underlying
-   models still require evidence; unknown identities cannot supply the second.
-   Two evidenced different families may qualify without exact backend snapshots.
-6. Compare later runtime identity against the lock. A conflicting model or
-   CLI/config change invalidates the attempt; pause affected seats. Never
-   silently fall back or mix old/new identities in a completed stage. Exposed
-   metadata cannot detect hidden provider changes; disclose that limit.
+## Cheap checks first; no default ping
 
-Auxiliary suggestions, automatic subagents and helper models are not seats. For
-an exact model-only call set, disable auxiliary activity using supported process-
-local settings and verify usage metadata. Report inability before formal calls.
-Do not modify global defaults, upgrade CLIs or change subscriptions implicitly.
+Version/hash changes trigger **local compatibility inspection**, not an automatic
+inference-only probe. Compare supported arguments, effective tool/permission
+configuration, metadata schema and launch policy. A different version does not
+make an old live probe evidence for the new binary: record that limitation.
+Unchanged fingerprints may reuse previous runtime evidence with its date; no
+calendar-only expiry requires a paid inference. Quota freshness is separate.
 
-## Adapter discovery hints
+Prefer tools-off inline review. When local configuration and native handshake
+show the actual callable tool set is empty, the first substantive response can
+also validate model identity, complete multiline input delivery and the empty
+runtime tool set. Include a tiny input control if delivery is uncertain. Save
+raw runtime evidence; do not trust a model saying it has no tools. Reject the
+answer if tools unexpectedly appear, identity conflicts, required input is lost,
+or the response is incomplete. Verify the callable surface **before submitting
+sensitive inputs**; if the adapter only reports it later, first use a nonsensitive
+synthetic fixture or an already enforced boundary. Do not expose live private
+peer material to an uncertain policy just to save a call.
 
-Freeze reasoning effort alongside each seat's model selector before the first
-probe. Include backups, synthesis and review calls; use explicit supported CLI
-flags or native-agent fields every time. Record requested and observed effort
-separately, using unknown for missing runtime metadata. A host session/global
-configuration change does not amend the seat lock. Only an explicit instruction
-about future execution permits a recorded amendment and fresh affected contexts.
-If the selected model has no applicable effort control, record not_applicable
-and the capability evidence; never invent or silently ignore an effort flag.
+For tool-enabled seats, enforce permitted roots using actual supported access
+controls or an existing sandbox. Test affected read/write/traversal/session/log
+routes with harmless fixtures when enforcement is new, changed or uncertain.
+These checks may share the substantive call only if the boundary is independently
+enforced before access and violations cannot disclose peer artifacts. Otherwise
+use one narrow standalone capability probe for that affected adapter, not three
+provider-wide smoke tests. Count it in the shared reserve before launch. A cwd,
+read-only flag, prompt refusal or missing canary is not proof of read isolation.
+If isolation cannot be enforced, block the affected route; soft isolation needs
+explicit authorization. Never claim a local flag inspection is a live access test.
 
-| Adapter | Inspect locally | Establish before calls |
-|---|---|---|
-| Claude Code | `claude --help`, `claude --version` | Print mode, model selector, JSON/events, exact tool set, restricted file roots, nonpersistent sessions, MCP/permissions. |
-| Codex | `codex --help`, `codex exec --help`, `codex --version` | Exec mode, model pin, final-message capture/events, ephemeral sessions, sandbox/permission profile, web configuration. |
-| Kimi | `kimi --help`, model/provider subcommand help | Prompt mode, qualified model IDs, diagnostics separation, actual read-only and web controls. |
-| Grok | `grok --help`, `grok --version` | One-shot mode, model pin, sandbox/web/subagent controls, final-message extraction. |
+## Adapter pitfalls
 
-Build argument arrays from **this installation's** help and capability tests.
-Record commands in preflight, not version tables in the core skill. New adapters
-fulfill the same requirements without changing the procedure. Flags can change.
+| Adapter | Inspect and constrain |
+|---|---|
+| Codex | Native app-server/exec metadata, ephemeral sessions, model/effort, tools, MCP, plugins, hooks, memory and environment discovery; read-only is not a read boundary. |
+| Kimi | Native subscription route, effective custom agent tools/subagents, skill discovery, model metadata and output mode. Never infer paid fallback authorization. |
+| Grok | Native initialization tool set, web/subagent controls, model/effort and primary vs auxiliary model usage. A tool allowlist alone may leave other tools exposed. |
 
-Check these non-obvious pitfalls:
+Launch outside the project to avoid auto-loading unrelated project instructions;
+include applicable constraints in the packet. Keep peer outputs, archive paths
+and session stores inaccessible to tools. Never hand a reviewer the host history.
+Use native executables and argument arrays; Windows shell shims can truncate
+multiline prompts. Pass prompt by file/stdin through supported interfaces.
 
-- Variadic tool flags may swallow trailing prompts. Use documented positions
-  and argument arrays; never construct shell code from user text.
-- An auto-allow list may not remove other tools. Inspect the actual tool set,
-  including MCP, shell, browser-local-file and subagent routes.
-- Codex `read-only` describes write restrictions, not proof of denied reads
-  outside the seat root. A working directory is not a read boundary.
-- Final-message files may appear only on success. Capture stdout/events and
-  stderr separately; missing output on failure is possible.
-- Some minimal modes disable subscription auth with customizations. Do not
-  choose API-only modes or copy credentials to make a sandbox work.
-- Without enforceable write restrictions, use an actually protected snapshot
-  or another verified boundary. A prompt saying "do not edit" is insufficient.
-- The working directory of an agent CLI is part of the prompt. Launched at a
-  repository root it auto-loads that project's instruction files (`AGENTS.md`,
-  `CLAUDE.md`, project skills), which can replace the seat's role. Launch from
-  the seat's own input directory and hand over project evidence as inputs.
-- Windows `.cmd` package-manager shims can cut a prompt at its first newline.
-  Resolve the native executable, or pass the prompt by file or stdin, and
-  confirm in preflight that a multi-line prompt arrives whole.
-- A planning or approval-only permission mode may return narration instead of
-  a review, and may auto-activate unrelated skills. Probe that the chosen mode
-  yields a complete final answer before using it for a seat.
-- A seat started inside the host's own tool shell dies with that shell and
-  inherits its tool timeout, which truncates long reviews. Launch seats as
-  detached processes and poll their completion records.
-- Non-empty stderr is not a failure: some CLIs echo the whole transcript there.
-  Judge the attempt by its completion record and the validity of the result.
+## Research
 
-## Isolation and probes
+No standalone web smoke for a local contract review. When a seat researches an
+external fact, retain its actual retrieval URL/content/events; a plausible URL
+or answer is not proof. A seat without working web can receive the same host-
+verified factual packet, explicitly marked second-hand. Do not claim web-grounded
+verification without actual retrieval. Explicit `--no-web` disables research
+routes, not authenticated inference, and applies to host verification as well.
 
-Default to **verified tool-level isolation**: only seat inputs are readable via
-every tool the model can invoke, and reviewed inputs are immutable. Use supported
-restricted-root tools or an existing OS/container boundary. Do not install
-containers, create accounts or alter broad ACLs implicitly. Tool-level isolation
-limits agent actions, not a malicious CLI binary; report the actual mechanism
-and tested scope rather than claiming an OS-security guarantee.
+## Launch and completion
 
-Disable/constrain alternate channels: shell/code execution, MCP filesystems,
-local browser/file URLs, host-agent/session APIs, hooks, memory and symlink/
-junction escapes. Keep peer and archive paths outside readable roots. Inspect
-session/log access too. Check auto-loaded project instructions; preserve applicable
-rules in input packets if a supported launch mode suppresses discovery. Resolve
-requirements by scope/priority; never waive a required unavailable tool in a
-prompt. Mark evidence gaps or surface an actual blocker.
+Use fresh independent sessions, immutable prompts, explicit cwd and model/effort.
+One task-local launcher may run different subscription pools concurrently; reserve
+all starts before launching, with whole-run admission as described in quota.md.
+Keep windows hidden. Capture stdout/events and stderr separately, final answer,
+prompt hash, model/config fingerprint, PID, start/end, OS exit and terminal status.
+Zero exit or a file's existence is insufficient: require valid nonempty output,
+identity and boundary evidence. Failed/partial output is never a completed vote.
 
-Probe through actual enabled seat tools under the same launch policy:
-
-- Successfully read an own-input control; attempt a harmless write to a
-  disposable reviewed-input fixture and verify refusal.
-- Attempt known existing absolute peer/archive paths, relative traversal and
-  any available link/session-log route. Require denial by access enforcement,
-  not a missing file or the model declining to try.
-- Place unique private canaries in test seats. Retrieving a peer's token fails.
-  Its absence in the answer is **not** proof: retain tool-level denied reads
-  and the successful control read.
-
-Reuse probes within a run only for identical boundary configuration; test each
-differing policy. Across runs, a **cached preflight** may stand in for the
-identity, isolation and web probes of an adapter when all of these still match
-the cached record: executable path and version, resolved model selector and
-effort, argument array, permission/sandbox policy, the non-secret effective
-configuration fingerprint, and OS user. Keep the records outside any project
-(for example `~/.model-debate/preflight/<fingerprint>.json`) with the probe
-evidence and timestamp. A record is valid for 7 days; any fingerprint change, a
-failed or surprising seat result, or a user request invalidates it at once and
-the probes run again. State in `roster.md` and the report which assurances come
-from a cached preflight and its age. The cache never covers quota: run the
-quota guard fresh every time. Cached results do not upgrade an assurance level
-and cannot supply the evidence for a second distinct model that the original
-probe did not establish. If a channel is unrestricted or a read succeeds, do not
-label the round independent. Try supported stricter launch modes first. If none
-works, report the precise gap. Proceed with explicitly labeled **soft isolation**
-only when the user authorizes that limitation; otherwise stop the affected launch.
-Existing soft-isolation authorization persists. Never replace requested models
-merely because their isolation capability is missing.
-
-## Web and no-web
-
-Probe a benign public fact using an actual search/fetch tool. Retain the event,
-URL and retrieved content/title. A plausible answer/URL is insufficient. Without
-observed retrieval evidence, mark web unverified and use a declared host packet
-before round 1.
-
-With `--no-web`, explicitly disable research tools and indirect network routes
-(shell, MCP, browser, subagents). Omitting an enabling flag does not disable an
-existing default. Preserve authenticated inference transport: no-web restricts
-seat research, not model inference. Report a policy that cannot enforce the mode.
-
-## Launch, complete, retry
-
-Use temporary task-local process handling, not an installed runner. One call per
-seat/stage, fresh session, isolated inputs, immutable prompt, explicit model,
-known cwd, stdin closed unless deliberately used for the prompt, and separate
-final answer/stdout/events/stderr. Prefer argument arrays/direct executables;
-Windows wrappers need a supported launcher, not interpolated shell code. Hide
-Windows helper windows; do not translate POSIX `&`/`wait` literally to PowerShell.
-
-Parent launcher writes atomic `completion.json` after streams close, including
-seat/stage/attempt, process identity, start/end time, terminal status (`SUCCEEDED`,
-`FAILED`, `TIMED_OUT`, `CANCELLED`), nullable OS exit code, input hash, model-lock
-fingerprint and result path. Use a finally path so failures also get records.
-Zero exit still requires a nonempty valid final result, matching model identity
-and required claim/objection coverage. Missing output is failed, not success.
-
-Observe completion records plus process status, not result-file size. If the
-launcher dies without a record, reconcile its recorded process identity before
-retrying; never duplicate a still-running seat. Apply per-seat deadlines to the
-task-owned process tree with supported OS mechanisms; retain partial outputs as
-failed attempts, and never kill by generic process name. Individual waits stay
-short so progress is visible even when a seat runs for minutes.
-
-Distinguish exhausted account quota from a transient rate limit. Use the
-quota recovery plan for authorized replacements; recheck quota and shared-pool
-budget before every retry. Preserve historical originals, rebuild independent
-replacement research/round1, and invalidate ALL round2 results when the model
-roster changes. Existing explicit roster-change authority is sufficient; do
-not ask again for the same authorized substitution. Unknown failures require
-reconciliation/repair, not an inferred model switch.
-
-Set a retry allowance (normally one transient retry per failed seat). Preserve
-attempts and retry only failures, counting all probes/retries in the call budget.
-Reuse successful outputs only with unchanged draft, claims, constraints, role,
-visible evidence and model-lock fingerprints. Round-2 reuse also requires the
-same index and full published round-1 snapshot. Changed inputs invalidate all
-dependent results, not just the previously failed seat.
-
-Availability filtering is allowed **before freezing an automatically discovered
-roster**, with exclusions disclosed. Explicit requested seats/models cannot be
-dropped automatically. After freeze, failure blocks stage completion until a
-budgeted repair or authorized roster revision resolves it, even if two models
-remain. Single-model review needs explicit separate authorization and is never
-presented as a multi-model debate.
+Bound each attempt with a deadline. Kill only its owned process tree on timeout;
+reconcile process identity before retry to avoid duplicate still-running calls.
+Retain failed attempts. Batch status checks rather than repeated per-seat polling.
+No inference retry for explicit exhaustion; unknown failures require diagnosis,
+not an inferred provider switch. See quota.md for authorized recovery.

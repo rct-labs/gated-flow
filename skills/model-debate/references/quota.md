@@ -15,7 +15,7 @@ the debate, or make a business workflow safe to replay.
    authority. Multiple roles/models on one account share its remaining capacity.
    Read provider metadata/help without starting an inference turn. The guard's
    quota readers do not establish full model identity or sandbox isolation.
-3. Write `quota-plan.json` beside the run's `roster.md`. Include all remaining
+3. Write `quota-plan.json` (set `profile: "focused"` for the default workflow; omitted profile preserves legacy `debate` recovery) beside the run's `roster.md`. Include all remaining
    research/round1/round2 calls, inference probes and allowed retries/replacement
    work; include previously used calls and in-flight calls. Reserve in-flight
    calls BEFORE starting them, subtract from remaining work, and retain the
@@ -26,7 +26,12 @@ the debate, or make a business workflow safe to replay.
    explicitly disclosed conservative bootstrap estimate. Missing estimates are
    UNKNOWN. Subscription percentages, money and tokens are distinct units;
    never convert using invented prices or assume a provider's hidden limits.
-5. Run the helper below. Only READY permits the listed roster to proceed.
+5. Run the helper below. For a batch of independent pools, one READY receipt
+   may admit the reserved batch if launches occur within its freshness window
+   (at most60seconds), bindings and budget are unchanged, and no failure occurs.
+   Reserve each call before starting; do not reuse receipts for retries or later
+   batches. This removes redundant simultaneous quota processes, not freshness.
+    Only READY permits the listed roster to proceed.
    Save a NEW receipt for each check. Freeze the selected roster, backup order,
    replacement authorization, minimum model count and total call/wall budget.
    Persist the READY assignments as `frozen_assignments` in the next plan
@@ -156,9 +161,13 @@ superseded results retain their model labels in the archive.
 
 Other successful research/round1 answers can stay active only when their common
 inputs, own role, evidence, model-lock and isolation fingerprints are unchanged.
-If those changed, invalidate the dependent answers too. Once a model changes,
-rebuild the merged research and objection index; ALL old round2 answers become
-historical, including successful ones, because their peer snapshot changed.
-Run round2 again for all seats, then verify distinct models and project quorum
-from valid results in the same final revision. Preserving originals is not the
+If those changed, invalidate the dependent answers too. Rebuild the merged
+index after a model change. In focused recovery, supply `repeat_seats` in the
+failure record: the explicit dependency-audited list of follow-ups that consumed
+the replaced answer, including an explicit empty list when none did. Each listed
+seat needs one repeat call; a replaced seat needs one fresh round1 call plus its
+listed repeat, if any. Missing dependency audit blocks recovery. Unrelated valid
+round1 answers need zero extra calls. In debate profile (also the legacy omitted
+profile), all round2 answers depend on the shared peer snapshot and are repeated.
+Verify distinct models and project quorum from valid results in the final revision. Preserving originals is not the
 same as counting them toward the new verdict.

@@ -5,9 +5,17 @@ user projects. Temporary launch/test helpers need not become a permanent framewo
 Run the skill-creator frontmatter validator when available and check local links;
 heading/keyword checks alone do not validate the workflow.
 
-## Independent forward test
+## Offline checks first
 
-Give an independent reviewer the skill, a fictitious draft, owner constraints,
+Run deterministic quota/recovery tests and inspect realistic scenario decisions
+without inference. Independent model forward tests and live smoke are optional,
+used only for an unresolved behavior risk with disclosed budget; editing prose
+does not itself require paid recursive review. Report live boundaries NOT TESTED
+when only local checks ran.
+
+## Optional independent forward test
+
+When justified and budgeted, give an independent reviewer the skill, a fictitious draft, owner constraints,
 local evidence and synthetic identity metadata. Do not give expected answers.
 Ask for setup/selection, round-1 input manifests and a verification plan without
 live calls. Check actual output against these cases, not self-assessed PASS labels.
@@ -35,10 +43,10 @@ This is a workflow test, not a live-model or sandbox test.
 | "Finish quickly" arrives mid-run | `focused` keeps host verification and the surviving-dispute round, `debate` keeps round 2; otherwise the run stays open or changes profile with agreement, and the report names the profile that ran. |
 | No profile requested, ordinary review | `focused`, three seats on three vendors, one call per seat plus a disclosed reserve. |
 | Draft claim checkable by reading a local file | Host settles it before seat calls; seats receive it as `SETTLED-*` with evidence, not as an open question. |
-| `focused`: one design dispute survives verification, three objections settled by it | Only the surviving dispute is sent, to the seats holding the positions plus one other model; settled objections closed with reasons. |
+| `focused`: one design dispute survives verification, three objections settled by it | Send one compact question to the relevant model if it can resolve the decision; settled objections closed locally. Extra calls need a concrete reason and budget. |
 | `focused`: nothing survives verification | `no surviving disputes` recorded, no second round, run reported complete. |
-| Cached preflight, CLI version changed | Cache rejected; probes rerun; roster shows fresh evidence. |
-| Cached preflight valid | Probes skipped, quota guard still run fresh, report states the cache and its age. |
+| Cached preflight, CLI version changed | Inspect current flags/config/schema locally; old probe is historical. Combine affected verification with first useful call where enforceable; standalone probe only for unresolved boundary risk. |
+| Cached preflight valid | Reuse applicable evidence with date/limits; fresh quota per launch batch; no calendar-only inference probe. |
 | Two models, one vendor and account pool | Minimum met; reduced diversity disclosed in roster and report; agreement not called cross-vendor. |
 | Run stops after round 1 | `decision-log.md` written with stage reached and reason; reported incomplete. |
 | Report with `final.md` not applied | Application status stated on its own line. |
@@ -91,12 +99,16 @@ never consume an owner-excluded model just to check its reported exhaustion.
 | Monetary balance | Preserve currency; no percent conversion or implicit paid account. |
 | Project minimum3, generic minimum2 | Three proven distinct models required; aliases/roles do not increase quorum. |
 | Quota exhaustion after freeze | Quarantine pool; no same-pool retry; only authorized alternatives and fresh sufficient budget. |
-| Replacement after round2 partly succeeds | Preserve originals; new independent research/round1; rebuild peer index and repeat all round2. |
+| Replacement after round2 partly succeeds | Preserve originals; fresh independent replacement; focused repeats audited dependencies only, debate repeats all round2. |
 | Changed context, unknown process, unverified read-only boundary | Reconcile/rebase before recovery; no automatic replay. |
 | Explicit transient Retry-After | Bounded cooldown/recheck; no inference of weekly exhaustion from a bare429. |
 | Unknown native schema or probe deadline | Typed UNKNOWN, no raw credential-bearing error output. |
 
-Independent forward-test the updated instructions with synthetic owner limits,
+Exercise the updated instructions with synthetic owner limits,
 shared pools and partly completed results. A native read-only account smoke
 validates quota transport only; it is not a model inference, complete debate,
 read-isolation or profitability test. Retain those distinctions in acceptance.
+
+Additional efficiency cases: local tools-off review has no default web or inference-only smoke; failed seat replacement in focused profile preserves unrelated successful seats after an explicit dependency audit; three independent pools share one fresh reserved batch; changed source invalidates dependent results; malformed or unexpectedly tool-enabled first response never counts as a valid vote.
+
+Review routing: routine reproducible bug+regression test -> direct validation, zero review calls; documentation-only change -> zero review calls; difficult unresolved implementation defect -> one scoped reviewer if useful; cross-layer core contract with project quorum3 -> three independent models; explicit user review -> honor requested scope.

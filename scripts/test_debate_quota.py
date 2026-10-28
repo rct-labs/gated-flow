@@ -259,6 +259,60 @@ class RecoveryTests(unittest.TestCase):
             g.recovery_plan(self.doc, failure())
 
 
+class FocusedRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.doc = plan()
+        self.doc.update(profile="focused", max_calls=8, used_calls=2)
+        for seat in self.doc["seats"]:
+            seat["remaining_calls"] = 0
+        self.doc["seats"][2].update(candidates=["c", "d"], remaining_calls=1)
+        self.record = failure()
+        self.record["repeat_seats"] = []
+
+    def test_replacement_only_uses_one_call_and_keeps_unrelated_answers(self):
+        action, revised = g.recovery_plan(self.doc, self.record)
+        self.assertEqual(action["repeat_seats"], [])
+        self.assertEqual([s["remaining_calls"] for s in revised["seats"]], [0, 0, 1])
+        result = g.evaluate(revised, samples(revised), NOW)
+        self.assertEqual(result["status"], "READY")
+        self.assertEqual(result["assignments"], {"a": "a", "b": "b", "c": "d"})
+
+    def test_missing_or_invalid_dependency_audit_is_not_a_free_pass(self):
+        for value in (None, "a", ["missing"], ["a", "a"], [{}]):
+            self.record["repeat_seats"] = value
+            with self.assertRaisesRegex(g.GuardError, "FOCUSED_DEPENDENCY_AUDIT_REQUIRED"):
+                g.recovery_plan(self.doc, self.record)
+
+    def test_dependent_successful_answer_requires_repeat_budget(self):
+        self.record["repeat_seats"] = ["a"]
+        with self.assertRaisesRegex(g.GuardError, "REPEATED_ROUND2_NOT_BUDGETED"):
+            g.recovery_plan(self.doc, self.record)
+        self.doc["seats"][0]["remaining_calls"] = 1
+        action, revised = g.recovery_plan(self.doc, self.record)
+        self.assertEqual(action["repeat_seats"], ["a"])
+        self.assertEqual(g.evaluate(revised, samples(revised), NOW)["status"], "READY")
+
+    def test_replacement_with_own_followup_needs_two_calls(self):
+        self.record["repeat_seats"] = ["c"]
+        with self.assertRaisesRegex(g.GuardError, "REPLACEMENT_WORK_NOT_BUDGETED"):
+            g.recovery_plan(self.doc, self.record)
+        self.doc["seats"][2]["remaining_calls"] = 2
+        self.assertEqual(g.recovery_plan(self.doc, self.record)[0]["status"], "PREFLIGHT_REQUIRED")
+
+    def test_quorum_and_budget_still_apply(self):
+        self.doc["models"]["d"]["family"] = "a"
+        _, revised = g.recovery_plan(self.doc, self.record)
+        self.assertEqual(g.evaluate(revised, samples(revised), NOW)["status"], "BLOCKED")
+        self.doc["max_calls"] = 2
+        with self.assertRaisesRegex(g.GuardError, "CALL_BUDGET_EXCEEDED"):
+            g.recovery_plan(self.doc, self.record)
+
+    def test_profile_typo_rejected(self):
+        self.doc["profile"] = "focusd"
+        with self.assertRaisesRegex(g.GuardError, "INVALID_PROFILE"):
+            g.validate(self.doc)
+
+
 class NativeNormalizationTests(unittest.TestCase):
     def test_codex_all_windows_and_bucket_selection(self):
         window = {"usedPercent": 12, "resetsAt": 2000000000}
