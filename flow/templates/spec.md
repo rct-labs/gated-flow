@@ -22,5 +22,8 @@ revision: 1
      Keep supported inputs and non-goals explicit; review does not expand them. -->
 
 ## Decisions
-<!-- Choices made and why, one line each. Long-lived ones graduate to
-     docs/adr/. -->
+<!-- Choices made and why, one line each: date, current|superseded|rejected,
+     the decision, why, source (user correction, test, commit). Mark a
+     replaced choice superseded in place; never delete it. `flow recall`
+     finds these lines and labels superseded ones. Long-lived ones graduate
+     to docs/adr/. -->

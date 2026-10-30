@@ -22,6 +22,7 @@ Codex `$flow`, Kimi Code `/skill:flow`, Grok Build `/flow`. This manual writes
 | `flow` command | `~/.local/bin/flow` (bash shim) plus `flow.cmd` for PowerShell/cmd on Windows; both on PATH |
 | Execution engine | `gate/gate.py` in the checkout (admission + acceptance + the unattended loop) |
 | Tree auditor | `flow/audit.py` in the checkout (read-only) |
+| Session continuity | `flow/continuity.py`: `flow resume`, `flow checkpoint`, `flow recall` (section 4) |
 | Skills | `flow`, `flow-run`, `run-queue`, `model-debate`, installed into each CLI's global skills directory |
 
 `flow home` prints the checkout directory, so every engine script can be
@@ -206,6 +207,19 @@ Tell your agent `$flow switch session`. It rebuilds `CONTEXT.md` (≤200 lines,
 five questions: goal and red lines / what is being worked on / last checkpoint /
 next step / decisions waiting on a human). **CONTEXT.md is the handoff document;
 there is no separate long handoff write-up.**
+
+The same three commands work from every CLI (your agent runs them for you):
+
+| Command | What it does |
+|---|---|
+| `flow resume --repo .` | Read-only recovery for a new session: the five CONTEXT sections with line references, Git state, queue head, last gate run and verdict, work packages, and anything that overrides the snapshot (stale snapshot, interrupted or active run, failed or outdated PASS, uncommitted paths). Prints the snapshot digest |
+| `flow checkpoint --from draft.md --expect <digest>` | Validates a complete five-section draft and replaces `CONTEXT.md` atomically, with an anchor line recording HEAD and the tree. Malformed, oversized or out-of-date input (someone else saved in between) changes nothing. Use `--expect none` for a first snapshot, `--dry-run` to check only |
+| `flow recall <words> --repo .` | Literal search (English or Chinese words) over CONTEXT, AGENTS.md, ADRs, work packages and review notes of this project only, with file:line references; records marked superseded/rejected are labelled. "No match" means it was never saved |
+
+Saying "continue" in a new session is enough: the agent runs `flow resume`.
+Decisions and corrections reach later sessions only if they were saved — the
+agent writes them as dated lines in the work package's spec Decisions or the
+evidence Lessons table. A chat that was never saved cannot be recovered.
 
 The agent also considers a handoff on its own at three phase boundaries:
 research done and implementation about to start, a work package closed, a

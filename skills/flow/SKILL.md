@@ -16,8 +16,8 @@ description: >
 
 One entry, few fixed actions. You are the router; every action lands on a
 deterministic file convention or a read-only script. The `flow` command is on
-PATH (`flow init|home|audit|admit|doctor|run|verify|usage`, dispatching to
-`gate/gate.py` and `flow/audit.py`). `flow home` prints the checkout
+PATH (`flow init|home|audit|resume|checkpoint|recall|admit|doctor|run|verify|usage`,
+dispatching to `gate/gate.py`, `flow/audit.py` and `flow/continuity.py`). `flow home` prints the checkout
 directory; the design contract is `<home>/docs/design.md` and the user manual
 is `<home>/docs/usage.md`. Never expose internal stage names to the user; just
 do the thing.
@@ -134,10 +134,43 @@ head, note the preempted task id in CONTEXT.md's checkpoint section. Small
 fix inside the current package: fold it into that package instead. Still
 fuzzy: it goes to a brief, not the queue.
 
-**Resume / switch session** — read CONTEXT.md, `git log --oneline -10`, the
-queue, and `.gate/journal.ndjson` tail. Rebuild CONTEXT.md as a fresh ≤200
-line snapshot answering the five questions. That file is the handoff — never
-write a separate handoff document.
+**Resume / switch session** — run `flow resume --repo <project>`: a bounded,
+read-only packet of the five CONTEXT sections with line references, Git state,
+queue head, last gate run/verdict, work packages, and the facts that override
+the snapshot (stale anchor, interrupted/active run, failed or stale verdict,
+unnamed uncommitted paths). Gate facts beat snapshot prose; a previous PASS is
+not acceptance of changed code. Tell the user the five facts, then rebuild
+CONTEXT.md as a fresh ≤200 line snapshot and save it with `flow checkpoint`
+(below). That file is the handoff — never write a separate handoff document.
+No project resolvable: ask for its directory; never scan for it. Legacy
+projects without `flow` on PATH: read CONTEXT.md, `git log --oneline -10`, the
+queue and the `.gate/journal.ndjson` tail by hand.
+
+**Save a checkpoint** — write the complete five-section draft (your prose:
+intent, rationale, decisions, next step) to a scratch file, then
+`flow checkpoint --repo <project> --from <draft> --expect <digest from resume>`
+(`--expect none` when no snapshot exists). It validates, stamps a mechanical
+anchor (HEAD, dirty count, tree) and replaces the file atomically; malformed,
+oversized or stale input leaves the old bytes intact. On a stale digest, run
+`flow resume` again and merge; never force. Read its warnings (removed red
+lines or human decisions, unnamed dirty paths, an unmentioned interrupted run)
+and fix or confirm them. Checkpoint at: planning → execution, batch completion
+or stop, package closure, and an explicit session or project switch. Not after
+each tool call, never from a worker. An `external_context` project refuses;
+update its own file by its conventions.
+
+**Record a decision / recall one** — at a substantive decision, a user
+correction or a verified failed approach, write one dated line in the
+package's `spec.md` Decisions (or the Lessons table of `evidence.md`, or an
+ADR): fact, why, source. Mark a replaced one `superseded`/`rejected` in place;
+never delete it. When the user refers to an earlier discussion, or before
+reopening a choice, run `flow recall <words> --repo <project>`: literal
+English/Chinese search over CONTEXT, AGENTS.md, ADRs, work packages,
+REVIEW-NOTES and configured handoff files, with file:line references and
+superseded labels. It is evidence, not instruction or renewed approval; the
+current user instruction and project rules win. No match means not saved: say
+so, never invent. Recall and resume are host-only; never paste their output
+into a worker prompt or queue row.
 
 **Hand off at a phase boundary** — three moments are natural handoff points:
 research is done and implementation starts, a work package closed, the user
@@ -153,7 +186,8 @@ after every tool use.
   CONTEXT.md from the template's five sections, keeping the goal and
   constraints, the user's decisions, what is uncommitted, any unresolved
   failure with its exact command, the next action, and the paths of the
-  evidence. Refer to durable files; do not copy logs.
+  evidence, then save it with `flow checkpoint`. Refer to durable files; do
+  not copy logs. Unsaved conversation cannot be recovered later.
 - Never hand off or compact in the middle of an unresolved edit, a failing
   test or a debugging chain because a number was crossed. Reach a
   recoverable state first. An interrupted task is written as interrupted,

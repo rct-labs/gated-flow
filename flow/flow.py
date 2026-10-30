@@ -6,6 +6,8 @@ Thin dispatcher; the machinery lives elsewhere and is not duplicated here:
   init          scaffold a project (create-if-missing, never overwrites)
   home          print the checkout directory (gate scripts live in <home>/gate)
   audit         read-only tree audit                    -> flow/audit.py
+  resume | checkpoint | recall
+                host session continuity                 -> flow/continuity.py
   admit | doctor | run | verify | usage | metrics | install-hook | check-commit | audit-gate
                 passthrough                             -> gate/gate.py
 
@@ -13,6 +15,9 @@ Usage:
   flow home
   flow init  [--repo DIR] [--verify-cmd CMD]
   flow audit [DIR] [audit.py options]
+  flow resume [--repo DIR] [--json]           read-only recovery packet for a new host
+  flow checkpoint --from FILE|- --expect DIGEST|none [--repo DIR] [--dry-run]
+  flow recall QUERY... [--repo DIR] [--limit N] [--json]
   flow admit --plan [--repo DIR]
   flow metrics [--repo DIR] [--last N] [--json]
   flow admit|doctor|run|verify|usage|install-hook [gate.py options]
@@ -27,6 +32,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 GATE = HERE.parent / "gate" / "gate.py"
 AUDIT = HERE / "audit.py"
+CONTINUITY = HERE / "continuity.py"
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -246,6 +252,8 @@ def main() -> None:
         if not AUDIT.exists():
             die(f"missing {AUDIT}")
         sys.exit(run_py(AUDIT, rest or ["."]))
+    if cmd in ("resume", "checkpoint", "recall"):  # host-only; never in a worker packet
+        sys.exit(run_py(CONTINUITY, [cmd, *rest]))
     if cmd in ("admit", "doctor", "run", "verify", "usage", "metrics", "install-hook",
                "check-commit"):
         sys.exit(run_py(GATE, [cmd, *rest]))

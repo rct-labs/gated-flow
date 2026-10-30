@@ -14,7 +14,7 @@ jobs:
           python-version: '3.12'
       - run: python scripts/verify_repository.py
       - run: bash -n install.sh gate/selftest.sh gate/watch-journal.sh
-      - run: python -m py_compile gate/gate.py flow/flow.py flow/audit.py
+      - run: python -m py_compile gate/gate.py flow/flow.py flow/audit.py flow/continuity.py
   gate-tests:
     runs-on: ubuntu-latest
     steps:

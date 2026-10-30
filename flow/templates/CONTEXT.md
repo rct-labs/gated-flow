@@ -1,6 +1,8 @@
 # CONTEXT — <project>
 
 > Rebuilt <YYYY-MM-DD>. ≤200 lines. Rebuild, never append.
+<!-- Save with `flow checkpoint --from <draft> --expect <digest>`; it adds a
+     flow:checkpoint anchor line after the title. Do not edit the anchor. -->
 
 ## 1. Goal & red lines
 <!-- What this project is for; constraints that must never be violated

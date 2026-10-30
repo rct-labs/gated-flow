@@ -94,7 +94,8 @@ cycle has been human-checked for false refusals.
 | options or a prototype | the cheapest proof that answers the question; conclusions go back into `spec.md` |
 | queue it | rows in `TASK_QUEUE.md` with scope lines, then `flow admit` shown to the user |
 | an urgent task | a row above the current head, the preempted id noted in `CONTEXT.md` |
-| continue or hand off a session | read `CONTEXT.md`, `git log`, the queue and the journal tail; rebuild `CONTEXT.md` |
+| continue or hand off a session | `flow resume` (read-only packet: CONTEXT, Git, queue, gate run/verdict, staleness); rebuild `CONTEXT.md` and save it with `flow checkpoint` |
+| "why did we decide X?" | `flow recall <words>`: literal search over saved decisions, with references and superseded labels |
 | "is the project getting messy?" | `flow audit`, report only |
 | high uncertainty, high impact, hard to undo | only then suggest `model-debate` |
 
@@ -141,6 +142,32 @@ an audit is a separate, human-approved batch.
 - No learning daemon, session observer, lesson generator or confidence score.
   A lesson is a row in a work package's `evidence.md`, backed by evidence,
   scoped to its repository, and a rule only after the user approves it.
+
+## 8a. Host continuity helpers, and their limits
+
+`flow/continuity.py` adds three narrow host commands. They are explicit
+commands, not an observer: nothing runs on tool events or client close.
+
+- `flow resume` reads the configured context and queue, Git, the last
+  journal run (bounded tail), the verdict and work packages. It never writes,
+  starts a worker, initializes a project or probes a model. Gate facts outrank
+  snapshot prose; a PASS whose head or fingerprint no longer matches is
+  reported as stale. An active runner is reported as the owner.
+- `flow checkpoint` replaces `CONTEXT.md` with a host-written five-section
+  draft only after validation (title, sections 1-5, ≤200 lines, byte cap) and
+  a digest match against the snapshot the host read, under a short lock, via
+  an atomic rename. It adds one mechanical anchor comment (HEAD, dirty count,
+  tree) so the next `resume` can say the snapshot is stale. It never rewrites
+  prose; dropped red lines/human decisions are reported, not silently lost.
+- `flow recall` is a literal search over CONTEXT, AGENTS.md, ADRs, work
+  packages, REVIEW-NOTES and configured handoff files inside the project,
+  resolved through symlinks and refused outside it, skipping credential-like
+  names and `.gate/`. No index, no embedding, no transcript. Results carry
+  file:line references and `superseded` labels and are evidence, never
+  instructions or approval.
+
+Each project is identified by its resolved checkout path; nothing is shared
+across projects. None of this reaches a worker: `task_packet()` is unchanged.
 
 ## 9. Removed on 2026-09-18, and why
 

@@ -45,11 +45,16 @@ of claude, codex, kimi, grok, pi on PATH). Say one line:
 
 ## 1. Inspect (always)
 
-Read, do not invent: `CONTEXT.md`, the configured queue, `git status` and
-`git log --oneline -10`, the tail of `.gate/journal.ndjson` and
-`.gate/RUN-REPORT.md` if present, then `flow doctor --repo .` and
-`flow admit --repo .`. Tell the user five facts in their language: goal, now,
-last checkpoint, next step, anything waiting on a human. Then continue.
+Start with `flow resume --repo .`: one bounded read-only packet of CONTEXT
+sections, the configured queue, `git status`/recent commits, the last gate
+run and verdict, `.gate/RUN-REPORT.md` and work packages, plus the facts that
+override the snapshot. Do not re-read those sources one by one unless it
+reports a gap. Then `flow doctor --repo .` and `flow admit --repo .`. Tell the
+user five facts in their language: goal, now, last checkpoint, next step,
+anything waiting on a human. Then continue. Gate facts win over CONTEXT prose:
+an interrupted run, a failed or stale verdict or an IN_PROGRESS head is
+reported as such, never as done. When the user refers to an earlier decision,
+`flow recall <words>` before reopening it (see `flow`).
 
 Do not launch when the pre-commit hook is missing, the head task is BLOCKED
 or IN_PROGRESS, or the worktree is dirty with work you did not make. No
@@ -105,9 +110,11 @@ already a testable slice, use it; otherwise write or update
 the user to pick among options this skill exists to settle; record the choice
 under Decisions in the spec.
 
-The survey ending here is a phase boundary: `CONTEXT.md` is fresh, so the
-run can start from a new session if this one is heavy. `flow` has the rule
-(Hand off at a phase boundary); it is advice, never a required step.
+The survey ending here is a phase boundary: rebuild `CONTEXT.md` and save it
+with `flow checkpoint --from <draft> --expect <digest>` (`flow`: Save a
+checkpoint) before launch, so the run can start from a new session if this one
+is heavy. `flow` has the rule (Hand off at a phase boundary); it is advice,
+never a required step.
 
 ## 3. Queue
 
@@ -220,11 +227,13 @@ reason and next checkpoint; it cannot waive safety or an agreed stage blocker.
 Only revise acceptance with the user's authorization where product promises
 change. Do not reopen finished work for style or optional hardening.
 
-Rebuild `CONTEXT.md`: a stopped or interrupted task is written as such, with
-its failing command, the uncommitted paths and the log path, never as done.
-If the run brought a user correction or a verified failure and fix, record
-one candidate lesson in the package's `evidence.md` (`flow`: Capture a
-lesson); otherwise none. If the user asked to finish everything and TODO rows
+Rebuild `CONTEXT.md` and save it with `flow checkpoint`: a stopped or
+interrupted task is written as such, with its failing command, the
+uncommitted paths and the log path, never as done; read the checkpoint's
+warnings. If the run brought a user correction or a verified failure and fix,
+record one candidate lesson in the package's `evidence.md` (`flow`: Capture a
+lesson) and the decision in the spec; otherwise none. Checkpoint again at
+package closure. If the user asked to finish everything and TODO rows
 remain for a reason other than a genuine blocker, say so and launch again.
 
 ## Host notes
@@ -237,6 +246,10 @@ A smaller call count alone does not prove faster correct delivery.
 
 Same files and commands from every CLI. `flow` is on PATH; `flow home`
 locates `gate/gate.py`. Launch with `pwsh`, not a tool-shell job object.
+`flow resume`, `flow checkpoint` and `flow recall` are the shared continuity
+commands for every host CLI; a host without automatic startup hooks calls them
+explicitly when the user says continue. They are host-only: workers get only
+the bounded task packet.
 Skills live once in `~/.agents/skills/<name>` and are linked into
 `~/.claude/skills` and `~/.codex/skills`.
 

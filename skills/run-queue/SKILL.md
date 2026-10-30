@@ -169,6 +169,9 @@ on every poll. Do not run `flow usage` at startup: the runner probes on demand.
 - Never `git commit --no-verify`, and never suggest it. The block is the product.
 - Never take over an IN_PROGRESS task. Never push, merge or open a PR.
 - Never turn a review finding into a queue row. `REVIEW-NOTES.md` is a record.
+- Never put `flow resume` / `flow recall` output, CONTEXT or host history into
+  a worker prompt or queue row; workers get the bounded task packet only.
+  After `run_end` the host (`flow-run`) saves state with `flow checkpoint`.
 - Never restart a run just because it stopped, and never raise `--max-tasks`,
   `max_model_calls` or `max_task_files` to push past a stop.
 

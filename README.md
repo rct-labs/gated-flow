@@ -125,7 +125,10 @@ you set one — loud beats a guessed oracle.
    and runs it), or `$run` when the queue is already written. The run is detached from the chat session, narrated from the
    journal, and ends with `RUN-REPORT.md`; read its **Waiting on you** section.
 3. **Switch sessions** → `$flow hand off`. `CONTEXT.md` (≤200 lines, five
-   questions) is the handoff; nothing else.
+   questions) is the handoff; nothing else. In the next session, from any CLI,
+   "continue" runs `flow resume` (read-only recovery with stale/interrupted
+   facts), `flow checkpoint` saves the snapshot atomically, and
+   `flow recall <words>` finds saved decisions with file:line references.
 
 `docs/usage.md` is the full manual, including queue format, admission states,
 stop reasons and troubleshooting.
