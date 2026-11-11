@@ -93,9 +93,10 @@ existing bounded, read-only launcher and completion records.
 ```json
 {
   "version": 1,
+  "profile": "focused",
   "min_models": 3,
   "project_min_models": 3,
-  "max_calls": 15,
+  "max_calls": 3,
   "used_calls": 0,
   "max_age_seconds": 60,
   "safety_factor": 1.5,
@@ -114,7 +115,7 @@ existing bounded, read-only launcher and completion records.
   "models": {
     "model-a": {"model": "RESOLVED_SELECTOR", "family": "RESOLVED_DISTINCT_MODEL", "pool": "account-a", "identity_evidence": "preflight/model-a.json"}
   },
-  "seats": [{"id": "review-a", "candidates": ["model-a"], "remaining_calls": 3}]
+  "seats": [{"id": "review-a", "candidates": ["model-a"], "remaining_calls": 1}]
 }
 ```
 
