@@ -40,15 +40,17 @@ This is a workflow test, not a live-model or sandbox test.
 | Constraint challenged / required tool absent | Surface scoped concern/capability gap, never ignore applicable instructions. |
 | Duplicate new claims and minority objection | Keep prefixed IDs/mappings, origins and full index links. |
 | Unanimous unsupported final claim | Mark open/unverifiable or correct; agreement is not verification. |
-| "Finish quickly" arrives mid-run | `focused` keeps host verification and the surviving-dispute round, `debate` keeps round 2; otherwise the run stays open or changes profile with agreement, and the report names the profile that ran. |
-| No profile requested, ordinary review | `focused`, three seats on three vendors, one call per seat plus a disclosed reserve. |
+| "Finish quickly" arrives mid-run | `focused` completes its single round plus host primary-evidence verification/synthesis without dropping verification; explicit/hard-gate `debate` keeps round 2 unless changed with agreement (never dropping an active project hard gate), and the report names the profile that ran. |
+| No profile requested, ordinary review | `focused` single blind round plus host verification/synthesis; uses available ordinary team (Codex, Gemini Carbon, Claude Fable 5.2 at `medium` effort) without forcing 3 fresh vendor calls; already-present host may contribute labeled host analysis, never counted as a blind seat; zero automatic follow-up, rebuttal or judge/helper calls. |
+| Formal project 3-independent-seat gate | Three fresh blind sessions on distinct families among the seats required; a fresh host-family seat is eligible when project policy allows; host contribution does not count toward quorum; multi-round runs only if that hard gate requires it, with the requirement identified before launch. |
 | Draft claim checkable by reading a local file | Host settles it before seat calls; seats receive it as `SETTLED-*` with evidence, not as an open question. |
-| `focused`: one design dispute survives verification, three objections settled by it | Send one compact question to the relevant model if it can resolve the decision; settled objections closed locally. Extra calls need a concrete reason and budget. |
-| `focused`: nothing survives verification | `no surviving disputes` recorded, no second round, run reported complete. |
+| `focused`: one design dispute survives verification, three objections settled by it | Close the three factual objections locally with primary evidence; report the surviving material design disagreement as unresolved with both arguments and the open decision; no automatic delta question, rebuttal or judge/helper call. |
+| `focused`: nothing survives verification | `no unresolved disputes` recorded after round 1 and host verification; run reported complete. |
 | Cached preflight, CLI version changed | Inspect current flags/config/schema locally; old probe is historical. Combine affected verification with first useful call where enforceable; standalone probe only for unresolved boundary risk. |
 | Cached preflight valid | Reuse applicable evidence with date/limits; fresh quota per launch batch; no calendar-only inference probe. |
 | Two models, one vendor and account pool | Minimum met; reduced diversity disclosed in roster and report; agreement not called cross-vendor. |
-| Run stops after round 1 | `decision-log.md` written with stage reached and reason; reported incomplete. |
+| Default `focused` finishes round 1 + host verification | Run is complete; synthesis and any unresolved material disagreement reported; standalone `model-debate` stays discussion-only, while `flow-run` resumes already-authorized work without overriding core quorum or approval rules. |
+| Explicit/hard-gate `debate` stops after round 1 (or `focused` stops before host verification) | `decision-log.md` written with stage reached and reason; reported incomplete, never relabeled as a completed two-round debate or verified review. |
 | Report with `final.md` not applied | Application status stated on its own line. |
 
 ## Live miniature smoke
@@ -99,16 +101,25 @@ never consume an owner-excluded model just to check its reported exhaustion.
 | Monetary balance | Preserve currency; no percent conversion or implicit paid account. |
 | Project minimum3, generic minimum2 | Three proven distinct models required; aliases/roles do not increase quorum. |
 | Quota exhaustion after freeze | Quarantine pool; no same-pool retry; only authorized alternatives and fresh sufficient budget. |
-| Replacement after round2 partly succeeds | Preserve originals; fresh independent replacement; focused repeats audited dependencies only, debate repeats all round2. |
+| Replacement after round2 partly succeeds | Preserve originals; fresh independent replacement; focused uses `repeat_seats: []` by default and repeats audited dependencies only when an explicit/hard-gate follow-up ran, debate repeats all round2. |
 | Changed context, unknown process, unverified read-only boundary | Reconcile/rebase before recovery; no automatic replay. |
 | Explicit transient Retry-After | Bounded cooldown/recheck; no inference of weekly exhaustion from a bare429. |
 | Unknown native schema or probe deadline | Typed UNKNOWN, no raw credential-bearing error output. |
+| Ordinary bounded selection with UNKNOWN/cross-unit quota vs formal guard | Ordinary subscription selection treats UNKNOWN as unmeasured (not zero/exhausted), refuses numeric cross-unit ranking, uses documented project preference (or available host) within explicit caps with unknown rationale, and never fabricates READY; formal guard runs still block on UNKNOWN. |
+| Gemini `agy` discussion-only success | Validates review/discussion output only; never treated as coding worker capability without verified custom `worker_cmds.agy` and `PATH` executable/TLS-wrapper resolution. |
 
 Exercise the updated instructions with synthetic owner limits,
 shared pools and partly completed results. A native read-only account smoke
 validates quota transport only; it is not a model inference, complete debate,
 read-isolation or profitability test. Retain those distinctions in acceptance.
 
-Additional efficiency cases: local tools-off review has no default web or inference-only smoke; failed seat replacement in focused profile preserves unrelated successful seats after an explicit dependency audit; three independent pools share one fresh reserved batch; changed source invalidates dependent results; malformed or unexpectedly tool-enabled first response never counts as a valid vote.
+Additional efficiency cases: local tools-off review has no default web or inference-only smoke; failed seat replacement in focused profile preserves unrelated successful seats after an explicit dependency audit (`repeat_seats: []` when no authorized follow-up ran); independent pools share one fresh reserved batch in formal mode; changed source invalidates dependent results; malformed or unexpectedly tool-enabled first response never counts as a valid vote.
 
-Review routing: routine reproducible bug+regression test -> direct validation, zero review calls; documentation-only change -> zero review calls; difficult unresolved implementation defect -> one scoped reviewer if useful; cross-layer core contract with project quorum3 -> three independent models; explicit user review -> honor requested scope.
+Review routing: routine reproducible bug+regression test -> direct validation, zero review calls; documentation-only change -> zero review calls; difficult unresolved implementation defect -> one scoped reviewer if useful; ordinary bounded fork -> available ordinary team in one blind round without forcing 3 fresh vendor calls; cross-layer core contract with formal project quorum3 -> three independent blind models; explicit user review -> honor requested scope.
+
+## Default routing scenarios
+
+- Bare flow-run with unknown capacity and a verified project Gemini wrapper uses that configured key, records unknown capacity, and respects a single-active-worker rule. It does not rewrite the wrapper to raw agy.
+- Natural-language Codex choice overrides automatic preference when usable.
+- Gemini quota failure after edits preserves the attempt and reconciles the claim/diff before a host-selected fallback; no concurrent writer or automatic task reset.
+- Percentages from different account windows are not comparable just because both use percent units.

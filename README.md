@@ -1,5 +1,20 @@
 # flow — an evidence-gated development workflow for coding agents
 
+Bare `$flow-run` resumes authorized work and selects a suitable implementation
+worker using trustworthy capacity evidence and project preference. No parameters
+are needed; natural language such as "use Gemini this time" overrides routing.
+Unknown allowance is recorded honestly, not ranked numerically. Existing verified
+native CLI wrappers are preserved. Codex and Gemini Carbon are preferred coding
+workers; required reviews remain independent of the implementer.
+
+`$model-debate` alone discusses without implementing: one independent round,
+then host evidence verification and synthesis. Unresolved disagreement is reported
+without automatic rebuttal calls. Adversarial rounds require an explicit request
+or an identified project hard requirement. Model packets use English, reports use
+the user's language, and Codex/Gemini/Claude default to medium effort unless
+explicitly overridden. Project quorum and financial/ownership gates still apply.
+
+
 [![CI](https://github.com/rct-labs/gated-flow/actions/workflows/validate.yml/badge.svg)](https://github.com/rct-labs/gated-flow/actions/workflows/validate.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Install with skills.sh](https://img.shields.io/badge/skills.sh-npx%20skills%20add%20rct--labs%2Fgated--flow-black)](https://skills.sh/rct-labs/gated-flow)

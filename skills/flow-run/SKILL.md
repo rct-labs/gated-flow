@@ -1,47 +1,87 @@
 ---
 name: flow-run
 description: >
-  The default entry for this workflow: inspect the project's current state,
-  decide the next work as the host CLI, write an admission-ready TASK_QUEUE,
-  then unattended-run it. It loads $flow and $run for their steps, so the
-  user never has to pick between them. Optional worker pin: claude /
-  claude-code, codex, kimi, grok / grok-build, pi. No pin means the CLI
-  running this skill. Use when the user types $flow-run or /flow-run, or says
-  check progress, continue, keep going, keep executing, run unattended,
-  continue until blocked, flow run, or continue and finish; also responds to
-  equivalent requests in other languages. Works from
-  Claude Code, Codex CLI, Kimi CLI and Grok Build. Analysis-only, plan-only
-  and paused-business requests do not authorize execution.
+  The default entry for this workflow: inspect and resume already-authorized
+  project work as the host CLI, automatically choose a suitable available
+  implementation worker (preferring Codex or Gemini Carbon for coding from
+  trustworthy capacity and suitability evidence, overridden by any
+  natural-language worker choice), write an admission-ready TASK_QUEUE, then
+  unattended-run it. It loads $flow and $run for their steps, so the user never
+  has to pick between them. Known worker ids: codex, agy (custom
+  worker_cmds.agy or an existing verified alias), claude, kimi, grok, pi. Use when the user types $flow-run
+  or /flow-run, or says check progress, continue, keep going, keep executing,
+  run unattended, continue until blocked, flow run, or continue and finish;
+  also responds to equivalent requests in other languages. Analysis-only,
+  plan-only, standalone debate and paused-business requests do not authorize
+  execution.
 ---
 
 # $flow-run: inspect, decide, queue, run
 
 You are the host CLI. You survey, you decide, you write the queue.
-`gate.py run` executes. You never mark a task DONE yourself.
+`gate.py run` executes in separate worker processes. You never mark a task DONE
+yourself.
 
 This skill is a router. Load the others when that step starts:
 shape / brief / spec / CONTEXT / queue format -> `flow`;
 launch, journal watch, stop reasons -> `run-queue`;
-a fork that is uncertain and high-impact -> `model-debate`. It picks its own
-profile: `focused` by default, `debate` only when the fork is truly hard to
-undo. Its verification and dispute rounds are part of the decision; do not
-drop them to finish sooner.
+a fork that is uncertain and high-impact -> `model-debate`. By default
+`model-debate` runs one independent blind round followed by host primary-evidence
+verification and synthesis, reporting unresolved material disagreement without
+automatic follow-up; multi-round `debate` runs only when explicitly requested or
+required by an identified project hard gate. Do not drop evidence verification to
+finish sooner. Once an in-scope technical fork is resolved, continue
+already-authorized project work without reopening routine permissions or
+overriding core quorum and per-task approval rules (standalone `model-debate`
+remains discussion-only).
 `flow home` prints the checkout; the design is `<home>/docs/autonomy.md`.
 
-## 0. Worker pin
+## 0. Worker selection and pin
 
-| user said | worker id |
+No new skill or parameter syntax is used. Bare `$flow-run` inspects and resumes
+authorized work and selects a suitable available worker automatically; an inline
+or natural-language worker request overrides automatic selection:
+
+| user said (inline or natural language) | worker id |
 |---|---|
-| claude, claude code | `claude` |
 | codex, codex cli | `codex` |
+| gemini, gemini carbon, agy, antigravity | the existing verified Gemini worker key (for example `agy` or `agy-flow`) |
+| claude, claude code, fable | `claude` |
 | kimi, kimi cli | `kimi` |
 | grok, grok build | `grok` |
 | pi, openrouter, or an OpenRouter model id | `pi` (set `worker_models.pi`) |
 
-No match: the CLI you are running in (`grok` if `GROK_HOME`, `claude` if
-`CLAUDECODE`, `kimi` if `KIMI_HOME`, `codex` if `CODEX_HOME`, else the first
-of claude, codex, kimi, grok, pi on PATH). Say one line:
-`host: <this CLI> / worker: <id>`. Unknown name: list the ids and stop.
+Unknown requested worker name: list the supported ids and stop; never substitute
+silently.
+
+When no worker is specified, choose automatically among installed, non-benched
+subscription CLIs:
+
+- **Prefer `codex` or Gemini Carbon (native `agy`, possibly a configured wrapper alias) for coding**, based on trustworthy
+  read-only capacity evidence and task suitability. Never mistake discussion-only
+  or tools-off success for coding capability: `agy` (or any custom worker) is
+  eligible for implementation only when its headless edit/shell/git contract is
+  configured in `worker_cmds` and its local flags/executable are verified. The
+  first bounded useful implementation call may establish remaining live coding
+  capability; record it as untested until observed, without a ceremonial ping.
+- **Honest quota handling**: read only local/read-only capacity evidence that is
+  already available; never run an inference quota sweep (`flow usage` or
+  candidate pings) and never use an implicit paid API or overage fallback.
+  `UNKNOWN` metadata and cross-unit allowances (percent vs currency vs tokens vs
+  requests) are never treated as `0`/exhausted and must not be ranked as
+  comparable numeric capacity. When trustworthy comparable capacity cannot decide (same units alone are insufficient
+  without account scope, window/reset time and task-cost context),
+  follow the documented project preference in `.gate/config.json` / `CONTEXT.md`
+  (otherwise the available current host CLI if coding-capable) and state the
+  explicit unknown-quota rationale.
+- **Effort, language and persistence**: default reasoning effort is `medium` for
+  Codex, Gemini Carbon and Claude (including Fable 5.2) unless the user or an
+  explicit project rule overrides it. Keep inter-model packets, worker prompts,
+  queue rows and machine state in English; deliver reports and status updates in
+  the user's language (for example Chinese when the user writes in Chinese).
+  Say one line: `host: <this CLI> / worker: <id> (<pin or auto rationale>)`, and
+  persist the routing choice plus quota freshness or `unknown` status in existing
+  `CONTEXT.md` and `.gate/config.json` with no new state framework.
 
 ## 1. Inspect (always)
 
@@ -164,11 +204,33 @@ immediately before it. Changed candidates still require fresh evidence.
 
 ## 4. Configure and launch
 
-`.gate/config.json`: `workers` (the pin first, fallbacks after),
-`worker_cmds` or `worker_models` when a CLI needs a model, `judge.enabled`
-and `judge.chain` when the project wants a package review, `judge.checkpoints`
-for rows that must be reviewed on their own, `max_model_calls` for the run.
-Never raise limits or weaken admission to get a task through.
+`.gate/config.json`: `workers` (selected worker first, verified fallbacks after, unless project policy requires exactly one active
+worker; then let the host select a fallback only after reconciling the stopped run),
+`worker_cmds` or `worker_models` when a CLI needs pinned model/effort flags,
+`judge.enabled` and `judge.chain` when the project wants a package review,
+`judge.checkpoints` for rows that must be reviewed on their own, `max_model_calls`
+for the run. Keep required reviews independent of the implementation worker:
+order `judge.chain` / `judge_cmds` so a distinct model/vendor reviews closed
+tasks rather than the implementer reviewing its own diff (disclose as unreviewed
+if no independent reviewer is usable). Pin `medium` effort by default for Codex,
+Gemini Carbon and Claude unless the user or project explicitly requires another
+setting. Never raise limits or weaken admission to get a task through.
+
+For Gemini Carbon, reuse the project's verified custom worker key and
+`worker_cmds` entry (for example `agy`, or `agy-flow` wrapping the native CLI).
+Do not replace an existing TLS wrapper with raw `agy`. No built-in Gemini adapter
+is promised in `gate.py`.
+`gate.py` admits custom `worker_cmds` keys as worker ids, resolves the executable
+by worker id on `PATH`, and replaces `template[0]` with that resolved path (stdin
+is piped only for `codex`). Before launch, confirm `PATH` resolves the selected worker key to the
+verified executable—including any existing TLS wrapper—and inspect `agy --help`
+on that binary to pin the Gemini Carbon selector, `medium` effort (unless
+overridden) and the supported prompt argument. The runner sets the working
+directory to `{projdir}`; do not invent a CLI directory flag. Set the required
+project interpreter environment for the detached engine and its checks, not only
+inside the worker prompt. If a worker fails mid-edit, preserve its attempt, inspect
+status/diff and reconcile the queue claim before fallback; never start another
+writer over an IN_PROGRESS task or discard partial edits silently.
 
 A new package starts from a clean slate. Before its first launch, re-read every
 package-scoped key the previous package left behind: `worker_prompt`,

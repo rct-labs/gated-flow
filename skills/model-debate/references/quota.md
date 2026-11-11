@@ -1,9 +1,33 @@
 # Allowance admission and recovery
 
-Use before ANY inference, including capability probes, helper calls or retries,
-and after a quota failure. This is the flow/model-debate call-admission boundary;
-it does not intercept unrelated CLI commands, reserve provider allowance, run
-the debate, or make a business workflow safe to replay.
+This reference governs account capacity checks, fallback routing and quota
+recovery across `model-debate` and `flow-run`. It separates two operating modes
+while keeping `scripts/quota_guard.py` strict and unchanged:
+
+- **Formal quota gate (explicit project hard gate, strict `quota-plan.json`
+  admission, or multi-round `debate` requiring verified headroom)**: run
+  `quota_guard.py check` / `recover`. **Only an actual `READY` receipt permits
+  launch.** `UNKNOWN`, stale, near-exhausted (`98%+` used / `<=2%` remaining) or
+  unverified cross-unit observations fail closed (`BLOCKED`). Never fabricate a
+  `READY` receipt, forge synthetic `KNOWN` samples in production, or bypass an
+  applicable project-required guard.
+- **Ordinary bounded selection (default single-round review or `flow-run` worker
+  routing on existing authenticated subscriptions when no formal `READY` gate
+  applies)**: honor owner exclusions and observed exhaustion/near-exhaustion
+  before any probe or call, read available native read-only metadata without
+  inference sweeps, and never use implicit paid fallback or overage. Where a
+  provider has no read-only quota reader (for example Gemini `agy`, Claude/Fable
+  or native `kimi`) or exposes incompatible units, treat `UNKNOWN` as unmeasured—
+  **not** `0`, **not** exhausted, and **not** a comparable numeric rank across
+  percent/currency/token/request units. Within explicit call caps (such as one
+  blind call per seat in default single-round review or bounded `max_model_calls`),
+  select by trustworthy same-unit capacity when comparable and otherwise follow
+  documented project preference (or the available current host) while persisting
+  `quota: unknown (<reason>)` and freshness timestamps in `CONTEXT.md` or run
+  records instead of claiming `READY`.
+
+This boundary never intercepts unrelated CLI commands, reserves provider
+allowance, runs the debate, or makes a business workflow safe to replay.
 
 ## Before launch
 
@@ -13,32 +37,37 @@ the debate, or make a business workflow safe to replay.
    not a permanent global blacklist. Separate CLI transport from paid account.
 2. Resolve native executables, actual model families, account pools and owner
    authority. Multiple roles/models on one account share its remaining capacity.
-   Read provider metadata/help without starting an inference turn. The guard's
-   quota readers do not establish full model identity or sandbox isolation.
-3. Write `quota-plan.json` (set `profile: "focused"` for the default workflow; omitted profile preserves legacy `debate` recovery) beside the run's `roster.md`. Include all remaining
-   research/round1/round2 calls, inference probes and allowed retries/replacement
-   work; include previously used calls and in-flight calls. Reserve in-flight
-   calls BEFORE starting them, subtract from remaining work, and retain the
-   attempt record even after a crash. One host owns a run's plan. Serialize
-   starts sharing an account; other sessions remain unreserved external usage.
+   Read provider metadata/help without starting an inference turn (for Gemini
+   `agy`, ensure `PATH` resolves the verified binary or existing TLS wrapper and
+   check `agy --help`). The guard's quota readers do not establish full model
+   identity, coding worker capability or sandbox isolation.
+3. For formal quota-gated runs, write `quota-plan.json` (set `profile: "focused"`
+   for single-round review with `remaining_calls: 1` per blind seat and zero
+   automatic follow-up reserve; omitted profile preserves legacy two-round
+   `debate` recovery) beside the run's `roster.md`. Include all remaining
+   scheduled calls, inference probes and authorized retries/replacement work,
+   plus previously used calls and in-flight calls. Reserve in-flight calls BEFORE
+   starting them, subtract from remaining work, and retain the attempt record
+   even after a crash. One host owns a run's plan. Serialize starts sharing an
+   account; other sessions remain unreserved external usage.
 4. Estimate whole remaining work per account, never per seat independently.
    Use recent comparable observed usage with sample count/provenance, or an
    explicitly disclosed conservative bootstrap estimate. Missing estimates are
-   UNKNOWN. Subscription percentages, money and tokens are distinct units;
-   never convert using invented prices or assume a provider's hidden limits.
-5. Run the helper below. For a batch of independent pools, one READY receipt
-   may admit the reserved batch if launches occur within its freshness window
-   (at most60seconds), bindings and budget are unchanged, and no failure occurs.
-   Reserve each call before starting; do not reuse receipts for retries or later
-   batches. This removes redundant simultaneous quota processes, not freshness.
-    Only READY permits the listed roster to proceed.
-   Save a NEW receipt for each check. Freeze the selected roster, backup order,
-   replacement authorization, minimum model count and total call/wall budget.
-   Persist the READY assignments as `frozen_assignments` in the next plan
-   revision. Normal checks then stay on that exact roster and cannot silently
-   switch to a backup. Recheck just before every inference start; budget any
-   inference probe itself.
-   A successful tiny inference is not evidence of full-round allowance.
+   `UNKNOWN`. Subscription percentages, money, tokens and request counts are
+   distinct units; never convert using invented prices, rank cross-unit numbers
+   against each other, or assume a provider's hidden limits.
+5. In formal quota-gated mode, run the helper below. For a batch of independent
+   pools, one `READY` receipt may admit the reserved batch if launches occur
+   within its freshness window (at most 60 seconds), bindings and budget are
+   unchanged, and no failure occurs. Reserve each call before starting; do not
+   reuse receipts for retries or later batches. In formal mode, only `READY`
+   permits the listed roster to proceed. Save a NEW receipt for each check.
+   Freeze the selected roster, backup order, replacement authorization, minimum
+   model count and total call/wall budget. Persist the `READY` assignments as
+   `frozen_assignments` in the next plan revision so normal checks stay on that
+   exact roster without silently switching to a backup. Recheck just before
+   every inference start; budget any inference probe itself. A successful tiny
+   inference is not evidence of full-round allowance.
 
 From the installed skill directory (use its actual resolved location):
 
@@ -49,8 +78,9 @@ python scripts/quota_guard.py recover /path/to/run/quota-plan.json /path/to/run/
 
 No top-up, reset-credit redemption, paid overage, subscription purchase or global
 CLI configuration change. Eligible known headroom is an estimate, not a promise
-of completion. Native schemas/routes can change: unsupported or missing values
-refuse admission; never replace an observed UNKNOWN with a guessed percentage.
+of completion. Inside `quota_guard.py`, unsupported or missing native schemas/routes
+refuse formal `READY` admission (`QUOTA_UNKNOWN` / `QUOTA_SCHEMA_UNKNOWN`); never
+replace an observed `UNKNOWN` with a guessed percentage in either mode.
 
 ## Plan contract
 
@@ -115,9 +145,13 @@ Included native readers (no model session or inference turn is started):
 
 Windows readers require direct native executables, not shell command strings.
 Each reader has an overall deadline; credentials stay out of argv and results.
-There is no Fable/native-Kimi quota reader in this release. Other providers
-need a tested read-only adapter; do not launch them under invented headroom.
-This is an explicit coverage limit, not a permanently excluded model list.
+There is no Claude/Fable, Gemini `agy` or native-Kimi quota reader in this
+release. In formal `quota_guard.py` admission, pools without a verified native
+reader evaluate to `UNKNOWN` / `BLOCKED` and cannot produce `READY`; in ordinary
+bounded subscription selection (when no project `READY` gate applies), record
+`unknown` explicitly and use documented project preference within explicit call
+caps rather than inventing headroom. This is an explicit reader coverage boundary,
+not a permanently excluded model list.
 
 ## When a call fails
 
@@ -140,12 +174,14 @@ For transient rate limits add `retry_after_seconds`, `max_wait_seconds` and
 not defaults that manufacture permission. Update the plan's remaining work and
 spent calls before recovery; keep `frozen_assignments` matching the failure record. After
 a READY recovery, apply `required_plan_changes`, save the new frozen assignments
-and record the roster revision before launch. A replacement must budget its fresh research and
-both rounds, and all other seats need the repeated round2; in `focused`, budget
-its round 1 and repeat only the dispute calls that read the replaced seat's
-output. Reaching the budget
-does not authorize extending it. Missing authorization is a scoped roster/budget
-decision only; existing explicit substitution authority is reused, not re-asked.
+and record the roster revision before launch. In `debate`, a replacement must
+budget its fresh research and both rounds, and all other seats need the repeated
+round 2; in `focused`, default single-round recovery budgets only the replacement's
+fresh round 1 (`repeat_seats: []`), repeating another seat only when an audited
+explicit/hard-gate follow-up actually read the replaced seat's output. Reaching
+the budget does not authorize extending it. Missing authorization is a scoped
+roster/budget decision only; existing explicit substitution authority is reused,
+not re-asked.
 
 ## What can survive a model change
 
