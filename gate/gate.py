@@ -2438,7 +2438,7 @@ def _last_json_object(text: str) -> dict | None:
     The JSON decoder does the scanning, so braces inside strings do not count.
     Counting braces by hand returned one finding instead of the envelope
     whenever a finding quoted code with a brace in it, and a finished review
-    was recorded as unparsable (AugurNext, 2026-09-20: 8 minutes and $3.38)."""
+    was recorded as unparsable."""
     decoder = json.JSONDecoder()
     last: dict | None = None
     pos = text.find("{")
