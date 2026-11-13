@@ -25,7 +25,7 @@ Subcommands
   metrics       read recent run timings and overhead from the existing journal
   usage         probe every worker / judge CLI now; bench the quota-dead ones
   doctor        report what is configured and whether it is usable
-  run           unattended loop: probe, dispatch, verify, risk review, stage acceptance
+  run           unattended loop: dispatch, verify, risk review, stage acceptance
   review        host-driven review of DONE tasks (--tasks A,B [--base SHA]) plus stage acceptance
 """
 
@@ -36,13 +36,66 @@ import contextlib
 from collections import Counter, deque
 from datetime import datetime
 import fnmatch
+import importlib.util
+import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+_model_policy_spec = importlib.util.spec_from_file_location(
+    "_gate_model_policy", Path(__file__).resolve().parent / "model_policy.py")
+if _model_policy_spec is None or _model_policy_spec.loader is None:
+    raise ImportError("Cannot load sibling model_policy.py")
+_model_policy = importlib.util.module_from_spec(_model_policy_spec)
+_model_policy_spec.loader.exec_module(_model_policy)
+validate_worker = _model_policy.validate_worker
+
+_usage_spec = importlib.util.spec_from_file_location(
+    "_gate_usage", Path(__file__).resolve().parent / "usage.py")
+if _usage_spec is None or _usage_spec.loader is None:
+    raise ImportError("Cannot load sibling usage.py")
+_usage = importlib.util.module_from_spec(_usage_spec)
+_usage_spec.loader.exec_module(_usage)
+
+_review_packet = None
+
+
+def review_packet_module():
+    """Review support is optional for policy-only engine embeddings, required
+    on every review/settlement path. Never fall back when that support is used.
+    """
+    global _review_packet
+    if _review_packet is None:
+        spec = importlib.util.spec_from_file_location(
+            "_gate_review_packet", Path(__file__).resolve().parent / "review_packet.py")
+        if spec is None or spec.loader is None:
+            raise ImportError("Cannot load sibling review_packet.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _review_packet = module
+    return _review_packet
+
+
+_worker_result = None
+
+
+def worker_result_module():
+    """Load the pure final-output protocol only on worker result paths."""
+    global _worker_result
+    if _worker_result is None:
+        spec = importlib.util.spec_from_file_location(
+            "_gate_worker_result", Path(__file__).resolve().parent / "worker_result.py")
+        if spec is None or spec.loader is None:
+            raise ImportError("Cannot load sibling worker_result.py")
+        _worker_result = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_worker_result)
+    return _worker_result
+
 
 GATE_DIR = ".gate"
 CONFIG_NAME = "config.json"
@@ -157,11 +210,9 @@ DEFAULT_CONFIG = {
     # the OS when the process ends. Tasks and task-local checks never wait.
     "serialize_full_acceptance": True,
     # ---- autonomy (docs/autonomy.md) ---------------------------------------
-    # Probe each CLI only when first needed in a run, with a
-    # tiny real request. A quota-shaped answer benches it for quota_cooldown_s;
-    # a probe that never reached the provider (timeout, not installed, other
-    # error) benches it for retry_s only — it must not occupy the quota window.
-    "probe": {"enabled": True, "timeout_s": 90, "retry_s": 600},
+    # Normal execution spends requests on useful work. Explicit `usage` still
+    # probes on demand; enabled=True retains opt-in lazy probing for old callers.
+    "probe": {"enabled": False, "timeout_s": 90, "retry_s": 600},
     # One optional batch review, then selected stage checks, when the queue
     # has no eligible TODO left: the package boundary, not the run boundary, so
     # a run of one task does not pay a review and a full oracle for one task.
@@ -220,6 +271,10 @@ JUDGE_ACTION_CONTRACT = (
     "\n\nReview only the agreed acceptance and the changed behavior. A blocking "
     "finding must state the concrete trigger, observed evidence or a traceable "
     "code path, and the violated acceptance or safety invariant in its issue. "
+    "Include the exact safe repro command if run, and observed versus expected result. "
+    "Source proof or unsafe/unavailable repro must remain explicitly unverified, "
+    "not dropped or automatically downgraded. Merge findings with the same root "
+    "cause; keep repair review scoped to the repair and prior finding IDs. "
     "Missing tests alone, speculative misuse outside supported inputs, style, "
     "future extensibility and preference are not high findings. Do not expand "
     "acceptance or audit unrelated modules. Report all evidenced blockers in "
@@ -629,6 +684,20 @@ def parse_review_origin(text: str) -> set[str]:
     return {m.group(1) for m in TASK_ORIGIN_RE.finditer(text) if m.group(2) == "review"}
 
 
+def parse_review_of(text: str) -> dict[str, list[str]]:
+    """Explicit original task IDs; malformed/ambiguous mappings fail closed."""
+    entries = re.findall(r"<!--\s*task:(\S+)\s+review_of:\s*(.*?)\s*-->", text)
+    rows, origins = parse_queue(text), parse_review_origin(text)
+    result = {}
+    for task, value in entries:
+        ids = [v.strip() for v in value.split(",")]
+        if (sum(t == task for t, _ in entries) == 1 and task in origins
+                and ids and len(set(ids)) == len(ids)
+                and all(t in rows and t not in origins and t != task for t in ids)):
+            result[task] = ids
+    return result
+
+
 # <!-- task:WP-9 approved: 2026-09-03 user -->
 TASK_APPROVED_RE = re.compile(r"<!--\s*task:(\S+)\s+approved:\s*(.*?)\s*-->")
 # One task-local acceptance command per task, admitted in the queue itself:
@@ -650,10 +719,8 @@ def parse_task_approved(text: str) -> dict[str, str]:
     return out
 
 
-def spec_acceptance(repo: Path, cfg: dict, text: str, task: str) -> str:
-    """The acceptance section of the work package spec that names the task,
-    found through a `<!-- task:ID spec: path -->` line or docs/work/*/spec.md.
-    Empty when there is none; the packet never guesses."""
+def task_spec(repo: Path, cfg: dict, text: str, task: str) -> tuple[str, str]:
+    """Resolve one spec for both acceptance and task-specific handoff evidence."""
     m = re.search(r"<!--\s*task:" + re.escape(task) + r"\s+spec:\s*(\S+)\s*-->", text)
     candidates = [repo / prefixed(cfg, m.group(1))] if m else sorted(
         (repo / (cfg.get("project_prefix") or "") / "docs" / "work").glob("*/spec.md"))
@@ -662,39 +729,112 @@ def spec_acceptance(repo: Path, cfg: dict, text: str, task: str) -> str:
             body = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        if not m and task not in body:
+        if not m and (task not in body or not re.search(
+                r"^##\s+Acceptance\s*$(.*?)(?=^##\s|\Z)", body, re.S | re.M)):
             continue
-        section = re.search(r"^##\s+Acceptance\s*$(.*?)(?=^##\s|\Z)", body, re.S | re.M)
-        if section:
-            return section.group(1).strip()
-    return ""
+        return os.path.relpath(path, repo).replace("\\", "/"), body
+    return "", ""
+
+
+def spec_acceptance(repo: Path, cfg: dict, text: str, task: str) -> str:
+    """Acceptance from the task's existing spec; empty when unavailable."""
+    _, body = task_spec(repo, cfg, text, task)
+    section = re.search(r"^##\s+Acceptance\s*$(.*?)(?=^##\s|\Z)", body, re.S | re.M)
+    return section.group(1).strip() if section else ""
+
+
+def spec_handoff(repo: Path, cfg: dict, text: str, task: str) -> str:
+    """Carry bounded task-local prose with mechanically checked source anchors.
+
+    The spec owns the assumptions; Git only verifies related-file freshness,
+    never the truth of the prose. Missing/invalid evidence cannot imply trust.
+    """
+    source, body = task_spec(repo, cfg, text, task)
+    section = re.search(r"^##[ \t]+Handoff[ \t]+" + re.escape(task)
+                        + r"[ \t]*$(.*?)(?=^##[ \t]|\Z)", body, re.S | re.M)
+    if not section:
+        return ""
+    handoff = section.group(1).strip()
+    reason = "missing or invalid base/files metadata"
+    metadata = re.search(r"<!--\s*handoff:\s*(\{.*?\})\s*-->", handoff, re.S)
+    try:
+        anchor = json.loads(metadata.group(1)) if metadata else {}
+        base, files = anchor.get("base"), anchor.get("files")
+        valid = (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base)
+                 and isinstance(files, list) and bool(files)
+                 and all(isinstance(f, str) and f.strip() == f and f
+                         and not Path(f).is_absolute() and ".." not in Path(f).parts
+                         and "\\" not in f and not f.startswith(":") for f in files))
+        if valid:
+            # Literal paths only: no accidental Git pathspec expansion or excludes.
+            paths = [":(literal)" + prefixed(cfg, f) for f in files]
+            commands = [
+                ("merge-base", "--is-ancestor", base, "HEAD"),
+                ("diff", "--quiet", base, "--", *paths),
+                ("status", "--porcelain", "--untracked-files=all", "--", *paths),
+            ]
+            results = [subprocess.run(["git", *args], cwd=repo, capture_output=True)
+                       for args in commands]
+            exists = all(
+                (repo / prefixed(cfg, f)).exists()
+                and subprocess.run(["git", "cat-file", "-e", f"{base}:{prefixed(cfg, f)}"],
+                                   cwd=repo, capture_output=True).returncode == 0
+                for f in files)
+            if exists and all(r.returncode == 0 for r in results) and not results[-1].stdout:
+                reason = "related files unchanged against base (prose still requires judgment)"
+            else:
+                reason = "base is unavailable/nonancestor, related files drifted, or Git check failed"
+    except (ValueError, AttributeError, OSError):
+        pass
+    current = reason.startswith("related files unchanged")
+    status = "CURRENT" if current else "STALE/UNVERIFIED"
+    instruction = ("Use these assumptions only after inspecting the relevant implementation."
+                   if current else "Before implementation, reread the related source/callers and replan; "
+                   "do not trust these stale or unverified assumptions. Preserve all stop conditions.")
+    return f"handoff ({source}, {status}: {reason}):\n{instruction}\n{handoff}"
 
 
 def task_packet(repo: Path, cfg: dict, text: str, task: str, files: list[str]) -> str:
     """What one worker needs and nothing more: its queue row, declared files,
-    local check, the spec's acceptance section and a summary of the current
-    diff. The whole queue, handoffs and history stay out of the prompt."""
+    local check, acceptance, optional task handoff and current diff summary.
+    Other tasks and full history stay out of the prompt."""
     row = next((ln for ln in text.splitlines() if _task_id_from_row(ln) == task), "")
     cmd, timeout, _ = task_verify_spec(repo, cfg, task)
-    engine = Path(__file__).resolve().as_posix()
+    check_args = [sys.executable, str(Path(__file__).resolve()), "verify", "--task", task,
+                  "--repo", str(repo)]
+    check_command = subprocess.list2cmdline(check_args) if os.name == "nt" else shlex.join(check_args)
     diff_stat = git(repo, "diff", "--stat", "--", *(files or ["."]), check=False).strip()
     acceptance = spec_acceptance(repo, cfg, text, task)
     parts = [
         "\n\n[TASK PACKET]",
         f"queue row: {row.strip()}",
         f"declared files: {', '.join(files) or '(undeclared)'}",
-        f"local check: python {engine} verify --task {task} --repo {repo.as_posix()}"
+        f"local check: {check_command}"
         f"  (runs: {cmd}; timeout {timeout}s)",
         "closing: stage only your own changes, flip the row to DONE, commit through "
         "the installed hook. Use the local check above as final validation; do not "
         "run its underlying command a second time immediately before or after it. "
         "The runner handles stage and full delivery acceptance.",
+        "If required scope is missing, preserve partial changes and stop immediately. "
+        "Emit exactly one unquoted line in your final assistant answer: FLOW_RESULT: "
+        + json.dumps({"version": 1, "task": task, "status": "scope_request",
+                      "files": ["path/to/required_file.py"],
+                      "reason": "Explain why the admitted scope is insufficient"})
+        + ". Replace files with 1-100 normalized repository-relative paths (no absolute "
+        "paths, backslashes or traversal), and reason with nonempty text of at most "
+        "2000 characters. Do not claim DONE or retry. For normal completion omit "
+        "FLOW_RESULT and follow the gate closing instructions above.",
     ]
     spec_line = re.search(r"<!--\s*task:" + re.escape(task) + r"\s+spec:\s*(\S+)\s*-->", text)
     if spec_line:
-        parts.append(f"spec: {spec_line.group(1)} (read its acceptance for {task} before starting)")
+        parts.append(f"spec: {spec_line.group(1)}" +
+                     (" (acceptance embedded below; reread only if changed)" if acceptance else
+                      " (read its acceptance before starting)"))
     if acceptance:
         parts.append("acceptance:\n" + acceptance)
+    handoff = spec_handoff(repo, cfg, text, task)
+    if handoff:
+        parts.append(handoff)
     if diff_stat:
         parts.append("current uncommitted diff:\n" + diff_stat)
     parts.append("Follow the installed agent-skills disciplines (incremental "
@@ -1256,7 +1396,10 @@ def run_stage_acceptance(repo: Path, cfg: dict, tasks: list[str], base: str | No
     plan = stage_check_plan(repo, cfg, tasks, base)
     run_dir = run_dir or repo / GATE_DIR
     print(f"GATE: {plan['stage']} acceptance ({plan['scope']}): {plan['reason']}")
+    required_review = required_review_tasks(repo, cfg, tasks)
+    missing_review = required_review - valid_review_tasks(repo, cfg, tasks) if required_review else set()
     blockers = open_stage_defects(repo, cfg, plan.get("affected"))
+    blockers += ["pending independent review: " + t for t in sorted(missing_review)]
     if blockers:
         payload = {"result": "FAIL", "exit_code": 1, "count": None, "cmd": "defect checkpoint",
                    "elapsed_s": 0, "tail": "Unresolved checkpoint defects: " + ", ".join(blockers),
@@ -1276,12 +1419,18 @@ def run_stage_acceptance(repo: Path, cfg: dict, tasks: list[str], base: str | No
                    affected=plan.get("affected"),
                    full_suite=plan["scope"] == "queue" and not blockers,
                    unverified="" if plan["scope"] == "queue" and not blockers else "unrelated modules; full delivery acceptance not established")
+    if payload["result"] == "PASS" and required_review - valid_review_tasks(repo, cfg, tasks):
+        payload.update(result="FAIL", exit_code=1, tail="Review evidence changed during acceptance")
     write_verdict(repo, payload)
     journal(repo, {"event": "full_acceptance" if payload["full_suite"] else "stage_acceptance",
                    "run": run_id, "tasks": tasks, "stage": plan["stage"],
                    "result": payload["result"], "count": payload["count"],
                    "seconds": payload["elapsed_s"], "log": payload["log"],
                    "reason": plan["reason"], "head": payload["head"]})
+    if payload["result"] == "PASS":
+        journal(repo, {"event": "package_settled", "tasks": tasks, "stage": plan["stage"],
+                       "head": payload["head"], "review_required": bool(required_review),
+                       "acceptance": payload["log"], "run": run_id})
     return payload
 
 
@@ -1565,6 +1714,7 @@ def run_metrics(events: list[dict], elapsed: float | None = None) -> dict:
         "lock_wait_s": total("acceptance_check", "waited_s") if modern else None,
         "check_coverage": "recorded commands only" if modern else "legacy: task checks unknown",
         "journal_warnings": counts["journal_warning"],
+        "usage": _usage.summarize_usage(events),
     }
 
 
@@ -1591,7 +1741,8 @@ def cmd_metrics(args) -> None:
         batches.append(run_metrics(current))
     note = ("Worker time includes task checks; durations are not additive. Missing legacy measures "
             "are unknown. Active runs have no completed duration. Model calls count CLI requests, "
-            "not provider tokens or spending. Compare similar delivery batches and defect outcomes.")
+            "not spending. Provider tokens cover only reported receipts; missing usage is unknown. "
+            "Cache buckets retain provider semantics. Compare similar delivery batches and defect outcomes.")
     if args.json:
         print(json.dumps({"runs": list(batches), "journal_warnings": warnings, "note": note}, indent=2))
         return
@@ -1601,6 +1752,8 @@ def cmd_metrics(args) -> None:
             "tasks_done", "scope_requests", "stop")
     for row in batches:
         print("| " + " | ".join(str(row[k]) if row[k] is not None else "unknown" for k in keys) + " |")
+    for row in batches:
+        print(f"Usage {row['run']}: " + json.dumps(row['usage'], sort_keys=True))
     print(f"\n{note}\nJournal warnings: {warnings}")
 
 
@@ -1817,11 +1970,46 @@ def is_quota(text: str) -> bool:
 
 def tool_outage_reason(text: str, returncode: int = 1) -> str | None:
     """Classify worker/tool outages that are not verdicts on task work."""
-    if GIT_WRITE_DENIAL_RE.search(text):
+    failures = []
+    terminal = []
+    structured = False
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        structured = True
+        # Codex command_execution items and Claude tool_result envelopes.
+        def walk(value):
+            if isinstance(value, dict):
+                failed = (value.get("is_error") is True or value.get("status") == "failed"
+                          or (isinstance(value.get("exit_code"), int)
+                              and value["exit_code"] != 0))
+                if failed:
+                    output_fields = ("aggregated_output", "stdout", "stderr", "output", "content", "error", "message", "result")
+                    failures.append(json.dumps({k: value[k] for k in output_fields if k in value}
+                                               | {k: value[k] for k in ("is_error", "type") if k in value}))
+                for child in value.values():
+                    if isinstance(child, (dict, list)):
+                        walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+        walk(event)
+        # Only provider/CLI terminal envelopes establish quota or terminal
+        # failure. Nested shell/test/tool errors may be recovered in this turn.
+        if (event.get("type") in ("turn.failed", "error")
+                or (event.get("type") == "result" and event.get("is_error") is True)):
+            terminal.append(json.dumps(event))
+    failed_text = "\n".join(failures + terminal) if structured else (text if returncode else "")
+    if GIT_WRITE_DENIAL_RE.search(failed_text):
         return "git_write_denied"
-    if returncode != 0 and is_quota(text):
+    provider_text = "\n".join(terminal) if structured else (text if returncode else "")
+    if is_quota(provider_text):
         return "quota"
-    return None
+    return "terminal_failure" if terminal else None
 
 
 def disable_worker(repo: Path, cfg: dict, worker: str, reason: str) -> None:
@@ -1890,27 +2078,10 @@ INCOMPLETE_WORK_PATTERNS = (
 )
 
 
-# A worker that ends its turn asking the human for a scope decision (extra
-# declared files, a widened acceptance) has not failed at the work; an
-# identical second dispatch asks the same question again. The first pattern is
-# the "needs your decision" row of the Chinese report format, written as
-# escapes so the source stays ASCII.
-SCOPE_REQUEST_PATTERNS = (
-    re.compile("\u8981\u4f60\u51b3\u5b9a\\s*\\|\\s*(?!\u65e0\\b|None\\b|\u2014|-|\\s*\\|)\\S", re.IGNORECASE),
-    re.compile(r"\b(?:needs? your decision|awaiting (?:your )?(?:approval|decision))\b", re.IGNORECASE),
-)
-SCOPE_HINT_RE = re.compile("\u6269\u56f4|\u58f0\u660e(?:\u6587\u4ef6|\u5217\u8868|\u8303\u56f4)|declared files|files:|scope", re.IGNORECASE)
-SCOPE_PATH_RE = re.compile(r"(?<![\w/])(?:src|tests|docs|scripts)/[\w./\[\]()-]+\.[A-Za-z]{1,5}")
-
-
-def worker_scope_request(output: str) -> dict | None:
-    """Detect a worker that stopped to ask for a scope decision, and what for."""
-    if not any(p.search(output) for p in SCOPE_REQUEST_PATTERNS):
-        return None
-    if not SCOPE_HINT_RE.search(output):
-        return None
-    files = sorted(set(SCOPE_PATH_RE.findall(output[-6000:])))
-    return {"files": files}
+def worker_scope_request(output: str, task: str | None = None, *,
+                         include_legacy: bool = True) -> dict | None:
+    """Interpret only final assistant decisions using the worker protocol owner."""
+    return worker_result_module().scope_request(output, task, include_legacy=include_legacy)
 
 
 def worker_incomplete_reason(output: str) -> str | None:
@@ -2032,9 +2203,13 @@ def spawn_worker(
         # worker_cmds in the config overrides the built-in contracts, so flags
         # can be tuned without editing this file.
         template = (cfg.get("worker_cmds") or {}).get(worker) or WORKER_CMDS.get(worker)
-        if not template:
+        if not template and role != "worker":
             return None, f"no invocation contract for {worker}"
     model = (cfg.get("worker_models") or {}).get(worker) or ""
+    if role == "worker":
+        policy_error = validate_worker(worker, template, model, cfg)
+        if policy_error:
+            return None, policy_error
     if any("{model}" in part for part in template) and not model:
         return None, f"worker_models.{worker} is empty; set an OpenRouter model id"
 
@@ -2126,10 +2301,14 @@ def spawn_worker(
     if log:
         log.close()
     rc = proc.returncode if proc.returncode is not None else -1
+    output = "".join(chunks)
     journal(repo, {"event": "model_call_end", "call": call_id, "worker": worker, "role": role,
                    "seconds": round(time.monotonic() - call_started, 3),
-                   "exit_code": rc, "timed_out": timed_out})
-    return WorkerResult(rc, "".join(chunks), timed_out), None
+                   "exit_code": rc, "timed_out": timed_out,
+                   "prompt_bytes": len(prompt.encode("utf-8")),
+                   "output_bytes": len(output.encode("utf-8")),
+                   "usage": _usage.extract_usage(worker, output)})
+    return WorkerResult(rc, output, timed_out), None
 
 
 # ------------------------------------------------------------ usage probe
@@ -2197,6 +2376,11 @@ def probe_candidates(cfg: dict, pins: dict[str, str]) -> list[str]:
     return seen
 
 
+def dispatch_calls_required(cfg: dict) -> int:
+    """Reserve a useful call after an optional probe, never for default dispatch."""
+    return 2 if sub_cfg(cfg, "probe").get("enabled", False) else 1
+
+
 def ensure_probed(repo: Path, cfg: dict, worker: str, run_id: str, run_dir: Path) -> bool:
     """Probe `worker` once per run (lazily, so a cooldown that expires mid-run
     is re-checked before the first dispatch that would use it). Returns
@@ -2204,13 +2388,13 @@ def ensure_probed(repo: Path, cfg: dict, worker: str, run_id: str, run_dir: Path
     info = tool_state(repo).get(worker, {})
     if info.get("disabled_until", 0) > time.time():
         return False
-    if not sub_cfg(cfg, "probe").get("enabled", True):
+    if not sub_cfg(cfg, "probe").get("enabled", False):
         return True
     if info.get("probed_run") == run_id:
         return True
     # Do not spend the final call on a probe with no allowance for useful work,
     # or misclassify an exhausted run budget as a provider outage.
-    if RUN_BUDGET["max"] and RUN_BUDGET["max"] - RUN_BUDGET["calls"] < 2:
+    if RUN_BUDGET["max"] and RUN_BUDGET["max"] - RUN_BUDGET["calls"] < dispatch_calls_required(cfg):
         return False
     started = time.monotonic()
     usable, reason = probe_worker(repo, cfg, worker, run_dir)
@@ -2348,7 +2532,7 @@ def judge_once(
             failures.append(f"{member}:no_contract")
             continue
         if not ensure_probed(repo, cfg, tool, run_id, run_dir):
-            if RUN_BUDGET["max"] and RUN_BUDGET["max"] - RUN_BUDGET["calls"] < 2:
+            if RUN_BUDGET["max"] and RUN_BUDGET["max"] - RUN_BUDGET["calls"] < dispatch_calls_required(cfg):
                 failures.append(f"{member}:budget")
                 continue  # A later, already-probed CLI may use the final call.
             failures.append(f"{member}:benched")
@@ -2381,8 +2565,15 @@ def judge_once(
             continue
         outage = tool_outage_reason(out, proc.returncode)
         if outage:
+            if outage == "terminal_failure":
+                env = _last_json_object(out) or {}
+                failures.append(f"{member}:{env.get('subtype') or outage}")
+                continue
             disable_worker(repo, cfg, tool, outage)
             failures.append(f"{member}:{outage}")
+            continue
+        if proc.returncode != 0:
+            failures.append(f"{member}:exit_{proc.returncode}")
             continue
         verdict = parse_judge_output(out, out_file)
         if verdict is None:
@@ -2426,6 +2617,97 @@ def review_prompt_template(cfg: dict) -> str:
     return DEFAULT_CONFIG["judge_prompt"]
 
 
+def review_contract(repo: Path, cfg: dict, tasks: list[str]) -> dict:
+    text = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
+    mappings = parse_review_of(text)
+    originals = sorted({original for task in tasks for original in mappings.get(task, [task])})
+    specs = {}
+    paths = {task_spec(repo, cfg, text, task)[0] for task in originals}
+    paths.discard("")
+    paths.update(("AGENTS.md", "gate/model_policy.py",
+                  str(Path.home() / ".config/mini-model-routing/POLICY.md"),
+                  str(Path.home() / ".config/mini-model-routing/policy.json")))
+    for rel in sorted(paths):
+        path = repo / rel
+        specs[rel] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    # Execution accounting and bounded goal grants do not change what the
+    # original review promised. All safety/check/reviewer settings still do.
+    operational = {"repair_continuation", "max_tasks", "max_attempts_per_task",
+                   "max_model_calls", "run_timeout_s", "heartbeat_s", "notify_cmd",
+                   "quota_cooldown_s", "probe"}
+    semantic = {k: v for k, v in cfg.items() if k not in operational}
+    declared, checks = parse_task_files(text), parse_task_verify(text)
+    impacts = dict(re.findall(r"<!--\s*task:(\S+)\s+impact:\s*(\w+)\s*-->", text))
+    return {"config": semantic, "specs": specs,
+            "original_tasks": originals,
+            "declared": {t: declared.get(t, []) for t in originals},
+            "checks": {t: checks.get(t) for t in originals},
+            "impacts": {t: impacts.get(t, "unknown") for t in originals},
+            "approvals": {t: parse_task_approved(text).get(t) for t in originals},
+            "acceptance": {t: spec_acceptance(repo, cfg, text, t) for t in originals},
+            "actions": JUDGE_ACTION_CONTRACT,
+            "repair_contract": REPAIR_REVIEW_CONTRACT, "template": review_prompt_template(cfg)}
+
+
+def review_creates_requirement(event: dict, settlement_version: int) -> bool:
+    """Legacy starts/skips were advisory; a disabled skip creates no obligation.
+
+    Existing explicit requirements and failed verdicts remain fail-closed.
+    This predicate only creates obligations; it never clears prior ones.
+    """
+    kind = event.get("event")
+    if kind == "review_verdict":
+        return bool(settlement_version) or not event.get("passed")
+    return (kind in ("review_start", "review_skipped")
+            and bool(settlement_version)
+            and not (kind == "review_skipped" and event.get("reason") == "disabled"))
+
+
+def legacy_acceptance_closes_implicit_review(event: dict, task: dict) -> bool:
+    """Historical PASS retires advisory review failures only for covered legacy work."""
+    return (event.get("event") in ("full_acceptance", "stage_acceptance")
+            and event.get("result") == "PASS"
+            and not task.get("settlement_version")
+            and not task.get("review_required")
+            and (event["event"] == "full_acceptance"
+                 or task.get("task") in (event.get("tasks") or [])))
+
+
+def required_review_tasks(repo: Path, cfg: dict, tasks: list[str]) -> set[str]:
+    required = set(tasks) if sub_cfg(cfg, "judge").get("enabled") else set()
+    lifecycle = 0
+    completed = {}
+    for e in review_packet_module().events(repo):
+        kind = e.get("event")
+        if kind == "run_start":
+            lifecycle = e.get("settlement_version", 0)
+        elif kind == "task_done":
+            completed[e.get("task")] = dict(e, settlement_version=e.get("settlement_version", lifecycle))
+            if e.get("review_required") and e.get("task") in tasks:
+                required.add(e["task"])
+        for tid in set(e.get("tasks") or []) & set(tasks):
+            if review_creates_requirement(e, completed.get(tid, {}).get("settlement_version", lifecycle)):
+                required.add(tid)
+        required.difference_update(tid for tid, task in completed.items()
+                                   if legacy_acceptance_closes_implicit_review(e, task))
+    return required
+
+
+def valid_review_tasks(repo: Path, cfg: dict, tasks: list[str]) -> set[str]:
+    contract_hash = review_packet_module().digest(review_contract(repo, cfg, tasks))
+    valid = set()
+    for e in review_packet_module().events(repo):
+        if e.get("event") == "review_verdict":
+            # Later failures/skips invalidate earlier evidence for those tasks.
+            valid.difference_update(e.get("tasks") or [])
+            for task in tasks:
+                if review_packet_module().receipt_valid(repo, cfg, e, [task], contract_hash):
+                    valid.add(task)
+        elif e.get("event") in ("review_start", "review_skipped"):
+            valid.difference_update(e.get("tasks") or [])
+    return valid
+
+
 def review_package(
     repo: Path, cfg: dict, run_id: str, run_dir: Path, tasks: list[str],
     base_head: str, files_by_task: dict[str, list[str]],
@@ -2435,11 +2717,14 @@ def review_package(
     Returns {"final": pass|failed|skipped, "score", "verdict", "member",
     "findings", "brief", "tasks"}. Passing means verdict "pass" and no
     high-severity finding. The queue rows are never touched; lesser findings
-    are recorded as notes. Repair tasks receive targeted verification only.
+    are recorded as notes. Repairs use delta review only with a validated baseline.
     """
     jcfg = sub_cfg(cfg, "judge")
+    if not jcfg.get("enabled"):
+        journal(repo, {"event": "review_skipped", "tasks": tasks, "reason": "disabled"})
+        return {"final": "skipped", "reason": "disabled", "tasks": tasks, "findings": [],
+                "score": None, "verdict": None, "member": None, "brief": ""}
     head = git(repo, "rev-parse", "HEAD").strip()
-    commits = [c[:10] for c in git(repo, "rev-list", f"{base_head}..{head}", check=False).split()]
     files = sorted({f for t in tasks for f in files_by_task.get(t, [])})
     v = read_verdict(repo) or {}
     qtext = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
@@ -2448,27 +2733,65 @@ def review_package(
     if template is not cfg.get("judge_prompt"):
         journal(repo, {"event": "judge_prompt_reset",
                        "reason": "project judge_prompt predates package review"})
+    mappings = parse_review_of(qtext)
+    originals = {o for t in tasks for o in mappings.get(t, [t])}
+    # Use the original task boundary even when the caller supplies a repair-only
+    # base. Packet validation may then select the prior reviewed head as anchor.
+    for event in review_packet_module().events(repo):
+        candidate = event.get("base")
+        if (event.get("event") == "task_done" and event.get("task") in originals
+                and candidate and review_packet_module().ancestor(repo, candidate, base_head)):
+            base_head = candidate
+    packet = review_packet_module().build(
+        repo, base_head, head, delivery_stage(cfg), tasks,
+        {t: [prefixed(cfg, p) for p in paths] for t, paths in parse_task_files(qtext).items()
+         if t in originals or t in tasks},
+        {t: spec_acceptance(repo, cfg, qtext, t) for t in sorted(originals | set(tasks))}, v,
+        recorded_defects(repo, cfg), review_contract(repo, cfg, tasks), repairs,
+        [prefixed(cfg, p) for p in [*(sub_cfg(cfg, "delivery").get("full_globs") or []),
+                                   *(cfg.get("irreversible_globs") or [])]], review_of=mappings,
+        semantic_config_paths=[] if os.environ.get("GATE_CONFIG") else [f"{GATE_DIR}/{CONFIG_NAME}"],
+        navigation_paths=[prefixed(cfg, cfg["queue_file"]),
+                          (Path(prefixed(cfg, cfg["queue_file"])).parent / REVIEW_NOTES_NAME).as_posix()])
+    base_head = packet["base"]
+    # Existing templates ask for base..HEAD; for a validated repair the base
+    # placeholder must actually be the repair anchor, never the original base.
     prompt = template.format(
-        tasks=", ".join(tasks), base=base_head[:10],
-        commits=", ".join(commits) or head[:10],
+        tasks=", ".join(tasks), base=packet["anchor"],
+        commits=", ".join(git(repo, "rev-list", f"{packet['anchor']}..{head}").split()) or head,
         files=", ".join(files) or "(undeclared)",
-        verify_tail=(v.get("tail") or "")[-1500:],
-    )
-    if repairs:
+        verify_tail=(v.get("tail") or "")[-1500:])
+    tag = "review-" + "-".join(tasks)[:60] + "-" + packet["packet_hash"][:12]
+    artifact = run_dir / (tag + ".packet.json")
+    artifact.write_text(json.dumps(packet, ensure_ascii=True, indent=2), encoding="utf-8")
+    prompt += review_packet_module().render(packet, artifact)
+    if packet["mode"] == "incremental":
         prompt += REPAIR_REVIEW_CONTRACT.format(repairs=", ".join(repairs))
     prompt += (f"\nCurrent stage: {delivery_stage(cfg)}. Read REVIEW-NOTES.md if present "
                "for existing defect ids and due checkpoints. Do not turn ordinary "
                "development defects into delivery blockers.\n")
     prompt += JUDGE_ACTION_CONTRACT
-    tag = "review-" + "-".join(tasks)[:60]
-    journal(repo, {"event": "review_start", "tasks": tasks, "commit": head})
+    receipt = {k: packet[k] for k in ("base", "head", "stage", "tasks", "original_tasks", "packet_hash", "contract_hash", "mode", "anchor")}
+    receipt.update(packet=str(artifact), coverage={"manifest_paths": len(packet["manifest"]),
+                   "omissions": "explicit in prompt; full originals accessible", "requested_scope": packet["mode"],
+                   "reviewer_read_coverage": "unknown; no read claims inferred from packet inclusion"})
+    journal(repo, dict(receipt, event="review_start", commit=head))
     print(f"  review of {', '.join(tasks)} ...")
-    verdict, member = judge_once(repo, cfg, prompt, run_dir, tag, run_id, n_tasks=len(tasks))
+    if len(prompt.encode("utf-8")) > 32000:
+        verdict, member = None, "review_packet_too_large: inspect full packet and shorten project template"
+    else:
+        verdict, member = judge_once(repo, cfg, prompt, run_dir, tag, run_id, n_tasks=len(tasks))
     if verdict is None:
-        journal(repo, {"event": "review_skipped", "tasks": tasks, "reason": member})
+        journal(repo, dict(receipt, event="review_skipped", outcome="unavailable", reason=member))
         print(f"  review unavailable ({member}) - tasks stay DONE, unreviewed")
         return {"final": "skipped", "reason": member, "tasks": tasks, "findings": [],
                 "score": None, "verdict": None, "member": None, "brief": ""}
+    if git(repo, "rev-parse", "HEAD").strip() != head or non_gate_worktree_state(repo):
+        journal(repo, dict(receipt, event="review_skipped", reason="work_changed"))
+        return {"final": "skipped", "reason": "work_changed", "tasks": tasks, "findings": [],
+                "score": None, "verdict": None, "member": None, "brief": ""}
+    for finding in verdict["findings"]:
+        finding["id"] = defect_id(finding)
     high = [f for f in verdict["findings"] if f.get("severity") in ("high", "critical")]
     affected = stage_check_plan(repo, cfg, tasks, base_head).get("affected")
     blockers = [f for f in verdict["findings"] if finding_blocks(f, delivery_stage(cfg))
@@ -2489,7 +2812,10 @@ def review_package(
     if repairs and blocker_ids and previous and set(previous) <= set(blocker_ids):
         info["loop_file"] = finding_path(blockers[0].get("file") or repairs[0])
     record_review_findings(repo, cfg, info)
-    journal(repo, {"event": "review_verdict", "tasks": tasks, "score": verdict["score"],
+    journal(repo, {**receipt, "recorded_head": git(repo, "rev-parse", "HEAD").strip(),
+                   "notes_path": str(review_notes_path(repo, cfg).relative_to(repo)),
+                   "parsed_review": verdict, "outcome": info["final"],
+                   "event": "review_verdict", "tasks": tasks, "score": verdict["score"],
                    "verdict": verdict["verdict"], "member": member,
                    "findings": len(verdict["findings"]), "high": len(high), "passed": passed,
                    "blocker_ids": blocker_ids, "stage": delivery_stage(cfg),
@@ -2679,32 +3005,52 @@ def pending_closeout(repo: Path) -> tuple[list[dict], set[str]]:
     """Closed tasks not yet covered by their acceptance checkpoint, oldest first, and
     the ids among them that a checkpoint review already passed.
 
-    The package boundary is a journal fact: a `full_acceptance` event or a
-    failed `review_verdict` closes everything before it. Each entry is the
-    task's last `task_done` event ({"task", "commit", "base"?})."""
+    Version 1 requires package_settled. Legacy successful acceptance closes
+    implicit legacy obligations under the historical contract; explicit review
+    requirements must still be resolved.
+    Each entry is the task's last task_done event ({"task", "commit", "base"?})."""
     path = repo / GATE_DIR / "journal.ndjson"
     pending: dict[str, dict] = {}
     reviewed: set[str] = set()
     if not path.exists():
         return [], reviewed
+    lifecycle = 0
+    unresolved_review: set[str] = set()
     for line in path.read_text(encoding="utf-8").splitlines():
         try:
             e = json.loads(line)
         except json.JSONDecodeError:
             continue
         kind = e.get("event")
+        if kind == "run_start":
+            lifecycle = e.get("settlement_version", 0)
+        if kind in ("review_start", "review_skipped", "review_verdict"):
+            ids = set(e.get("tasks") or [])
+            if kind == "review_verdict" and e.get("passed"):
+                unresolved_review.difference_update(ids)
+            else:
+                unresolved_review.update(tid for tid in ids if review_creates_requirement(
+                    e, pending.get(tid, {}).get("settlement_version", lifecycle)))
         if kind == "task_done" and e.get("task") and e.get("commit"):
             pending.pop(e["task"], None)
-            pending[e["task"]] = e
-        elif kind == "review_verdict" and e.get("passed"):
-            reviewed.update(e.get("tasks") or [])
-        elif kind == "stage_acceptance" and e.get("result") == "PASS":
+            pending[e["task"]] = dict(e, settlement_version=e.get("settlement_version", lifecycle))
+            if e.get("review_required"):
+                unresolved_review.add(e["task"])
+        elif kind in ("full_acceptance", "stage_acceptance") and e.get("result") == "PASS":
+            ids = list(pending) if kind == "full_acceptance" else e.get("tasks") or []
+            for tid in ids:
+                if tid not in pending:
+                    continue
+                implicit_closed = legacy_acceptance_closes_implicit_review(e, pending[tid])
+                if implicit_closed or (not pending[tid].get("settlement_version")
+                                       and tid not in unresolved_review):
+                    pending.pop(tid)
+                    unresolved_review.discard(tid)
+        elif kind == "package_settled":
             for tid in e.get("tasks") or []:
                 pending.pop(tid, None)
-                reviewed.discard(tid)
-        elif kind == "full_acceptance" or (kind == "review_verdict" and not e.get("passed")):
-            pending.clear()
-            reviewed.clear()
+    if pending:
+        reviewed = valid_review_tasks(repo, load_config(repo), list(pending))
     return list(pending.values()), reviewed & set(pending)
 
 
@@ -2756,11 +3102,10 @@ def cmd_run(args) -> None:
         repo,
         {"event": "run_start", "run": run_id, "runner_pid": os.getpid(), "workers": workers, "pins": pins,
          "judge": bool(jcfg.get("enabled")), "stage": delivery_stage(cfg),
-         "metrics_version": 1},
+         "metrics_version": 1, "settlement_version": 1},
     )
 
-    # Workers and judges probe lazily immediately before their first useful call.
-    # No startup sweep over old pins, unused fallbacks or future reviewers.
+    # Normal workers and reviewers dispatch directly; optional probes remain lazy.
     run_dir = repo / GATE_DIR / "runs" / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     results: list[dict] = []
@@ -2882,7 +3227,7 @@ def cmd_run(args) -> None:
             ordered = pool[attempts % len(pool):] + pool[:attempts % len(pool)] if pool else []
             worker = next((w for w in ordered if ensure_probed(repo, cfg, w, run_id, run_dir)), None)
             if worker is None:
-                exhausted = RUN_BUDGET["max"] and RUN_BUDGET["max"] - RUN_BUDGET["calls"] < 2
+                exhausted = RUN_BUDGET["max"] and RUN_BUDGET["max"] - RUN_BUDGET["calls"] < dispatch_calls_required(cfg)
                 outcome = "budget" if exhausted else "no_workers"
                 break
             last_worker = worker
@@ -2957,6 +3302,31 @@ def cmd_run(args) -> None:
                 break
 
             out = (proc.stdout or "") + (proc.stderr or "")  # already streamed to logp
+
+            # Explicit protocol decisions precede DONE handling and fail closed.
+            # Weaker legacy prose is deferred until committed DONE/blocked checks.
+            protocol = worker_result_module()
+            try:
+                asked = worker_scope_request(proc.stdout or "", tid, include_legacy=False)
+            except protocol.ProtocolError as exc:
+                attempts += 1
+                outcome = "worker_protocol_error"
+                journal(repo, {"event": outcome, "task": tid, "worker": worker,
+                               "reason": str(exc), "log": str(logp)})
+                print(f"  {worker}: {exc} — stopping without retry; partial work preserved")
+                break
+            if asked:
+                attempts += 1
+                claimed_done = parse_queue(qpath.read_text(encoding="utf-8")).get(
+                    tid, {}).get("status") in cfg["done_markers"]
+                outcome = "worker_protocol_error" if claimed_done else "scope_request"
+                reason = asked["reason"]
+                if claimed_done:
+                    reason = "Scope request conflicts with DONE claim: " + reason
+                journal(repo, {"event": outcome, "task": tid, "worker": worker,
+                               "files": asked["files"], "reason": reason, "log": str(logp)})
+                print(f"  {worker}: {reason} — stopping without retry; partial work preserved")
+                break
 
             # Tool outages are not task failures. A model CLI may itself exit
             # zero after a nested Git command fails, so classify its transcript
@@ -3067,7 +3437,7 @@ def cmd_run(args) -> None:
                 journal(
                     repo,
                     {
-                        "event": "task_done",
+                        "event": "task_done", "settlement_version": 1, "review_required": bool(jcfg.get("enabled")),
                         "task": tid,
                         "worker": worker,
                         "base": head_before,
@@ -3107,6 +3477,16 @@ def cmd_run(args) -> None:
                 print(f"  {tid} ended attempt in unexpected state {task_status} — stopping")
                 break
 
+            # A verified committed completion outranks heuristic prose. Genuine
+            # incomplete legacy requests still stop before any dirty retry.
+            asked = worker_scope_request(proc.stdout or "", tid)
+            if asked:
+                outcome = "scope_request"
+                journal(repo, {"event": outcome, "task": tid, "worker": worker,
+                               "files": asked["files"], "reason": asked["reason"], "log": str(logp)})
+                print(f"  {worker}: {asked['reason']} — stopping without retry; partial work preserved")
+                break
+
             incomplete = worker_incomplete_reason(out)
             if incomplete:
                 outcome = "worker_incomplete"
@@ -3123,16 +3503,6 @@ def cmd_run(args) -> None:
                         "reason": incomplete,
                     },
                 )
-                break
-
-            asked = worker_scope_request(out)
-            if asked:
-                outcome = "scope_request"
-                print(f"  {worker} stopped to ask for a scope decision"
-                      + (": " + ", ".join(asked["files"]) if asked["files"] else "")
-                      + " - stopping without an identical retry")
-                journal(repo, {"event": "scope_request", "task": tid, "worker": worker,
-                               "files": asked["files"]})
                 break
 
             dirty_after = non_gate_worktree_state(repo)
@@ -3197,6 +3567,9 @@ def cmd_run(args) -> None:
         if outcome != "done":
             stop_reason = "budget:model_calls" if outcome == "budget" else f"{outcome}:{tid}"
             break
+        if checkpoint and checkpoint["final"] == "skipped":
+            stop_reason = "review_unavailable:" + tid
+            break
         if checkpoint and checkpoint["final"] == "failed":
             stop_reason = (f"review_loop:{checkpoint['loop_file']}" if checkpoint.get("loop_file")
                            else f"review_failed:{tid}")
@@ -3212,7 +3585,8 @@ def cmd_run(args) -> None:
     if pending and clean_stop:
         qtext = qpath.read_text(encoding="utf-8")
         ids = [e["task"] for e in pending]
-        unreviewed = [t for t in ids if t not in checkpointed] if jcfg.get("enabled") else []
+        required = required_review_tasks(repo, cfg, ids)
+        unreviewed = [t for t in ids if t in required and t not in checkpointed]
         if head_task(cfg, parse_queue(qtext))[0] is not None:
             deferred = ids
         elif unreviewed and stop_reason == "budget:model_calls":
@@ -3234,8 +3608,9 @@ def cmd_run(args) -> None:
                 base = first.get("base") or git(repo, "rev-parse", first["commit"] + "~1",
                                                 check=False).strip() or run_base
                 review_info = review_package(repo, cfg, run_id, run_dir, unreviewed, base, files_by_task)
-                if review_info.get("reason") == "budget":
-                    stop_reason = "budget:model_calls"
+                if review_info["final"] == "skipped":
+                    stop_reason = ("budget:model_calls" if review_info.get("reason") == "budget"
+                                   else "review_unavailable:" + ",".join(unreviewed))
                     deferred = ids
                 if review_info["final"] == "failed":
                     stop_reason = (f"review_loop:{review_info['loop_file']}"
@@ -3273,8 +3648,8 @@ def cmd_run(args) -> None:
     )
 
     needs_human = stop_reason.split(":", 1)[0] in (
-        "review_failed", "full_acceptance_failed", "needs_approval", "scope_request",
-        "prompt_too_large", "review_loop", "repair_paused", "stage_acceptance_failed",
+        "review_failed", "full_acceptance_failed", "needs_approval", "scope_request", "worker_protocol_error",
+        "prompt_too_large", "review_loop", "review_unavailable", "repair_paused", "stage_acceptance_failed",
     )
     # A run that only closed out earlier tasks dispatched nothing and is fine.
     if any(r["outcome"] != "done" for r in results) or needs_human or not (results or acceptance):
@@ -3336,6 +3711,8 @@ def render_report(
                             "review_s", "check_s", "lock_wait_s", "scope_requests")],
               "", "Worker duration includes task checks; these times are not additive. "
               "Checks outside the gate are not measured. Use `flow metrics --last 5` to compare runs."]
+
+    lines += ["", "## Provider usage", "", *_usage.render_usage(metrics["usage"])]
 
     # Review: one package review per run plus any checkpoint reviews. A
     # skipped review is printed loudly - quality silently switched off is
@@ -3470,10 +3847,16 @@ def render_report(
                if acceptance and acceptance.get("log") else "")
             + "Read it and admit one repair task."
         )
-    if stop.startswith("scope_request:"):
+    if stop.startswith(("scope_request:", "worker_protocol_error:")):
         tid = stop.split(":", 1)[1]
-        waiting.append(f"- **{tid}**: the worker asked for a scope decision. Read its log, "
-                       "then widen the declared files or re-shape the task.")
+        evidence = next((e for e in reversed(events) if e.get("task") == tid and
+                         e.get("event") in ("scope_request", "worker_protocol_error")), {})
+        waiting.append(f"- **{tid}**: {evidence.get('reason', 'worker scope/protocol decision')}. "
+                       f"Requested paths: {', '.join(evidence.get('files', [])) or '(see log)'}. "
+                       f"Saved result: `{evidence.get('log', '(see worker log)')}`. "
+                       "Preserve partial work and cumulative budgets; host reconciles scope "
+                       "under existing authority, refreshes the admitted packet, then resumes. "
+                       "Resolve protocol errors before resuming; no automatic retry.")
     if stop.startswith("prompt_too_large:"):
         tid = stop.split(":", 1)[1]
         waiting.append(f"- **{tid}**: its worker packet exceeds worker_packet_max_bytes. "
@@ -3483,8 +3866,8 @@ def render_report(
             waiting.append(f"- **{', '.join(review['tasks'])}**: review and acceptance remain pending "
                            "because the model-call budget was exhausted.")
         else:
-            waiting.append(f"- **{', '.join(review['tasks'])}** closed without a review "
-                           f"({review.get('reason')}). Not blocking; spot-check them.")
+            waiting.append(f"- **{', '.join(review['tasks'])}** awaiting required review "
+                           f"({review.get('reason')}). Settlement remains pending.")
     drifted = [e for e in events if e.get("event") == "scope_drift"]
     for e in drifted:
         waiting.append(f"- **{e['task']}** committed undeclared paths: {', '.join(e['files'][:8])}. "
@@ -3492,8 +3875,8 @@ def render_report(
     for r in results:
         j = r.get("checkpoint")
         if j and j["final"] == "skipped":
-            waiting.append(f"- **{r['task']}** closed without its checkpoint review "
-                           f"({j.get('reason')}). Not blocking; spot-check it.")
+            waiting.append(f"- **{r['task']}** awaiting required checkpoint review "
+                           f"({j.get('reason')}). Settlement remains pending.")
     lines += ["", "## Waiting on you", ""]
     lines += waiting or ["- nothing"]
 
@@ -3569,20 +3952,23 @@ def cmd_review(args) -> None:
     files_by_task = {t: parse_task_files(text).get(t) or [] for t in tasks}
     journal(repo, {"event": "run_start", "run": run_id, "runner_pid": os.getpid(), "workers": [], "pins": {},
                    "judge": not args.acceptance_only, "mode": "review",
-                   "stage": delivery_stage(cfg), "metrics_version": 1})
+                   "stage": delivery_stage(cfg), "metrics_version": 1, "settlement_version": 1})
     acceptance = None
     stop = "queue_empty"
     if args.acceptance_only:
         # The review already passed in an earlier run; only the full oracle is redone.
         info = None
+        if required_review_tasks(repo, cfg, tasks) - valid_review_tasks(repo, cfg, tasks):
+            stop = "review_unavailable:" + ",".join(tasks)
     else:
         info = review_package(repo, cfg, run_id, run_dir, tasks, base, files_by_task)
-        if info.get("reason") == "budget":
-            stop = "budget:model_calls"
+        if info["final"] == "skipped":
+            stop = ("budget:model_calls" if info.get("reason") == "budget"
+                    else "review_unavailable:" + ",".join(tasks))
         if info["final"] == "failed":
             stop = (f"review_loop:{info['loop_file']}" if info.get("loop_file")
                     else "review_failed:" + ",".join(tasks))
-    if stop != "budget:model_calls" and (info is None or info["final"] != "failed") and not args.no_acceptance:
+    if stop == "queue_empty" and not args.no_acceptance:
         acceptance = run_stage_acceptance(repo, cfg, tasks, base, run_dir, run_id)
         if acceptance["result"] != "PASS":
             stop = ("full_acceptance_failed:" if acceptance["full_suite"]

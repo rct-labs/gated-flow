@@ -131,6 +131,24 @@ flow doctor --repo .
 `--verify-cmd` empty and admission refuses every task with `no-oracle` until
 you set one — loud beats a guessed oracle.
 
+Before dispatching workers, configure the required local model policy and
+explicit worker model/effort pins. See [model routing setup](docs/autonomy.md#required-local-configuration).
+Missing or mismatched policy stops dispatch before any model call.
+
+## Local maintenance releases
+
+For an existing compatible Linux installation, use the verified local release
+path instead of rerunning the legacy installer. After independent final review
+and full verification, the host runs `python3 flow/release.py inspect`, stages a
+unique version with the reviewed installation fingerprint, and activates it.
+The source checkout remains authoritative; deployment copies live under
+`~/.local/share/flow/<version>/runtime`. Hashed manifests, canonical skill
+backups, preserved symlink aliases, isolated offline smoke and an atomic shim
+switch support recovery with `python3 flow/release.py rollback --version <id>`.
+Policy bytes and existing project configs/hooks remain protected. See the
+[host commands and recovery procedure](docs/usage.md#verified-local-maintenance-release-linux).
+Implementation completion does not itself activate a release.
+
 ## Daily loop
 
 1. **Have an idea** → `$flow …`. The agent surveys the code, discusses in small

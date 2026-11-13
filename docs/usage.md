@@ -50,6 +50,81 @@ collides with a built-in Claude Code skill. Saying `$run`, "unattended", or
 
 ---
 
+## Verified local maintenance release (Linux)
+
+For an existing compatible Linux installation, the maintenance checkout is the
+source authority. `flow/release.py` stages a deployment copy under
+`~/.local/share/flow/<version>/runtime`; it does not update source, project
+`.gate` configs/hooks, prior releases, historical receipts or machine policy.
+Use this path instead of the legacy installer when updating this installation.
+The legacy installer replaces directories and does not provide this recovery
+contract. This tool requires Python 3.10+, the existing versioned `python3` shim,
+four real canonical directories under `~/.agents/skills`, and their existing
+symlink aliases under both `~/.codex/skills` and `~/.claude/skills`. Other layouts
+are refused; it does not adopt or delete unrelated destinations.
+
+The host first completes independent final review and full verification. Feature
+implementation by itself does not authorize activation. After that delivery
+boundary, run these commands from the maintenance checkout:
+
+```bash
+python3 flow/release.py inspect
+# Review the printed target, hashes, modes and alias paths. Copy its fingerprint.
+python3 flow/release.py stage --source "$PWD" --version <unique-version> --expected-install <reviewed-fingerprint>
+python3 flow/release.py activate --version <unique-version>
+python3 flow/release.py inspect
+flow home
+```
+
+`inspect` is read-only. The explicit fingerprint acknowledges the exact existing
+installation, including intentional local skill edits that differ from the old
+runtime. Review those edits before staging; they are preserved in the backups.
+Staging writes only a new release directory and the release lock. It records
+per-file SHA-256 hashes and modes in `manifest.json`, keeps original canonical
+skills and shim bytes in `backup/`, and leaves the live installation alone.
+The payload is `flow/`, `gate/`, `skills/`, `docs/`, README and LICENSE when
+present; caches, Git metadata and `.gate` state are excluded. The source and
+staged payload must still match at activation. `gate/model_policy.py` must match
+the prior installed runtime byte-for-byte; there is no policy-change override.
+
+Activation checks the original destination snapshot again and runs isolated
+`flow.py home` and `gate.py --help` smoke commands with a temporary home and
+working directory. It performs no inference, scheduler installation or business
+work. It then replaces only the four canonical skill trees and atomically
+replaces the `flow` shim with a shim targeting the new runtime. Skill directory
+swaps are sequential; keep agents idle during activation/recovery. Alias link
+text stays untouched. Release operations serialize through a nonblocking Linux
+file lock. External edits must remain paused as well; this lock coordinates
+release commands, not arbitrary editors.
+
+Recover from an ordinary activation error (automatic rollback is attempted),
+an interrupted activation, or an active release using the maintenance tool:
+
+```bash
+python3 flow/release.py rollback --version <same-version>
+python3 flow/release.py inspect
+flow home
+```
+
+Rollback restores prior canonical bytes/modes and the exact prior shim bytes,
+mode and target. It also handles interruption between directory renames; rerun
+rollback if recovery itself was interrupted. `state.json` records `prepared`,
+`activating`, `active`, `rolling_back` or `rolled_back`. A prepared release has
+not touched live files. A rolled-back release cannot be activated again; stage
+a fresh version. Keep the manifest, backups and prior runtime until recovery is
+no longer needed; the tool never prunes releases.
+
+Activation refuses source or staged payload drift. Rollback tolerates damaged
+code/docs in the abandoned runtime and changed maintenance source; it still
+requires intact staged skill trees matching the manifest, backups and prior
+runtime. Both operations refuse unexpected shim/aliases or live skill bytes
+outside the recorded old/new states. On refusal, preserve
+the release and inspect the named path; do not overwrite unrelated edits, change
+manifest hashes to bypass the check, or run the legacy installer. Resolve the
+drift deliberately and retry recovery, or stage a newly reviewed baseline.
+Offline regression tests use temporary roots only:
+`python3 -m unittest discover -s gate -p test_release.py`.
+
 ## 1. One-time onboarding per project
 
 ```powershell

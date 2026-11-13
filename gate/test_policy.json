@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "coding": {
+    "codex": {
+      "model": "gpt-6.1-sol",
+      "effort": "medium"
+    },
+    "gemini": {
+      "model": "gemini-4-hydrogen-high",
+      "effort": "high"
+    },
+    "claude_fallback": {
+      "model": "claude-sonnet-5-5",
+      "effort": "medium",
+      "only_when": "primary_coding_unavailable"
+    }
+  }
+}

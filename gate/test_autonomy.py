@@ -99,7 +99,7 @@ class ReviewHarness(unittest.TestCase):
             calls["prompts"].append(prompt)
             if i >= len(verdicts):
                 raise AssertionError("review called more often than planned")
-            return verdicts[i], (members or ["fable"] * len(verdicts))[i]
+            return self.gate.normalize_judge_verdict(verdicts[i]), (members or ["fable"] * len(verdicts))[i]
         return fake_judge_once, calls
 
     def _run(self, repo, spawn, judge, expect_exit: str | None = None, max_tasks=None):
@@ -121,6 +121,139 @@ class ReviewHarness(unittest.TestCase):
             for p in patches:
                 p.stop()
         return (repo / ".gate" / "RUN-REPORT.md").read_text(encoding="utf-8")
+
+class LegacyReviewBoundaryTests(ReviewHarness):
+    def test_legacy_skipped_and_started_reviews_stay_closed_after_pass(self):
+        for acceptance in ('full_acceptance', 'stage_acceptance'):
+            for reason in ('disabled', 'unavailable', None):
+                with self.subTest(acceptance=acceptance, reason=reason), tempfile.TemporaryDirectory() as td:
+                    repo = judged_runner_repo(Path(td), ['codex'], judge={'enabled': False})
+                    events = [
+                        {'event': 'task_done', 'task': 'EAV-2', 'commit': 'old'},
+                        {'event': 'review_start', 'tasks': ['EAV-2']},
+                    ]
+                    if reason:
+                        events.append({'event': 'review_skipped', 'tasks': ['EAV-2'], 'reason': reason})
+                    events.append({'event': acceptance, 'tasks': ['EAV-2'], 'result': 'PASS'})
+                    for event in events:
+                        self.gate.journal(repo, event)
+                    self.assertEqual(self.gate.pending_closeout(repo)[0], [])
+                    self.assertEqual(self.gate.required_review_tasks(
+                        repo, self.gate.load_config(repo), ['EAV-2']), set())
+
+    def test_explicit_or_modern_required_reviews_stay_open(self):
+        for version, explicit, review in (
+            (0, True, {'event': 'review_skipped', 'reason': 'disabled'}),
+            (1, False, {'event': 'review_skipped', 'reason': 'unavailable'}),
+        ):
+            with self.subTest(version=version, explicit=explicit), tempfile.TemporaryDirectory() as td:
+                repo = judged_runner_repo(Path(td), ['codex'], judge={'enabled': False})
+                for event in (
+                    {'event': 'run_start', 'settlement_version': version},
+                    {'event': 'task_done', 'task': 'EAV-2', 'commit': 'old', 'review_required': explicit},
+                    dict(review, tasks=['EAV-2']),
+                    {'event': 'review_skipped', 'tasks': ['EAV-2'], 'reason': 'disabled'},
+                    {'event': 'full_acceptance', 'result': 'PASS'},
+                    {'event': 'run_start'},  # Restart/config disable cannot erase the obligation.
+                ):
+                    self.gate.journal(repo, event)
+                self.assertEqual([e['task'] for e in self.gate.pending_closeout(repo)[0]], ['EAV-2'])
+                self.assertEqual(self.gate.required_review_tasks(
+                    repo, self.gate.load_config(repo), ['EAV-2']), {'EAV-2'})
+
+    def test_failed_legacy_original_closes_after_repair_and_full_pass(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as td:
+                repo = judged_runner_repo(Path(td), ['codex'], judge={'enabled': enabled})
+                for event in (
+                    {'event': 'task_done', 'task': 'EAV-2', 'commit': 'original'},
+                    {'event': 'review_verdict', 'tasks': ['EAV-2'], 'passed': False},
+                ):
+                    self.gate.journal(repo, event)
+                self.assertEqual([e['task'] for e in self.gate.pending_closeout(repo)[0]], ['EAV-2'])
+                self.assertEqual(self.gate.required_review_tasks(
+                    repo, self.gate.load_config(repo), ['EAV-2']), {'EAV-2'})
+                for event in (
+                    {'event': 'task_done', 'task': 'EAV-3', 'commit': 'repair'},
+                    {'event': 'review_verdict', 'tasks': ['EAV-3'], 'passed': True},
+                    {'event': 'full_acceptance', 'tasks': [], 'result': 'PASS'},
+                    {'event': 'run_start', 'settlement_version': 1},
+                ):
+                    self.gate.journal(repo, event)
+                self.assertEqual(self.gate.pending_closeout(repo)[0], [])
+                self.assertEqual(self.gate.required_review_tasks(
+                    repo, self.gate.load_config(repo), ['EAV-2', 'EAV-3']), set())
+
+    def test_legacy_acceptance_scope_and_failure(self):
+        for kind, result, expected in (
+            ('stage_acceptance', 'PASS', ['EAV-3']),
+            ('stage_acceptance', 'FAIL', ['EAV-2', 'EAV-3']),
+            ('full_acceptance', 'FAIL', ['EAV-2', 'EAV-3']),
+        ):
+            with self.subTest(kind=kind, result=result), tempfile.TemporaryDirectory() as td:
+                repo = judged_runner_repo(Path(td), ['codex'], judge={'enabled': False})
+                for tid in ('EAV-2', 'EAV-3'):
+                    self.gate.journal(repo, {'event': 'task_done', 'task': tid, 'commit': 'old'})
+                self.gate.journal(repo, {'event': 'review_verdict', 'tasks': ['EAV-2', 'EAV-3'],
+                                         'passed': False})
+                self.gate.journal(repo, {'event': kind, 'tasks': ['EAV-2'], 'result': result})
+                self.assertEqual([e['task'] for e in self.gate.pending_closeout(repo)[0]], expected)
+                self.assertEqual(self.gate.required_review_tasks(
+                    repo, self.gate.load_config(repo), ['EAV-2', 'EAV-3']), set(expected))
+
+    def test_mixed_acceptance_retires_only_implicit_legacy_obligations(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ['codex'], judge={'enabled': False})
+            for event in (
+                {'event': 'task_done', 'task': 'legacy', 'commit': 'old'},
+                {'event': 'task_done', 'task': 'explicit', 'commit': 'old', 'review_required': True},
+                {'event': 'run_start', 'settlement_version': 1},
+                {'event': 'task_done', 'task': 'modern', 'commit': 'new'},
+                {'event': 'task_done', 'task': 'modern-unreviewed', 'commit': 'new'},
+                {'event': 'review_verdict', 'tasks': ['legacy', 'explicit', 'modern'], 'passed': False},
+                {'event': 'full_acceptance', 'tasks': [], 'result': 'PASS'},
+                {'event': 'stage_acceptance', 'tasks': ['explicit', 'modern', 'modern-unreviewed'],
+                 'result': 'PASS'},
+                {'event': 'run_start'},
+            ):
+                self.gate.journal(repo, event)
+            self.assertEqual([e['task'] for e in self.gate.pending_closeout(repo)[0]],
+                             ['explicit', 'modern', 'modern-unreviewed'])
+            self.assertEqual(self.gate.required_review_tasks(
+                repo, self.gate.load_config(repo), ['legacy', 'explicit', 'modern', 'modern-unreviewed']),
+                {'explicit', 'modern'})
+
+    def test_historical_closure_does_not_waive_repeated_modern_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ['codex'], judge={'enabled': False})
+            for event in (
+                {'event': 'task_done', 'task': 'EAV-2', 'commit': 'old'},
+                {'event': 'review_verdict', 'tasks': ['EAV-2'], 'passed': False},
+                {'event': 'full_acceptance', 'tasks': [], 'result': 'PASS'},
+                {'event': 'run_start', 'settlement_version': 1},
+                {'event': 'task_done', 'task': 'EAV-2', 'commit': 'new'},
+                {'event': 'review_skipped', 'tasks': ['EAV-2'], 'reason': 'unavailable'},
+                {'event': 'full_acceptance', 'result': 'PASS'},
+                {'event': 'run_start'},
+            ):
+                self.gate.journal(repo, event)
+            pending, _ = self.gate.pending_closeout(repo)
+            self.assertEqual([(e['task'], e['commit']) for e in pending], [('EAV-2', 'new')])
+            self.assertEqual(self.gate.required_review_tasks(
+                repo, self.gate.load_config(repo), ['EAV-2']), {'EAV-2'})
+
+    def test_disabled_skip_alone_does_not_require_review_for_modern_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ['codex'], judge={'enabled': False})
+            for event in (
+                {'event': 'run_start', 'settlement_version': 1},
+                {'event': 'task_done', 'task': 'EAV-2', 'commit': 'new'},
+                {'event': 'review_skipped', 'tasks': ['EAV-2'], 'reason': 'disabled'},
+            ):
+                self.gate.journal(repo, event)
+            self.assertEqual(self.gate.required_review_tasks(
+                repo, self.gate.load_config(repo), ['EAV-2']), set())
+
 
 class ReviewTests(ReviewHarness):
     """One package review per run gated on high findings, lesser findings
@@ -202,16 +335,121 @@ class ReviewTests(ReviewHarness):
             self.assertIn("review_failed:EAV-2", report)
             self.assertIn("did not pass (verdict escalate)", report)
 
-    def test_review_unavailable_skips_loudly_and_still_accepts(self) -> None:
+    def test_review_unavailable_defers_acceptance_and_survives_restart(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = judged_runner_repo(Path(td), ["claude"])
 
             def unavailable(repo_, cfg, prompt, run_dir, tag, run_id, n_tasks=1):
                 return None, "fable:quota; opus:quota; codex:not found"
-            report = self._run(repo, self._spawn([]), unavailable)
+            report = self._run(repo, self._spawn([]), unavailable, expect_exit="3")
             self.assertIn("| EAV-2 | skipped |", report)
-            self.assertIn("## Full acceptance", report)
-            self.assertIn("closed without a review", report)
+            self.assertNotIn("## Full acceptance", report)
+            self.assertIn("awaiting required review", report)
+            self.assertTrue(self.gate.pending_closeout(repo)[0])
+            judge, calls = self._judge([verdict(95, "pass", [])])
+            self._run(repo, self._spawn([]), judge)
+            self.assertEqual(calls["n"], 1)
+            self.assertFalse(self.gate.pending_closeout(repo)[0])
+
+    def test_failed_original_review_then_mapped_repair_uses_incremental_packet(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"],
+                                      extra={"delivery": {"stage": "integration", "integration_cmd": "python -c \"print('1 passed')\""}})
+            judge, first = self._judge([self.gate.normalize_judge_verdict(verdict(40, "revise", HIGH))])
+            self._run(repo, self._spawn([]), judge, expect_exit="3")
+            receipts = [e for e in self.gate.review_packet_module().events(repo)
+                        if e['event'] == 'review_verdict']
+            prior = receipts[-1]
+            self.assertEqual(prior['mode'], 'full')
+            self.assertFalse(prior['passed'])
+            # Host admission changes the existing queue, not the old receipt or
+            # its contract. This is a real second runner invocation.
+            queue = repo / "TASK_QUEUE.md"
+            queue.write_text(queue.read_text() +
+                "| 2 | EAV-3 | diff | `TODO` | 1 passed | — |\n"
+                "<!-- task:EAV-3 origin: review -->\n"
+                "<!-- task:EAV-3 review_of: EAV-2 -->\n"
+                "<!-- task:EAV-3 files: eav2.txt -->\n")
+            config = repo / '.gate/config.json'
+            cfg = json.loads(config.read_text())
+            cfg['repair_continuation'] = {'enabled': True, 'approved_by': 'existing goal',
+                                         'tasks': ['EAV-3'], 'expires_at': time.time() + 600}
+            cfg['max_model_calls'] = 12
+            config.write_text(json.dumps(cfg))
+            run('git', '-C', str(repo), 'add', 'TASK_QUEUE.md', '.gate/config.json')
+            run('git', '-C', str(repo), 'commit', '-qm', 'admit mapped repair')
+            def repair(repo_arg, cfg, worker, prompt, prompt_file, **kw):
+                # The repair edits the original source; eav3.txt would be
+                # undeclared code and must force a full review.
+                q = repo_arg / 'TASK_QUEUE.md'
+                q.write_text(q.read_text().replace('EAV-3 | diff | `TODO`', 'EAV-3 | diff | `DONE`'))
+                (repo_arg / 'eav2.txt').write_text('fixed\n')
+                run('git', '-C', str(repo_arg), 'add', 'TASK_QUEUE.md', 'eav2.txt')
+                result = run('git', '-C', str(repo_arg), 'commit', '-qm', 'repair original source')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return self.gate.WorkerResult(0, 'done'), None
+            # Keep the same blocker to isolate packet lifecycle from the host's
+            # separate defect-resolution assertion and acceptance checkpoint.
+            judge, second = self._judge([self.gate.normalize_judge_verdict(verdict(40, 'revise', HIGH))])
+            self._run(repo, repair, judge, expect_exit='3')
+            receipt = [e for e in self.gate.review_packet_module().events(repo)
+                       if e['event'] == 'review_verdict'][-1]
+            self.assertEqual(receipt['mode'], 'incremental')
+            self.assertEqual(receipt['base'], prior['base'])
+            self.assertEqual(receipt['anchor'], prior['head'])
+            self.assertEqual(receipt['contract_hash'], prior['contract_hash'])
+            self.assertEqual(receipt['tasks'], ['EAV-2', 'EAV-3'])
+            packet = json.loads(Path(receipt['packet']).read_text())
+            self.assertEqual(packet['prior_blockers'], prior['blocker_ids'])
+            self.assertEqual(packet['review_of'], {'EAV-3': ['EAV-2']})
+            prompt = second['prompts'][0]
+            self.assertIn(f"git diff {prior['head']}..HEAD", prompt)
+            self.assertIn(f"--binary {prior['head']} {receipt['head']}", prompt)
+            self.assertNotIn(f"git diff {prior['base']}..HEAD", prompt)
+            self.assertIn('directly affected callers', prompt)
+
+    def test_checkpoint_unavailable_stops_before_next_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"],
+                                      judge={"checkpoints": ["EAV-2"]}, max_tasks=2)
+            seen = []
+            report = self._run(repo, self._spawn(seen), lambda *a, **kw: (None, "budget"), expect_exit="3")
+            self.assertEqual([t for t, _ in seen], ["EAV-2"])
+            self.assertIn("review_unavailable:EAV-2", report)
+            self.assertTrue(self.gate.pending_closeout(repo)[0])
+            events = list(self.gate.review_packet_module().events(repo))
+            self.assertFalse(any(e['event'] == 'package_settled' for e in events))
+
+    def test_explicit_unavailable_and_acceptance_only_cannot_settle_required_review(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"])
+            self._run(repo, self._spawn([]), lambda *a, **kw: (None, "quota"), expect_exit="3")
+            base = self.gate.pending_closeout(repo)[0][0]['base']
+            for acceptance_only in (False, True):
+                with mock.patch.object(self.gate, 'judge_once', return_value=(None, 'budget')), \
+                     self.assertRaises(SystemExit):
+                    self.gate.cmd_review(SimpleNamespace(repo=str(repo), tasks='EAV-2', base=base,
+                        no_acceptance=False, acceptance_only=acceptance_only))
+                self.assertTrue(self.gate.pending_closeout(repo)[0])
+            cfg = self.gate.load_config(repo)
+            cfg['judge']['enabled'] = False
+            result = self.gate.run_stage_acceptance(repo, cfg, ['EAV-2'], base)
+            self.assertEqual(result['result'], 'FAIL')
+            self.assertIn('pending independent review', result['tail'])
+            self.assertFalse(any(e['event'] == 'package_settled'
+                                 for e in self.gate.review_packet_module().events(repo)))
+
+    def test_changed_work_during_review_cannot_be_receipted(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"])
+            def changing(*args, **kwargs):
+                (repo / 'eav2.txt').write_text('unreviewed change')
+                run('git', '-C', str(repo), 'commit', '-qam', 'changed during review')
+                return verdict(99, 'pass', []), 'fable'
+            self._run(repo, self._spawn([]), changing, expect_exit='3')
+            self.assertTrue(self.gate.pending_closeout(repo)[0])
+            self.assertFalse(any(e['event'] == 'package_settled'
+                                 for e in self.gate.review_packet_module().events(repo)))
 
     def test_checkpoint_task_is_reviewed_right_after_it_closes(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -222,7 +460,7 @@ class ReviewTests(ReviewHarness):
             report = self._run(repo, self._spawn([]), judge)
             self.assertEqual(calls["n"], 2)
             self.assertIn("Tasks under review: EAV-2.", calls["prompts"][0])
-            self.assertIn("Tasks under review: EAV-3.", calls["prompts"][1])
+            self.assertIn("Tasks under review: EAV-2, EAV-3.", calls["prompts"][1])
             self.assertIn("| EAV-2 | pass |", report)
 
     def test_failed_full_acceptance_needs_a_human(self) -> None:
@@ -493,7 +731,8 @@ class ReviewIsAGateTests(ReviewHarness):
             judge, calls = self._judge([verdict(80, "pass", findings=[])])
             report = self._run(repo, self._spawn([]), judge)
             self.assertEqual(calls["n"], 1)
-            self.assertIn("TARGETED REPAIR VERIFICATION for: EAV-2", calls["prompts"][0])
+            self.assertIn("Mode: full", calls["prompts"][0])
+            self.assertNotIn("TARGETED REPAIR VERIFICATION for:", calls["prompts"][0])
             self.assertIn("## Full acceptance", report)
             self.assertIn("## Waiting on you\n\n- nothing", report)
 
@@ -675,7 +914,9 @@ class StagePolicyTests(ReviewHarness):
             item.update(status="resolved", resolution="regression test for export label passes")
             notes.write_text(text + "\n<!-- defect: " + json.dumps(item) + " -->\n", encoding="utf-8")
             result = self.gate.run_stage_acceptance(repo, cfg, ["EAV-2"], None)
-            self.assertEqual(result["result"], "PASS")
+            # A changed stage and edited notes require fresh independent evidence.
+            self.assertEqual(result["result"], "FAIL")
+            self.assertIn("pending independent review", result["tail"])
 
     def test_optional_suggestion_does_not_block_delivery(self):
         with tempfile.TemporaryDirectory() as td:
@@ -995,9 +1236,9 @@ class JudgeChainTests(unittest.TestCase):
         ask = self.gate.worker_scope_request
         self.assertIsNone(ask("Implemented and committed. Done."))
         self.assertEqual(ask("Blocked: this needs your decision on the declared files; "
-                             "I would also touch src/extra.py"), {"files": ["src/extra.py"]})
+                             "I would also touch src/extra.py"), {"files": ["src/extra.py"], "reason": "Blocked: this needs your decision on the declared files; I would also touch src/extra.py"})
         chinese = "| \u8981\u4f60\u51b3\u5b9a | \u6269\u56f4 tests/test_new.py |"
-        self.assertEqual(ask(chinese), {"files": ["tests/test_new.py"]})
+        self.assertEqual(ask(chinese), {"files": ["tests/test_new.py"], "reason": chinese})
         self.assertIsNone(ask("| \u8981\u4f60\u51b3\u5b9a | \u65e0 |"))
 
     def test_judge_contracts_are_read_only(self) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,13 +19,23 @@ HERE = Path(__file__).resolve().parent
 # The full oracle takes a machine-wide turn (~/.gate). The suites must neither
 # wait for a real project's oracle nor make one wait: give them a private turn.
 os.environ["GATE_MACHINE_DIR"] = tempfile.mkdtemp(prefix="gate-machine-")
+# Shell-based legacy fixtures also need `python` on hosts shipping only python3.
+# Keep this alias inside a disposable test directory, never in the installation.
+_PYTHON_BIN = tempfile.TemporaryDirectory(prefix="gate-python-")
+if shutil.which("python") is None:
+    alias = Path(_PYTHON_BIN.name) / ("python.exe" if os.name == "nt" else "python")
+    if os.name == "nt":
+        shutil.copyfile(sys.executable, alias)
+    else:
+        alias.symlink_to(sys.executable)
+    os.environ["PATH"] = str(alias.parent) + os.pathsep + os.environ.get("PATH", "")
 GATE = HERE / "gate.py"
 FLOW = HERE.parent / "flow" / "flow.py"
 
 
 def run(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        list(args),
+        [sys.executable if args[0] == "python" else args[0], *args[1:]],
         cwd=cwd,
         text=True,
         encoding="utf-8",
@@ -45,6 +56,9 @@ def new_repo(root: Path) -> Path:
 
 def committed_runner_repo(root: Path, workers: list[str]) -> Path:
     repo = new_repo(root)
+    # Snapshot assertions must not race Git's detached maintenance/lock cleanup.
+    run("git", "-C", str(repo), "config", "maintenance.auto", "false")
+    run("git", "-C", str(repo), "config", "gc.auto", "0")
     run("git", "-C", str(repo), "config", "user.name", "Gate Test")
     run("git", "-C", str(repo), "config", "user.email", "gate@example.invalid")
     queue = (
@@ -326,6 +340,26 @@ class GateRunnerRecoveryTests(unittest.TestCase):
         self.assertIsNone(self.gate.tool_outage_reason("quota handling test passed", 0))
         self.assertEqual(self.gate.tool_outage_reason("rate limit", 1), "quota")
 
+    def test_structured_git_failure_ignores_successful_source_dumps(self):
+        denied = "fatal: Unable to create '/repo/.git/index.lock': Permission denied"
+        for event in (
+            {"type": "item.completed", "item": {"type": "command_execution", "exit_code": 0,
+                "status": "completed", "aggregated_output": denied}},
+            {"type": "assistant", "message": {"content": denied}},
+            {"type": "user", "message": {"content": [{"type": "tool_result",
+                "is_error": False, "content": denied}]}}):
+            self.assertIsNone(self.gate.tool_outage_reason(json.dumps(event), 0))
+        for event in (
+            {"type": "item.completed", "item": {"type": "command_execution", "exit_code": 128,
+                "status": "failed", "aggregated_output": denied}},
+            {"type": "user", "message": {"content": [{"type": "tool_result",
+                "is_error": True, "content": denied}]}}):
+            self.assertEqual(self.gate.tool_outage_reason(json.dumps(event), 0), "git_write_denied")
+        self.assertIsNone(self.gate.tool_outage_reason(denied, 0))
+        self.assertEqual(self.gate.tool_outage_reason(json.dumps(
+            {"type": "result", "is_error": True, "subtype": "error_max_budget_usd"}), 0),
+            "terminal_failure")
+
     def test_restore_task_row_preserves_other_queue_changes(self) -> None:
         before = (
             "| 1 | EAV-2 | loader | `TODO` |\n"
@@ -356,8 +390,9 @@ class GateRunnerRecoveryTests(unittest.TestCase):
                     return (
                         self.gate.WorkerResult(
                             0,
-                            "fatal: Unable to create "
-                            "'/repo/.git/index.lock': Permission denied",
+                            json.dumps({"type": "item.completed", "item": {
+                                "type": "command_execution", "exit_code": 128,
+                                "aggregated_output": "fatal: Unable to create '/repo/.git/index.lock': Permission denied"}}),
                         ),
                         None,
                     )
