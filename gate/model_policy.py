@@ -4,6 +4,7 @@ This validates explicit argv contracts, not CLI installation or ambient state.
 The engine alone decides whether a call is an implementation call.
 """
 from datetime import datetime
+import errno
 import json
 import math
 from pathlib import Path
@@ -112,6 +113,18 @@ def _is_safe_relative_package_path(raw, package):
     return len(parts) >= 4 and parts[0] == 'docs' and parts[1] == 'work' and parts[2] == package
 
 
+def _resolve_path(path):
+    """Resolve path, normalizing Python <3.13 symlink-loop RuntimeError to OSError."""
+    try:
+        return Path(path).resolve()
+    except RuntimeError as exc:
+        if 'Symlink loop' in str(exc) or (
+            isinstance(exc.__context__, OSError) and exc.__context__.errno == errno.ELOOP
+        ):
+            raise OSError(errno.ELOOP, str(exc)) from exc
+        raise
+
+
 def _validate_exception(cfg, context):
     """Fail-closed validation of the scoped difficult-coding package exception."""
     if not isinstance(context, dict) or not context:
@@ -122,8 +135,8 @@ def _validate_exception(cfg, context):
     ctx_repo = context.get('repository')
     if not isinstance(ctx_repo, str) or not ctx_repo or not Path(ctx_repo).is_absolute():
         raise ValueError('missing or invalid engine repository context')
-    canonical_resolved = CANONICAL_REPO.resolve()
-    actual_repo_resolved = Path(ctx_repo).resolve()
+    canonical_resolved = _resolve_path(CANONICAL_REPO)
+    actual_repo_resolved = _resolve_path(ctx_repo)
     if actual_repo_resolved != canonical_resolved:
         raise ValueError(f'wrong repository for package exception: {actual_repo_resolved}')
 
@@ -133,8 +146,8 @@ def _validate_exception(cfg, context):
     ctx_spec = context.get('spec')
     if not _is_safe_relative_package_path(ctx_spec, EXCEPTION_PACKAGE):
         raise ValueError('missing or invalid engine task spec context')
-    package_root = (actual_repo_resolved / 'docs' / 'work' / EXCEPTION_PACKAGE).resolve()
-    spec_resolved = (actual_repo_resolved / ctx_spec).resolve()
+    package_root = _resolve_path(actual_repo_resolved / 'docs' / 'work' / EXCEPTION_PACKAGE)
+    spec_resolved = _resolve_path(actual_repo_resolved / ctx_spec)
     if not spec_resolved.is_file() or not spec_resolved.is_relative_to(package_root):
         raise ValueError('task spec does not resolve inside authorized package directory')
 
@@ -157,7 +170,7 @@ def _validate_exception(cfg, context):
     grant_repo = grant['repository']
     if not isinstance(grant_repo, str) or not grant_repo or not Path(grant_repo).is_absolute():
         raise ValueError('malformed model_policy_exception repository')
-    if Path(grant_repo).resolve() != canonical_resolved:
+    if _resolve_path(grant_repo) != canonical_resolved:
         raise ValueError(f'wrong repository in model_policy_exception: {grant_repo!r}')
     if grant['package'] != EXCEPTION_PACKAGE:
         raise ValueError(f'wrong package in model_policy_exception: {grant["package"]!r}')
@@ -180,7 +193,7 @@ def _validate_exception(cfg, context):
     record_rel = auth['record']
     if not _is_safe_relative_package_path(record_rel, EXCEPTION_PACKAGE):
         raise ValueError('model_policy_exception authorization.record must stay inside package docs')
-    record_resolved = (actual_repo_resolved / record_rel).resolve()
+    record_resolved = _resolve_path(actual_repo_resolved / record_rel)
     if not record_resolved.is_file() or not record_resolved.is_relative_to(package_root):
         raise ValueError('model_policy_exception authorization.record file does not exist in package')
 

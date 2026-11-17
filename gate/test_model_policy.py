@@ -726,10 +726,39 @@ class PackageExceptionEngineTests(unittest.TestCase):
             self.assertTrue(err.startswith('model_policy:'), err)
             self.assertIn('host must reconcile', err)
 
-            # Simulated ELOOP/OSError from Path.resolve inside _validate_exception.
+            # Python <3.13 Path.resolve() raises RuntimeError('Symlink loop from ...') on cyclic symlinks.
             ctx = gate.worker_policy_context(self.repo, self.cfg, 'IL-1')
             orig_resolve = Path.resolve
 
+            def _legacy_loop_resolve(self_path, *args, **kwargs):
+                if self_path.name == 'loop-a.md':
+                    raise RuntimeError(f'Symlink loop from {str(self_path)!r}')
+                return orig_resolve(self_path, *args, **kwargs)
+
+            with patch.object(model_policy, 'CANONICAL_REPO', self.repo), \
+                 patch.object(Path, 'resolve', _legacy_loop_resolve):
+                v_loop = validate_worker('agy-flow', CARBON_FLOW, '', loop_cfg, policy_path=POLICY, context=ctx)
+                self.assertIsInstance(v_loop, str)
+                self.assertTrue(v_loop.startswith('model_policy:'), v_loop)
+                self.assertIn('Symlink loop', v_loop)
+                self.assertIn('host must reconcile', v_loop)
+                res_loop, err_loop = self._spawn(self.repo, loop_cfg, 'agy-flow', task='IL-1')
+                self.assertIsNone(res_loop)
+                self.assertTrue(err_loop.startswith('model_policy:'), err_loop)
+                self.assertIn('Symlink loop', err_loop)
+                self.assertIn('host must reconcile', err_loop)
+
+            def _unrelated_runtime_error(self_path, *args, **kwargs):
+                if self_path.name == 'implementation.md':
+                    raise RuntimeError('unrelated resolve failure')
+                return orig_resolve(self_path, *args, **kwargs)
+
+            with patch.object(model_policy, 'CANONICAL_REPO', self.repo), \
+                 patch.object(Path, 'resolve', _unrelated_runtime_error):
+                with self.assertRaisesRegex(RuntimeError, 'unrelated resolve failure'):
+                    validate_worker('agy-flow', CARBON_FLOW, '', self.cfg, policy_path=POLICY, context=ctx)
+
+            # Simulated ELOOP/OSError from Path.resolve inside _validate_exception.
             def _eloop_resolve(self_path, *args, **kwargs):
                 if self_path.name == 'implementation.md':
                     raise OSError(40, 'Too many levels of symbolic links')

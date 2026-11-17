@@ -493,7 +493,12 @@ class SkillLifecycleTests(unittest.TestCase):
         q_orig = qpath.read_text(encoding="utf-8")
         qpath.write_text(q_orig.replace("| 1 | EAV-2 | loader | `TODO` |", "| 1 | EAV-2 | loader | `IN_PROGRESS` |"), encoding="utf-8")
 
-        pin1 = flow_skills.pin_task_start(repo, "EAV-2", skill_name="flow-run")
+        pin1 = flow_skills.pin_task_start(
+            repo,
+            "EAV-2",
+            skill_name="flow-run",
+            policy_path=Path(__file__).with_name("test_policy.json"),
+        )
         old_inspect = flow_skills.read_pinned_skill(repo, "EAV-2", "references/inspect.md").decode("utf-8")
         # Materialized pin directory and policy snapshot exist.
         self.assertTrue((repo / ".gate" / "pins" / "EAV-2" / "policy.json").is_file())
