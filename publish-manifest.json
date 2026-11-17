@@ -43,6 +43,7 @@
     "gate/test_autonomy.py",
     "gate/test_compat.py",
     "gate/test_continuity.py",
+    "gate/test_document_tasks.py",
     "gate/test_efficiency.py",
     "gate/test_learning.py",
     "gate/test_model_policy.py",

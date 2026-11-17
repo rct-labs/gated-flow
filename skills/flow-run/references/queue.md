@@ -1,7 +1,9 @@
 # Prepare the next admitted batch
 
 Use [flow's queue procedure](../../flow/references/planning.md) for row format,
-scope, irreversible approval and admission. Do not maintain a second queue.
+scope, `kind: document` opt-in (substantive non-status deliverables + real
+task-specific `verify:`; content validation is task-owned), irreversible approval
+and admission. Do not maintain a second queue.
 
 Declare impact from callers and shared behavior, not the directory name:
 `local`, `shared`, or `unknown`. Shared changes need `delivery.checks` mappings

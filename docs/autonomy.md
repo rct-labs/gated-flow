@@ -149,6 +149,20 @@ Each task declares its implementation files, local check and impact:
 <!-- task:WP-1 impact: local -->
 ```
 
+For genuine documentation-only tasks, opt in explicitly with
+`<!-- task:ID kind: document -->` (default is `code`). Reuse the existing
+`files:` and `verify:` declarations: `files:` must list substantive, non-empty,
+explicit deliverable paths (documents may match `doc_only_globs`, while queue,
+context, gate, review-notes and handoff/status paths never count), and `verify:`
+must declare a real task-specific verification command (not omitted, trivial
+no-op, or replaced by `verify_cmd` fallback). Content and prose validation is
+task-owned via that `verify` command and review; the engine checks contract
+freeze against preexisting `HEAD`, staged substantive non-empty deliverables,
+staged-vs-working-tree byte equality, complete `files` fingerprint and a fresh
+matching `verify --task` PASS, and cannot infer prose correctness from file
+existence. Ordinary `code` tasks remain protected against docs-only closure and
+keep their prior behavior (including when declaring `.md` files alongside code).
+
 Choose `local`, `shared`, or `unknown` from the actual callers, contracts and
 data effects, not the number of files or directory name. Shared changes need
 explicit test mappings covering the declared paths, including affected callers.
@@ -393,25 +407,49 @@ conversion from prompt bytes or cost claims from subscription call counts.
 
 ## Budget continuation decision
 
-At `$flow-run` entry and a budget stop, reconcile the current delivery allowance,
-actual consumption and remaining calls/time from existing budget records and
-CONTEXT. A new session, runner, task name or recovered provider quota never resets
-them. If the remaining allowance covers the next bounded slice and its required
-review, continue without a budget question. A per-run cap alone can be reconciled
-within the existing delivery allowance while stopped; it is not a new grant.
+At `$flow-run` entry and a budget stop, reconcile the current allowance, actual
+consumption, remaining calls/time and limit ownership from existing budget
+records and CONTEXT (no new budget store). A new session, runner, task name or
+recovered provider quota never resets consumption or limits. Distinguish four
+cases before deciding:
 
-When an explicit delivery limit is exhausted or insufficient, keep dispatch
-stopped and present one concise budget decision in the user's language. Show the
-scope, spent/limit/remaining, why the next slice cannot fit, and these choices:
+1. **Owner-set or owner-confirmed cap/deadline**: an explicit owner limit
+   (program, package, call, token/spending or deadline). When exhausted or
+   insufficient, keep dispatch stopped until the owner gives an actual grant.
+   Never silently extend an owner cap or use a paid fallback.
+2. **Host-created finite operational batch**: a scheduling batch limit created by
+   the host with no still-binding owner cap/deadline exceeded. When the owner
+   has given an explicit instruction to finish feasible existing work (not a
+   bare `$flow-run` or recovered quota), the host may replenish that host-created
+   batch with a finite, evidenced **task-sized** increment sized from the
+   actual remaining next slice plus bounded repair/review capacity, preserving
+   cumulative consumption and every actual owner cap/deadline.
+3. **Real provider exhaustion**: actual provider quota, rate-limit or credit
+   exhaustion. Report it honestly without paid fallback; wait for genuine quota
+   recovery or an authorized subscription route. Recovered quota alone is never
+   authorization to launch or extend limits.
+4. **Ambiguous authority**: bare `$flow-run`, silence, timeout, session switch,
+   recovered quota without explicit continuation authorization, or unclear limit
+   ownership. Keep dispatch stopped and present the budget decision choices.
+
+If remaining authorized allowance covers the next bounded slice and its required
+review, continue without a budget question. A per-run cap alone can be
+reconciled within the existing authorized allowance while stopped; it is not a
+new grant.
+
+When an owner grant or confirmation is required, keep dispatch stopped and
+present one concise budget decision in the user's language. Show the scope,
+spent/limit/remaining, why the next slice cannot fit, and size any recommended
+increment `<N>` from the actual next slice plus bounded repair/review capacity
+(never default to `+120` for small remaining tasks):
 
 | Choice | Effect after explicit confirmation |
 |---|---|
-| Add 120 model calls (recommended) | Keep the current scope and consumed count; record a separate +120 grant and increase the cumulative cap by 120 |
-| Start a new bounded batch | Agree its scope and finite allowance (suggest 120 calls), archive the old batch and record the new batch at 0/120 with its predecessor and outstanding obligations |
+| Add `<N>` model calls (recommended) | Keep the current scope and consumed count; record a separate `+<N>` grant sized for the next slice + bounded repair/review and increase the cumulative cap by `<N>` |
+| Start a new bounded batch | Agree its scope and finite task-sized allowance `<N>`, archive the old batch and record the new batch at `0/<N>` with its predecessor and outstanding obligations |
 | Custom allowance | Accept a positive finite additional call count, or clarify the exact requested cap/unit before changing it |
 | Progress only | Report pending work and stop without dispatch or a budget change |
 
-120 is a suggested increment, never an automatic grant or a promise to finish.
 Honor a different explicit user choice already supplied in the session without
 asking again. Use a selection tool when available and permitted for this decision;
 otherwise offer the same numbered choices in chat. A preselected recommendation,
@@ -419,16 +457,18 @@ silence, timeout, bare `$flow-run`, or a session switch is not confirmation. Kee
 the decision pending; do not launch dependent work while awaiting a reply. A
 read-only/status request does not trigger a launch or require a budget decision.
 
-Before resuming, record the user's decision, scope, timestamp, previous cap and
-consumption, grant delta and resulting cap in the existing budget authority and
-CONTEXT; do not introduce a competing budget store. Example: 120/120 plus 120
-becomes 120/240, not 0/120. A new batch can display 0/120 only for that batch;
-retain historical consumption and do not reset a still-binding parent program
-cap. Identify every binding exhausted parent/package/time limit together, so the
-user can approve the necessary changes in one decision. A call-only grant does
-not extend deadlines, token/spending limits or closed package repair allowances.
-New batches preserve pending review, failures, partial work and task identities;
-they never turn unfinished work into accepted work or replay completed tasks.
+Before resuming (including an authorized host-created batch replenishment),
+record the decision/authority, scope, timestamp, previous cap and consumption,
+grant delta and resulting cap in the existing budget authority and CONTEXT; do
+not introduce a competing budget store. Example: `20/20` plus `+12` becomes
+`20/32`, not `0/12`. A new batch can display `0/<N>` only for that batch; retain
+historical consumption and do not reset a still-binding parent program cap.
+Identify every binding exhausted parent/package/time limit together, so the user
+can approve any necessary owner-cap changes in one decision. A call-only grant
+does not extend deadlines, token/spending limits or closed package repair
+allowances. New batches preserve pending review, failures, partial work and task
+identities; they never turn unfinished work into accepted work or replay
+completed tasks.
 
 Update only stopped-run limits to fit the confirmed remaining allowance, reserve
 required review/repair capacity, reconcile task ownership and refresh admission.

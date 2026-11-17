@@ -464,7 +464,10 @@ the next CLI takes over without burning an attempt.
 - **Local checks while working.** A row may admit its own test command
   (`<!-- task:ID verify: {"cmd": ..., "timeout_s": N} -->`); the worker runs
   `flow verify --task ID` and the hook accepts the DONE commit while the
-  declared files keep the tested bytes.
+  declared files keep the tested bytes. Genuine docs-only tasks opt in with
+  `<!-- task:ID kind: document -->` (default `code`), declaring substantive
+  non-status deliverables and a real task-specific `verify` command (content
+  validation is task-owned; see [autonomy.md](autonomy.md#2-test-selection)).
 - **One review per batch.** With `judge.enabled`, a read-only reviewer reads
   the commits once, when the queue has no TODO left; tasks closed by earlier
   runs are included. Current-scope safety and due acceptance defects block;

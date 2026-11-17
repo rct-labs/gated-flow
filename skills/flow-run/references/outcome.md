@@ -31,9 +31,10 @@ language, leading with the measured result or the blocking fact.
 - `prompt_too_large:<id>`: remove unrelated context or split the task; never truncate or weaken acceptance/stop conditions.
 - `needs_approval:<id>`: show the scope line, ask once, add the line on yes.
 - `budget:model_calls` / `run_timeout`: reconcile per-run versus cumulative limits
-  using the [budget continuation decision](../../../docs/autonomy.md#budget-continuation-decision).
-  Offer the choices when delivery authority is insufficient; never reset counters
-  or infer an extension from a new session or restored provider quota.
+  using the [budget continuation decision](../../../docs/autonomy.md#budget-continuation-decision)
+  (distinguish owner caps from host-created batches, size any authorized
+  increment to the actual next slice + bounded repair/review, and never infer an
+  extension from a new session or restored provider quota).
 
 A stage is finished when its selected checks and required reviews pass.
 Disclose untested scope and unavailable reviews. A final delivery needs

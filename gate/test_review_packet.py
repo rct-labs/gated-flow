@@ -206,6 +206,88 @@ class PacketTests(unittest.TestCase):
         (self.repo / 'original-spec.md').write_text('## Acceptance\nChanged acceptance.\n')
         self.assertNotEqual(original, gate.review_contract(self.repo, cfg, ['EAV-3']))
 
+    def test_review_contract_legacy_code_compatibility_and_document_invalidation(self):
+        gate = load_gate_module()
+        queue = self.repo / 'TASK_QUEUE.md'
+        cfg = gate.load_config(self.repo)
+        expected_legacy_keys = {
+            'config', 'specs', 'original_tasks', 'declared', 'checks',
+            'impacts', 'approvals', 'acceptance', 'actions',
+            'repair_contract', 'template',
+        }
+        legacy = gate.review_contract(self.repo, cfg, ['EAV-2'])
+        self.assertEqual(set(legacy.keys()), expected_legacy_keys)
+        self.assertNotIn('kinds', legacy)
+        legacy_digest = packet.digest(legacy)
+
+        # Explicit `kind: code` and unrelated document tasks in the queue preserve exact legacy shape/digest.
+        base_q = queue.read_text(encoding='utf-8')
+        queue.write_text(
+            base_q
+            + '| 2 | DOC-9 | docs | `TODO` | — | — |\n'
+            + '<!-- task:EAV-2 kind: code -->\n'
+            + '<!-- task:DOC-9 kind: document -->\n'
+            + '<!-- task:DOC-9 files: docs/doc9.md -->\n',
+            encoding='utf-8',
+        )
+        explicit_code = gate.review_contract(self.repo, cfg, ['EAV-2'])
+        self.assertEqual(explicit_code, legacy)
+        self.assertNotIn('kinds', explicit_code)
+        self.assertEqual(packet.digest(explicit_code), legacy_digest)
+
+        # Document tasks include `kinds`, changing the contract digest vs code.
+        doc_only = gate.review_contract(self.repo, cfg, ['DOC-9'])
+        self.assertEqual(doc_only['kinds'], {'DOC-9': 'document'})
+        self.assertNotEqual(packet.digest(doc_only), legacy_digest)
+
+        mixed = gate.review_contract(self.repo, cfg, ['EAV-2', 'DOC-9'])
+        self.assertEqual(mixed['kinds'], {'EAV-2': 'code', 'DOC-9': 'document'})
+        self.assertNotEqual(packet.digest(mixed), packet.digest(doc_only))
+
+        # Changing a reviewed document task back to code (or removing kind) invalidates its contract/receipt.
+        queue.write_text(base_q + '| 2 | DOC-9 | docs | `TODO` | — | — |\n<!-- task:DOC-9 files: docs/doc9.md -->\n', encoding='utf-8')
+        reclassified = gate.review_contract(self.repo, cfg, ['DOC-9'])
+        self.assertNotIn('kinds', reclassified)
+        self.assertNotEqual(packet.digest(reclassified), packet.digest(doc_only))
+
+        # End-to-end review receipt validity: legacy code review stays valid when adding explicit `kind: code`;
+        # document review invalidates when kind changes.
+        queue.write_text(base_q, encoding='utf-8')
+        _, cfg_rev, code_receipt = self.native_review()
+        self.assertEqual(code_receipt['contract_hash'], packet.digest(gate.review_contract(self.repo, cfg_rev, ['EAV-2'])))
+        self.assertEqual(gate.valid_review_tasks(self.repo, cfg_rev, ['EAV-2']), {'EAV-2'})
+        # Adding `kind: code` does not alter the contract digest for EAV-2.
+        queue.write_text(queue.read_text(encoding='utf-8') + '<!-- task:EAV-2 kind: code -->\n', encoding='utf-8')
+        self.assertEqual(
+            code_receipt['contract_hash'],
+            packet.digest(gate.review_contract(self.repo, cfg_rev, ['EAV-2'])),
+        )
+        queue.write_text(queue.read_text(encoding='utf-8').replace('<!-- task:EAV-2 kind: code -->\n', ''), encoding='utf-8')
+        self.assertEqual(gate.valid_review_tasks(self.repo, cfg_rev, ['EAV-2']), {'EAV-2'})
+
+        # Review a document task, then verify altering its kind invalidates the receipt.
+        doc_q = (
+            base_q.replace('`TODO`', '`DONE`')
+            + '| 2 | DOC-9 | docs | `DONE` | — | — |\n'
+            + '<!-- task:DOC-9 kind: document -->\n'
+            + '<!-- task:DOC-9 files: docs/doc9.md -->\n'
+            + '<!-- task:DOC-9 impact: local -->\n'
+            + f"<!-- task:DOC-9 verify: {json.dumps({'cmd': cfg_rev['verify_cmd'], 'timeout_s': 10})} -->\n"
+        )
+        (self.repo / 'docs').mkdir(exist_ok=True)
+        self.change('docs/doc9.md', b'# Doc 9\n\n## Summary\nValid.\n')
+        self.change('TASK_QUEUE.md', doc_q.encode('utf-8'))
+        with mock.patch.dict(os.environ, {'GATE_CONFIG': ''}):
+            with mock.patch.object(gate, 'judge_once', return_value=(verdict(95, 'pass', findings=[]), 'offline')):
+                doc_res = gate.review_package(
+                    self.repo, cfg_rev, 'offline-doc', self.repo / '.gate',
+                    ['DOC-9'], self.base, {'DOC-9': ['docs/doc9.md']},
+                )
+        self.assertEqual(doc_res['final'], 'pass')
+        self.assertEqual(gate.valid_review_tasks(self.repo, cfg_rev, ['DOC-9']), {'DOC-9'})
+        self.change('TASK_QUEUE.md', doc_q.replace('kind: document', 'kind: code').encode('utf-8'))
+        self.assertEqual(gate.valid_review_tasks(self.repo, cfg_rev, ['DOC-9']), set())
+
     def test_review_mapping_rejects_missing_unknown_self_duplicate_and_repair_targets(self):
         gate = load_gate_module()
         rows = (self.repo / 'TASK_QUEUE.md').read_text()

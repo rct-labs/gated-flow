@@ -79,9 +79,12 @@ state rather than overriding this launch check. No
 ## 2. Decide
 
 Before selecting executable work, apply the shared
-[budget continuation decision](../../../docs/autonomy.md#budget-continuation-decision).
-Carry remaining allowance across sessions; offer the confirmed-choice flow only
-when an explicit delivery limit cannot cover the next bounded slice and review.
+[budget continuation decision](../../../docs/autonomy.md#budget-continuation-decision):
+distinguish owner-set caps (actual grant required), host-created operational
+batches (replenishable with a finite evidenced task-sized increment under
+explicit owner instruction to finish feasible existing work), real provider
+exhaustion (no paid fallback), and ambiguous authority (stop and confirm).
+Carry remaining allowance across sessions without resetting cumulative counts.
 
 Use [shared adaptive workflow, stage and budget rules](../../../docs/autonomy.md).
 Select simple, scoped or sensitive from actual behavior without asking the user

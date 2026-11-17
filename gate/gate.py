@@ -723,6 +723,190 @@ TASK_APPROVED_RE = re.compile(r"<!--\s*task:(\S+)\s+approved:\s*(.*?)\s*-->")
 # run, after the package review. A row without a declaration uses verify_cmd.
 TASK_VERIFY_RE = re.compile(r"<!--\s*task:([\w.-]+)\s+verify:\s*(\{.*?\})\s*-->", re.S)
 
+TASK_KINDS = ("code", "document")
+# Queue, context, gate, and handoff paths are bookkeeping, never substantive
+# document deliverables, even when a project adds doc globs to doc_only_globs.
+STATUS_ONLY_GLOBS = (
+    "NEXT_SESSION.md",
+    "NEXT_SESSION.*.archive.md",
+    "SESSION.md",
+    "docs/handoff/*",
+    "docs/handoff/**",
+)
+TRIVIAL_VERIFY_CMDS = frozenset({":", "true", "exit 0", "/bin/true", "/usr/bin/true"})
+
+
+def is_explicit_rel_path(rel: str) -> bool:
+    """Return True when `rel` is a single normalized project-relative file path."""
+    if not isinstance(rel, str) or not rel or rel.strip() != rel:
+        return False
+    if "\\" in rel or rel.startswith((":", "/", "./")) or rel.endswith("/") or "/./" in rel:
+        return False
+    if any(ch in rel for ch in "*?[]"):
+        return False
+    parts = Path(rel).parts
+    return bool(parts) and ".." not in parts and "." not in parts and not Path(rel).is_absolute()
+
+
+def _strip_leading_dot_slash(path: str) -> str:
+    """Strip leading './' segments while preserving dot-directories like '.gate'."""
+    norm = path.replace("\\", "/").strip()
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
+def is_status_path(cfg: dict, rel: str) -> bool:
+    """Return True for queue, context, gate, review-notes, and handoff/status paths."""
+    raw_norm = _strip_leading_dot_slash(rel)
+    norm = project_rel(cfg, raw_norm)
+    queue_rel = _strip_leading_dot_slash(cfg.get("queue_file") or "TASK_QUEUE.md")
+    context_rel = _strip_leading_dot_slash(cfg.get("context_file") or "CONTEXT.md")
+    review_parent = Path(queue_rel).parent
+    review_rel = (
+        REVIEW_NOTES_NAME
+        if review_parent == Path(".")
+        else (review_parent / REVIEW_NOTES_NAME).as_posix()
+    )
+    exact_status = {queue_rel, context_rel, REVIEW_NOTES_NAME, review_rel}
+    if norm in exact_status or raw_norm in exact_status:
+        return True
+    if raw_norm == GATE_DIR or raw_norm.startswith(GATE_DIR + "/") or norm == GATE_DIR or norm.startswith(GATE_DIR + "/"):
+        return True
+    handoff = list(cfg.get("handoff_globs") or [])
+    return matches_any(norm, [*STATUS_ONLY_GLOBS, *handoff])
+
+
+def substantive_document_deliverables(cfg: dict, files: list[str]) -> list[str]:
+    """Explicit declared paths that count as substantive document deliverables."""
+    return [f for f in files if is_explicit_rel_path(f) and not is_status_path(cfg, f)]
+
+
+def parse_task_kinds_detailed(text: str) -> tuple[dict[str, str], dict[str, str]]:
+    """Parse `<!-- task:ID kind: code|document -->` comments; return (kinds, errors).
+
+    Tasks without a `kind` declaration default to 'code' at lookup time.
+    Malformed, unclosed, empty, unknown, duplicate, or conflicting declarations
+    are returned in `errors` so callers fail closed.
+    """
+    matches = list(re.finditer(r"<!--\s*task:(\S+)\s+kind\b", text))
+    kinds: dict[str, str] = {}
+    errors: dict[str, str] = {}
+    seen: dict[str, list[str]] = {}
+    for idx, m in enumerate(matches):
+        tid = m.group(1)
+        next_start = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        seg = text[m.end():next_start]
+        close_idx = seg.find("-->")
+        if close_idx < 0 or "\n" in seg[:close_idx] or "<!--" in seg[:close_idx]:
+            errors.setdefault(tid, f"unclosed kind metadata for {tid}")
+            continue
+        body = seg[:close_idx]
+        if not body.startswith(":"):
+            errors.setdefault(tid, f"malformed kind metadata for {tid} (expected 'kind: code|document')")
+            continue
+        val = body[1:].strip()
+        if not val:
+            errors.setdefault(tid, f"empty kind metadata for {tid}")
+            continue
+        if val not in TASK_KINDS:
+            errors.setdefault(
+                tid,
+                f"invalid kind {val!r} for {tid}; expected one of {', '.join(TASK_KINDS)}",
+            )
+            continue
+        seen.setdefault(tid, []).append(val)
+    for tid, vals in seen.items():
+        if tid in errors:
+            continue
+        if len(vals) > 1:
+            if len(set(vals)) > 1:
+                errors[tid] = f"conflicting kind declarations for {tid}: {', '.join(vals)}"
+            else:
+                errors[tid] = f"duplicate kind declaration for {tid}"
+        else:
+            kinds[tid] = vals[0]
+    return kinds, errors
+
+
+def _task_files_status(text: str, tid: str) -> tuple[list[str] | None, str | None]:
+    """Return (files_list_or_None, error_or_None) for one task."""
+    matches = list(re.finditer(r"<!--\s*task:" + re.escape(tid) + r"\s+files\b", text))
+    if not matches:
+        return None, None
+    if len(matches) > 1:
+        return None, f"duplicate files declaration for {tid}"
+    m = matches[0]
+    seg = text[m.end():]
+    close_idx = seg.find("-->")
+    if close_idx < 0 or "\n" in seg[:close_idx] or "<!--" in seg[:close_idx]:
+        return None, f"unclosed files declaration for {tid}"
+    body = seg[:close_idx]
+    if not body.startswith(":"):
+        return None, f"malformed files declaration for {tid}"
+    return [f.strip() for f in body[1:].split(",") if f.strip()], None
+
+
+def _task_verify_status(text: str, tid: str) -> tuple[dict | None, str | None]:
+    """Return (verify_dict_or_None, error_or_None) for one task."""
+    matches = list(re.finditer(r"<!--\s*task:" + re.escape(tid) + r"\s+verify\b", text))
+    if not matches:
+        return None, None
+    if len(matches) > 1:
+        return None, f"duplicate verify declaration for {tid}"
+    m = matches[0]
+    seg = text[m.end():]
+    close_idx = seg.find("-->")
+    if close_idx < 0 or "<!--" in seg[:close_idx]:
+        return None, f"unclosed verify declaration for {tid}"
+    body = seg[:close_idx]
+    if not body.startswith(":"):
+        return None, f"malformed verify declaration for {tid}"
+    raw = body[1:].strip()
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None, f"invalid JSON in verify declaration for {tid}"
+    if not isinstance(value, dict):
+        return None, f"verify declaration for {tid} must be a JSON object"
+    cmd = value.get("cmd")
+    if not isinstance(cmd, str) or not cmd.strip():
+        return None, f"verify declaration for {tid} requires a non-empty cmd string"
+    timeout = value.get("timeout_s", 900)
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or timeout <= 0:
+        return None, f"verify declaration for {tid} has invalid timeout_s"
+    return {"cmd": cmd.strip(), "timeout_s": timeout}, None
+
+
+def validate_document_contract(cfg: dict, text: str, tid: str) -> tuple[dict | None, str | None]:
+    """Validate opt-in document task contract.
+
+    Content/prose validation is task-owned via the explicit verify command;
+    the gate cannot infer prose correctness from file existence.
+    """
+    files, f_err = _task_files_status(text, tid)
+    if f_err:
+        return None, f_err
+    if not files:
+        return None, f"document task {tid} must declare nonempty explicit deliverable paths"
+    bad_paths = [f for f in files if not is_explicit_rel_path(f)]
+    if bad_paths:
+        return None, f"document task {tid} has invalid deliverable path(s): {', '.join(bad_paths)}"
+    deliverables = substantive_document_deliverables(cfg, files)
+    if not deliverables:
+        return None, f"document task {tid} cannot declare only queue/context/status paths"
+    v_decl, v_err = _task_verify_status(text, tid)
+    if v_err:
+        return None, v_err
+    if v_decl is None:
+        return None, (
+            f"document task {tid} requires an explicit <!-- task:{tid} verify: {{\"cmd\": ...}} --> "
+            "command (content validation is task-owned)"
+        )
+    if v_decl["cmd"].strip() in TRIVIAL_VERIFY_CMDS:
+        return None, f"document task {tid} verify command {v_decl['cmd']!r} is a trivial no-op; provide a real content check"
+    return {"kind": "document", "files": files, "deliverables": deliverables, "verify": v_decl}, None
+
 
 def parse_task_approved(text: str) -> dict[str, str]:
     """Map task id -> approval note. An irreversible task (declared files match
@@ -1372,6 +1556,8 @@ def task_packet(repo: Path, cfg: dict, text: str, task: str, files: list[str]) -
     Other tasks and full history stay out of the prompt."""
     row = next((ln for ln in text.splitlines() if _task_id_from_row(ln) == task), "")
     cmd, timeout, _ = task_verify_spec(repo, cfg, task)
+    kinds, _ = parse_task_kinds_detailed(text)
+    task_kind = kinds.get(task, "code")
     check_args = [sys.executable, str(Path(__file__).resolve()), "verify", "--task", task,
                   "--repo", str(repo)]
     check_command = subprocess.list2cmdline(check_args) if os.name == "nt" else shlex.join(check_args)
@@ -1380,6 +1566,8 @@ def task_packet(repo: Path, cfg: dict, text: str, task: str, files: list[str]) -
     parts = [
         "\n\n[TASK PACKET]",
         f"queue row: {row.strip()}",
+        *(["task kind: document (all declared deliverables must be non-empty, staged, and verified via local check; content validation is task-owned)"]
+          if task_kind == "document" else []),
         f"declared files: {', '.join(files) or '(undeclared)'}",
         f"local check: {check_command}"
         f"  (runs: {cmd}; timeout {timeout}s)",
@@ -1721,13 +1909,171 @@ def hook_installation(repo: Path) -> tuple[bool, str]:
     return False, "existing hook is not gate-managed"
 
 
+def git_blob_bytes(repo: Path, ref: str, path: str) -> bytes | None:
+    """Raw bytes of `path` at `ref` (use ':' for index). None when absent."""
+    spec = f":{path}" if ref == ":" else f"{ref}:{path}"
+    proc = subprocess.run(
+        ["git", "cat-file", "blob", spec],
+        cwd=str(repo),
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def _evaluate_contract_texts(
+    cfg: dict,
+    before_q: str,
+    after_q: str,
+    task_ids: list[str],
+    *,
+    require_single_doc_done: bool = True,
+) -> tuple[dict[str, dict], str | None]:
+    """Validate task kind and freeze document contract from `before_q` to `after_q`."""
+    after_kinds, after_k_errs = parse_task_kinds_detailed(after_q)
+    before_kinds, before_k_errs = parse_task_kinds_detailed(before_q or "")
+    before_rows = parse_queue(before_q) if before_q else {}
+    after_rows = parse_queue(after_q) if after_q else {}
+    contracts: dict[str, dict] = {}
+    hint = "(only host/planner before dispatch may reconcile contracts; worker must stop and report)"
+    for tid in task_ids:
+        if tid in after_k_errs:
+            return {}, after_k_errs[tid]
+        after_kind = after_kinds.get(tid, "code")
+        existed_before = tid in before_rows
+        if existed_before:
+            if tid in before_k_errs:
+                return {}, f"preexisting queue has invalid kind for {tid}: {before_k_errs[tid]}"
+            before_kind = before_kinds.get(tid, "code")
+            if before_kind != after_kind:
+                return {}, (
+                    f"task {tid} cannot change kind from {before_kind!r} to {after_kind!r} "
+                    + hint
+                )
+            if not require_single_doc_done and tid not in after_rows:
+                return {}, f"task {tid} row was removed from queue {hint}"
+        if after_kind == "document":
+            if require_single_doc_done and len(task_ids) != 1:
+                return {}, f"document task {tid} cannot close in a multi-task DONE commit ({', '.join(task_ids)})"
+            if not existed_before:
+                return {}, f"document task {tid} must be declared in preexisting HEAD before closing DONE"
+            after_contract, err = validate_document_contract(cfg, after_q, tid)
+            if err:
+                return {}, err
+            before_contract, b_err = validate_document_contract(cfg, before_q or "", tid)
+            if b_err:
+                return {}, f"preexisting queue contract invalid for {tid}: {b_err}"
+            if before_contract["files"] != after_contract["files"]:
+                return {}, f"document task {tid} changed declared files {hint}"
+            if before_contract["verify"] != after_contract["verify"]:
+                return {}, f"document task {tid} changed verify command {hint}"
+            contracts[tid] = after_contract
+        else:
+            contracts[tid] = {"kind": "code"}
+    return contracts, None
+
+
+def _contract_freeze_error(
+    repo: Path,
+    cfg: dict,
+    admitted_qtext: str,
+    dispatched_tid: str,
+    *,
+    head_before: str,
+    head_after: str,
+    queue_after_text: str,
+) -> str | None:
+    """Detect worker contract tampering against `admitted_qtext` across commits, index, and worktree."""
+    qf = prefixed(cfg, cfg["queue_file"])
+    snapshots: list[tuple[str, str]] = []
+    if head_after != head_before:
+        shas = [
+            s.strip()
+            for s in git(
+                repo, "rev-list", "--reverse", f"{head_before}..{head_after}", "--", qf, check=False
+            ).splitlines()
+            if s.strip()
+        ]
+        if not shas:
+            committed_q = blob(repo, head_after, qf)
+            snapshots.append(("committed HEAD", "" if committed_q is None else committed_q))
+        else:
+            for sha in shas:
+                label = "committed HEAD" if sha == head_after else f"commit {sha[:10]}"
+                committed_q = blob(repo, sha, qf)
+                snapshots.append((label, "" if committed_q is None else committed_q))
+    staged_paths = [
+        p.replace("\\", "/")
+        for p in git(repo, "diff", "--cached", "--name-only", "-z", check=False).split("\0")
+        if p
+    ]
+    if qf in staged_paths:
+        staged_q = blob(repo, ":", qf)
+        snapshots.append(("staged index", "" if staged_q is None else staged_q))
+    snapshots.append(("working tree", queue_after_text))
+
+    before_kinds, before_k_errs = parse_task_kinds_detailed(admitted_qtext)
+    before_rows = parse_queue(admitted_qtext)
+    for source_label, after_q in snapshots:
+        _, err = _evaluate_contract_texts(
+            cfg, admitted_qtext, after_q, [dispatched_tid], require_single_doc_done=False
+        )
+        if err:
+            return f"contract freeze violation in {source_label}: {err}"
+        after_kinds, after_k_errs = parse_task_kinds_detailed(after_q)
+        after_rows = parse_queue(after_q)
+        other_ids = sorted(
+            (set(before_rows) | set(after_rows) | set(before_kinds) | set(after_kinds) | set(after_k_errs))
+            - {dispatched_tid}
+        )
+        for other_tid in other_ids:
+            if other_tid in after_k_errs and after_k_errs[other_tid] != before_k_errs.get(other_tid):
+                return f"contract freeze violation in {source_label}: {after_k_errs[other_tid]}"
+            if other_tid in before_k_errs:
+                continue
+            b_kind = before_kinds.get(other_tid, "code")
+            a_kind = after_kinds.get(other_tid, "code")
+            if other_tid in before_rows or other_tid in before_kinds:
+                if b_kind != a_kind:
+                    _, k_err = _evaluate_contract_texts(
+                        cfg, admitted_qtext, after_q, [other_tid], require_single_doc_done=False
+                    )
+                    return f"contract freeze violation in {source_label}: {k_err}"
+            elif a_kind == "document":
+                return (
+                    f"contract freeze violation in {source_label}: "
+                    f"document task {other_tid} cannot be added by worker "
+                    "(only host/planner before dispatch may reconcile contracts; worker must stop and report)"
+                )
+            if b_kind == "document":
+                _, b_err = validate_document_contract(cfg, admitted_qtext, other_tid)
+                if b_err is None:
+                    _, d_err = _evaluate_contract_texts(
+                        cfg, admitted_qtext, after_q, [other_tid], require_single_doc_done=False
+                    )
+                    if d_err:
+                        return f"contract freeze violation in {source_label}: {d_err}"
+    return None
+
+
+def evaluate_done_contracts(
+    repo: Path, cfg: dict, before_ref: str | None, after_ref: str, flipped: list[str]
+) -> tuple[dict[str, dict], str | None]:
+    """Validate task kind and freeze document contract against `before_ref`."""
+    qf = prefixed(cfg, cfg["queue_file"])
+    before_q = blob(repo, before_ref, qf) if before_ref else ""
+    after_q = blob(repo, after_ref, qf) or ""
+    return _evaluate_contract_texts(cfg, before_q or "", after_q, flipped, require_single_doc_done=True)
+
+
 def cmd_check_commit(args) -> None:
     """Fast, structural, and unforgeable: derived from the staged diff itself."""
     repo = repo_root(Path(args.repo).resolve())
     cfg = load_config(repo)
 
     staged = [
-        p for p in git(repo, "diff", "--cached", "--name-only").splitlines() if p.strip()
+        p for p in git(repo, "diff", "--cached", "--name-only", "-z").split("\0") if p
     ]
     if not staged:
         ok("no staged changes")
@@ -1770,20 +2116,73 @@ def cmd_check_commit(args) -> None:
         ok(f"{len(staged)} staged path(s); no task flipped to DONE")
         return
 
-    # --- Gate 1: fake completion. A DONE flip needs code, not just documents.
-    code_paths = [
-        p for p in staged if not matches_any(project_rel(cfg, p), cfg["doc_only_globs"])
-    ]
-    if not code_paths:
-        fail(
-            f"fake completion — task(s) {', '.join(flipped)} flipped to DONE "
-            f"but the commit touches only documentation.",
-            "Staged paths:\n  "
-            + "\n  ".join(staged)
-            + "\n\nThis is the fake-completion pattern (measured at ~60% of tasks in the\n"
-            "orchestrator this gate replaced).\n"
-            "A task is done when the code changed, not when the queue says so.",
-        )
+    contracts, contract_err = evaluate_done_contracts(repo, cfg, before, ":", flipped)
+    if contract_err:
+        fail(f"invalid or modified task contract — {contract_err}")
+
+    doc_tasks = [tid for tid, c in contracts.items() if c["kind"] == "document"]
+    staged_norm = {p.replace("\\", "/") for p in staged}
+
+    # --- Gate 1: fake completion. A code DONE flip needs code; a document
+    # DONE flip needs staged, present, non-empty declared deliverables matching working tree.
+    code_paths: list[str] = []
+    staged_deliverables: list[str] = []
+    if doc_tasks:
+        doc_tid = doc_tasks[0]
+        doc_contract = contracts[doc_tid]
+        deliverables = doc_contract["deliverables"]
+        staged_deliverables = [
+            prefixed(cfg, f) for f in deliverables if prefixed(cfg, f) in staged_norm
+        ]
+        if not staged_deliverables:
+            fail(
+                f"fake completion — document task {doc_tid} flipped to DONE "
+                "without staging any substantive declared deliverable.",
+                "Staged paths:\n  "
+                + "\n  ".join(staged)
+                + "\n\nDeclared deliverables:\n  "
+                + "\n  ".join(prefixed(cfg, f) for f in deliverables),
+            )
+        for rel in deliverables:
+            repo_rel = prefixed(cfg, rel)
+            idx_bytes = git_blob_bytes(repo, ":", repo_rel)
+            if idx_bytes is None:
+                fail(
+                    f"declared document deliverable missing from git index: {repo_rel}",
+                    "Stage all declared deliverables before committing DONE.",
+                )
+            wt_path = repo / repo_rel
+            if not wt_path.is_file():
+                fail(
+                    f"declared document deliverable missing from working tree: {repo_rel}",
+                    "Restore and verify the deliverable before committing DONE.",
+                )
+            wt_bytes = wt_path.read_bytes()
+            if idx_bytes != wt_bytes:
+                fail(
+                    f"staged bytes differ from working-tree bytes for {repo_rel}; "
+                    "stage the verified file so committed bytes match verified bytes.",
+                    "Run `git add` on the verified deliverable and re-commit.",
+                )
+            if not idx_bytes.strip():
+                fail(
+                    f"declared document deliverable is empty: {repo_rel}",
+                    "Document tasks require substantive non-empty deliverables.",
+                )
+    else:
+        code_paths = [
+            p for p in staged if not matches_any(project_rel(cfg, p), cfg["doc_only_globs"])
+        ]
+        if not code_paths:
+            fail(
+                f"fake completion — task(s) {', '.join(flipped)} flipped to DONE "
+                f"but the commit touches only documentation.",
+                "Staged paths:\n  "
+                + "\n  ".join(staged)
+                + "\n\nThis is the fake-completion pattern (measured at ~60% of tasks in the\n"
+                "orchestrator this gate replaced).\n"
+                "A task is done when the code changed, not when the queue says so.",
+            )
 
     # --- Gate 2: frozen paths must not move.
     frozen = cfg.get("frozen_globs") or []
@@ -1798,7 +2197,7 @@ def cmd_check_commit(args) -> None:
             )
 
     # --- Gate 3: a fresh, matching verdict from the real acceptance command.
-    if cfg.get("require_verdict_on_done", True):
+    if cfg.get("require_verdict_on_done", True) or doc_tasks:
         v = read_verdict(repo)
         if not v:
             fail(
@@ -1819,7 +2218,36 @@ def cmd_check_commit(args) -> None:
             )
         if v.get("scope") == "stage":
             fail("a stage checkpoint cannot close an individual task; run verify --task <id>")
-        if v.get("scope") == "task":
+        if doc_tasks:
+            doc_tid = doc_tasks[0]
+            doc_contract = contracts[doc_tid]
+            if v.get("scope") != "task" or v.get("task") != doc_tid:
+                fail(
+                    f"document task {doc_tid} requires a matching task-local PASS "
+                    f"(got scope={v.get('scope')!r}, task={v.get('task')!r}).",
+                    f"Run: gate.py verify --task {doc_tid}",
+                )
+            if v.get("kind") != "document":
+                fail(
+                    f"verdict for {doc_tid} has kind={v.get('kind')!r}, expected 'document'.",
+                    f"Re-run: gate.py verify --task {doc_tid}",
+                )
+            if v.get("cmd") != doc_contract["verify"]["cmd"]:
+                fail(
+                    f"verdict command for {doc_tid} does not match its admitted verify command.",
+                    f"Re-run: gate.py verify --task {doc_tid}",
+                )
+            if sorted(v.get("files") or []) != sorted(doc_contract["files"]):
+                fail(
+                    f"verdict files for {doc_tid} do not match its declared deliverables.",
+                    f"Re-run: gate.py verify --task {doc_tid}",
+                )
+            if not v.get("fingerprint") or files_fingerprint(repo, cfg, doc_contract["files"]) != v.get("fingerprint"):
+                fail(
+                    f"declared files of {doc_tid} changed after its local check.",
+                    f"Re-run: gate.py verify --task {doc_tid}",
+                )
+        elif v.get("scope") == "task":
             # A task-local PASS closes exactly the task it measured, and only
             # while the declared files still hold the bytes that were tested.
             if v.get("task") not in flipped or len(flipped) != 1:
@@ -1827,6 +2255,11 @@ def cmd_check_commit(args) -> None:
                     f"verdict is for task {v.get('task')} but this commit flips "
                     f"{', '.join(flipped)}.",
                     "Run: gate.py verify --task <id> for the task being closed.",
+                )
+            if v.get("kind", "code") != "code":
+                fail(
+                    f"verdict for {v.get('task')} has kind={v.get('kind')!r}, expected 'code'.",
+                    "Run: gate.py verify --task " + str(v.get("task")),
                 )
             files = list(v.get("files") or [])
             if files and files_fingerprint(repo, cfg, files) != v.get("fingerprint"):
@@ -1847,10 +2280,16 @@ def cmd_check_commit(args) -> None:
                         "command is the fact. Fix whichever is wrong.",
                     )
 
-    ok(
-        f"task(s) {', '.join(flipped)} → DONE with {len(code_paths)} code path(s) "
-        f"and a fresh PASS verdict"
-    )
+    if doc_tasks:
+        ok(
+            f"document task {doc_tasks[0]} → DONE with {len(staged_deliverables)} "
+            "staged deliverable(s) and a fresh task PASS verdict"
+        )
+    else:
+        ok(
+            f"task(s) {', '.join(flipped)} → DONE with {len(code_paths)} code path(s) "
+            f"and a fresh PASS verdict"
+        )
 
 
 def task_verify_spec(repo: Path, cfg: dict, task: str) -> tuple[str, int, list[str]]:
@@ -1881,9 +2320,29 @@ def cmd_verify(args) -> None:
             die("--tasks is required for a non-delivery stage check")
         payload = run_stage_acceptance(repo, cfg, tasks, None)
     elif args.task:
-        cmd, timeout, files = task_verify_spec(repo, cfg, args.task)
-        payload = run_acceptance(repo, cfg, args.cmd or cmd, task=args.task,
-                                 timeout_s=timeout, files=files)
+        qpath = repo / prefixed(cfg, cfg["queue_file"])
+        qtext = qpath.read_text(encoding="utf-8") if qpath.exists() else ""
+        kinds, kind_errors = parse_task_kinds_detailed(qtext)
+        if args.task in kind_errors:
+            die(kind_errors[args.task])
+        task_kind = kinds.get(args.task, "code")
+        if task_kind == "document":
+            doc_contract, doc_err = validate_document_contract(cfg, qtext, args.task)
+            if doc_err:
+                die(doc_err)
+            if args.cmd and args.cmd != doc_contract["verify"]["cmd"]:
+                die(
+                    f"document task {args.task} must run its admitted verify command, "
+                    "not an ad-hoc --cmd override"
+                )
+            cmd = doc_contract["verify"]["cmd"]
+            timeout = doc_contract["verify"]["timeout_s"]
+            files = doc_contract["files"]
+        else:
+            cmd, timeout, files = task_verify_spec(repo, cfg, args.task)
+            cmd = args.cmd or cmd
+        payload = run_acceptance(repo, cfg, cmd, task=args.task,
+                                 timeout_s=timeout, files=files, kind=task_kind)
     else:
         payload = run_acceptance(repo, cfg, args.cmd or cfg["verify_cmd"])
     print(
@@ -1916,6 +2375,19 @@ def stage_check_plan(repo: Path, cfg: dict, tasks: list[str], base: str | None,
     full = lambda reason: {"stage": stage, "scope": "queue", "reason": reason,
                            "checks": [{"cmd": cfg["verify_cmd"], "timeout_s": cfg["verify_timeout_s"]}]}
     if stage == "delivery":
+        if not str(cfg.get("verify_cmd") or "").strip():
+            text = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
+            kinds, kind_errs = parse_task_kinds_detailed(text)
+            local = parse_task_verify(text)
+            declared = parse_task_files(text)
+            files = {f for t in tasks for f in declared.get(t, [])}
+            if (tasks and not any(t in kind_errs for t in tasks)
+                    and all(kinds.get(t, "code") == "document" for t in tasks)
+                    and all(t in local for t in tasks)):
+                unique = {local[t]["cmd"]: local[t] for t in tasks}
+                return {"stage": stage, "scope": "stage",
+                        "reason": "admitted document task checks (verify_cmd empty)",
+                        "checks": list(unique.values()), "affected": sorted(files)}
         return full("delivery candidate requires complete acceptance")
     text = (repo / prefixed(cfg, cfg["queue_file"])).read_text(encoding="utf-8")
     rows = parse_queue(text)
@@ -2078,7 +2550,7 @@ def full_oracle_turn(repo: Path, cfg: dict):
 def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
                    task: str | None = None, timeout_s: int | None = None,
                    files: list[str] | None = None, log_path: Path | None = None,
-                   scope: str | None = None) -> dict:
+                   scope: str | None = None, kind: str | None = None) -> dict:
     """Run an acceptance command, write the verdict, return it. Shared by
     `verify` and by the runner's own full acceptance at the end of a run.
     A task-scoped verdict records the task and a fingerprint of its declared
@@ -2089,6 +2561,11 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
     not their tracebacks, and an oracle that takes twenty minutes must not
     have to run again just to be read."""
     cmd = cmd or cfg["verify_cmd"]
+    if task is not None and kind is None:
+        qpath = repo / prefixed(cfg, cfg["queue_file"])
+        qtext = qpath.read_text(encoding="utf-8") if qpath.is_file() else ""
+        kinds, _ = parse_task_kinds_detailed(qtext)
+        kind = kinds.get(task, "code")
     candidate = candidate_fingerprint(repo, cfg) if task is None and scope != "stage" else ""
     # The oracle runs where the project lives, not at the repo root — a repo
     # can host several projects.
@@ -2156,6 +2633,7 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
         "candidate_fingerprint": candidate,
         "scope": "task" if task else (scope or "queue"),
         "task": task,
+        **({"kind": kind} if task else {}),
         "files": sorted(files or []),
         "fingerprint": files_fingerprint(repo, cfg, files or []) if task else "",
         "tail": tail,
@@ -2164,7 +2642,8 @@ def run_acceptance(repo: Path, cfg: dict, cmd: str | None = None, *,
     }
     write_verdict(repo, payload)
     journal(repo, {"event": "acceptance_check", "scope": payload["scope"],
-                   "task": task, "seconds": elapsed, "waited_s": waited,
+                   "task": task, **({"kind": kind} if task else {}),
+                   "seconds": elapsed, "waited_s": waited,
                    "result": result, "head": payload["head"]})
     return payload
 
@@ -2186,15 +2665,39 @@ def cmd_audit(args) -> None:
             continue
         names = [
             p
-            for p in git(repo, "show", "--name-only", "--format=", sha).splitlines()
-            if p.strip()
+            for p in git(repo, "show", "--name-only", "--format=", "-z", sha).split("\0")
+            if p
         ]
+        subject = git(repo, "log", "-1", "--format=%s", sha).strip()
+        contracts, contract_err = evaluate_done_contracts(repo, cfg, parent, sha, flipped)
+        if contract_err:
+            findings.append((sha[:10], ", ".join(flipped), subject, "FAKE_COMPLETION"))
+            continue
+        doc_tasks = [tid for tid, c in contracts.items() if c["kind"] == "document"]
+        if doc_tasks:
+            deliverables = contracts[doc_tasks[0]]["deliverables"]
+            changed_set = {p.replace("\\", "/") for p in names}
+            changed_deliverables = [
+                prefixed(cfg, f) for f in deliverables if prefixed(cfg, f) in changed_set
+            ]
+            all_nonempty = all(
+                (blob_bytes := git_blob_bytes(repo, sha, prefixed(cfg, rel))) is not None
+                and bool(blob_bytes.strip())
+                for rel in deliverables
+            )
+            if not changed_deliverables or not all_nonempty:
+                findings.append((sha[:10], ", ".join(flipped), subject, "FAKE_COMPLETION"))
+            else:
+                findings.append(
+                    (sha[:10], ", ".join(flipped), subject,
+                     f"ok ({len(changed_deliverables)} doc deliverable(s))")
+                )
+            continue
         code = [
             p
             for p in names
             if not matches_any(project_rel(cfg, p), cfg["doc_only_globs"])
         ]
-        subject = git(repo, "log", "-1", "--format=%s", sha).strip()
         if not code:
             findings.append((sha[:10], ", ".join(flipped), subject, "FAKE_COMPLETION"))
         else:
@@ -2397,16 +2900,35 @@ def admit_verdicts(
     def ordered_pair(a: str, b: str) -> bool:
         return b in after_map.get(a, []) or a in after_map.get(b, [])
 
+    kinds_map, kind_errors = parse_task_kinds_detailed(spec_qtext)
+
     for tid in todo:
+        k_err = kind_errors.get(tid)
+        task_kind = kinds_map.get(tid, "code")
         files = files_map.get(tid)
         if files is None:
-            out[tid] = {
-                "verdict": "undeclared-scope",
-                "reason": f"no '<!-- task:{tid} files: … -->' line in the queue",
-                "invalid_row": tid in row_errors,
-            }
+            if k_err:
+                out[tid] = {
+                    "verdict": "refuse",
+                    "reason": f"invalid-kind: {k_err}; no '<!-- task:{tid} files: … -->' line in the queue",
+                    "needs_approval": False,
+                    "invalid_row": tid in row_errors,
+                    "invalid_handoff": False,
+                    "invalid_kind": True,
+                    "invalid_contract": True,
+                }
+            else:
+                out[tid] = {
+                    "verdict": "undeclared-scope",
+                    "reason": f"no '<!-- task:{tid} files: … -->' line in the queue",
+                    "invalid_row": tid in row_errors,
+                    "invalid_kind": False,
+                    "invalid_contract": task_kind == "document",
+                }
             continue
         reasons = [row_errors[tid]] if tid in row_errors else []
+        if k_err:
+            reasons.append(f"invalid-kind: {k_err}")
         h_err = handoff_schema_error(repo, cfg, spec_qtext, tid)
         if h_err:
             reasons.append(f"invalid-handoff: {h_err}")
@@ -2435,10 +2957,18 @@ def admit_verdicts(
             reasons.append(
                 f"unknown-worker: '{pin}' is not one of {', '.join(sorted(known))}"
             )
-        if not cfg.get("verify_cmd"):
-            reasons.append("no-oracle: verify_cmd is empty")
-        elif verdict and verdict.get("result") == "VACUOUS":
-            reasons.append("no-oracle: last verify was VACUOUS")
+        doc_contract_err = None
+        if not k_err and task_kind == "document":
+            _, doc_contract_err = validate_document_contract(cfg, spec_qtext, tid)
+            if doc_contract_err:
+                reasons.append(f"invalid-doc-contract: {doc_contract_err}")
+            elif verdict and verdict.get("result") == "VACUOUS":
+                reasons.append("no-oracle: last verify was VACUOUS")
+        elif not k_err:
+            if not cfg.get("verify_cmd"):
+                reasons.append("no-oracle: verify_cmd is empty")
+            elif verdict and verdict.get("result") == "VACUOUS":
+                reasons.append("no-oracle: last verify was VACUOUS")
         # Reversibility tier: an irreversible task is never a judgement call
         # for the runner. Without an explicit per-task approval it is refused,
         # and cmd_run stops on it regardless of advisory mode.
@@ -2457,6 +2987,8 @@ def admit_verdicts(
             "needs_approval": needs_approval,
             "invalid_row": tid in row_errors,
             "invalid_handoff": bool(h_err),
+            "invalid_kind": bool(k_err),
+            "invalid_contract": bool(k_err or doc_contract_err),
         }
     return out
 
@@ -2502,6 +3034,9 @@ def cmd_admit(args) -> None:
         for check in plan["checks"]:
             print(f"  check ({check['timeout_s']}s): {check['cmd']}")
         print("  Actual edits can expand acceptance. Review callers and test coverage before dispatch.")
+        kinds_map, _ = parse_task_kinds_detailed(text)
+        if any(kinds_map.get(t) == "document" for t in verdicts):
+            print("  Document tasks: prose/content validation is task-owned via verify; existence alone does not validate prose.")
         if bad or any(d["level"] == "error" for d in diagnostics):
             raise SystemExit(2)
 
@@ -2511,6 +3046,7 @@ def planning_diagnostics(repo: Path, cfg: dict, text: str, tasks: list[str]) -> 
     notes = []
     files = parse_task_files(text)
     local = parse_task_verify(text)
+    kinds_map, kind_errors = parse_task_kinds_detailed(text)
     requests = {}
     for event in iter_journal(repo):
         tid = event.get("task")
@@ -2523,11 +3059,18 @@ def planning_diagnostics(repo: Path, cfg: dict, text: str, tasks: list[str]) -> 
     for tid in tasks:
         def note(level, message):
             notes.append({"task": tid, "level": level, "message": message})
+        if tid in kind_errors:
+            note("error", f"invalid task kind: {kind_errors[tid]}")
+        elif kinds_map.get(tid, "code") == "document":
+            _, doc_err = validate_document_contract(cfg, text, tid)
+            if doc_err:
+                note("error", doc_err)
         if tid not in local:
-            declared = re.search(r"<!--\s*task:" + re.escape(tid) + r"\s+verify:", text)
-            note("error" if declared else "warning", "invalid task check" if declared else
-                 "no task check: each attempt falls back to the complete verify_cmd")
-        elif local[tid]["cmd"].strip() == cfg.get("verify_cmd", "").strip():
+            if kinds_map.get(tid, "code") != "document":
+                declared = re.search(r"<!--\s*task:" + re.escape(tid) + r"\s+verify:", text)
+                note("error" if declared else "warning", "invalid task check" if declared else
+                     "no task check: each attempt falls back to the complete verify_cmd")
+        elif cfg.get("verify_cmd", "").strip() and local[tid]["cmd"].strip() == cfg.get("verify_cmd", "").strip():
             note("warning", "task check equals complete verify_cmd; select affected tests if sufficient")
         spec = re.search(r"<!--\s*task:" + re.escape(tid) + r"\s+spec:\s*(\S+)\s*-->", text)
         if spec and not spec_acceptance(repo, cfg, text, tid):
@@ -3344,16 +3887,22 @@ def review_contract(repo: Path, cfg: dict, tasks: list[str]) -> dict:
                    "quota_cooldown_s", "probe"}
     semantic = {k: v for k, v in cfg.items() if k not in operational}
     declared, checks = parse_task_files(text), parse_task_verify(text)
+    kinds, _ = parse_task_kinds_detailed(text)
     impacts = dict(re.findall(r"<!--\s*task:(\S+)\s+impact:\s*(\w+)\s*-->", text))
-    return {"config": semantic, "specs": specs,
-            "original_tasks": originals,
-            "declared": {t: declared.get(t, []) for t in originals},
-            "checks": {t: checks.get(t) for t in originals},
-            "impacts": {t: impacts.get(t, "unknown") for t in originals},
-            "approvals": {t: parse_task_approved(text).get(t) for t in originals},
-            "acceptance": {t: spec_acceptance(repo, cfg, text, t) for t in originals},
-            "actions": JUDGE_ACTION_CONTRACT,
-            "repair_contract": REPAIR_REVIEW_CONTRACT, "template": review_prompt_template(cfg)}
+    contract = {
+        "config": semantic, "specs": specs,
+        "original_tasks": originals,
+        "declared": {t: declared.get(t, []) for t in originals},
+        "checks": {t: checks.get(t) for t in originals},
+        "impacts": {t: impacts.get(t, "unknown") for t in originals},
+        "approvals": {t: parse_task_approved(text).get(t) for t in originals},
+        "acceptance": {t: spec_acceptance(repo, cfg, text, t) for t in originals},
+        "actions": JUDGE_ACTION_CONTRACT,
+        "repair_contract": REPAIR_REVIEW_CONTRACT, "template": review_prompt_template(cfg),
+    }
+    if any(kinds.get(t, "code") == "document" for t in originals):
+        contract["kinds"] = {t: kinds.get(t, "code") for t in originals}
+    return contract
 
 
 def review_creates_requirement(event: dict, settlement_version: int) -> bool:
@@ -3904,7 +4453,7 @@ def cmd_run(args) -> None:
                 {"event": "admit_refused", "task": tid, "strict": strict, **adm},
             )
             detail = f"{adm['verdict']}: {adm['reason']}"
-            if strict or adm.get("invalid_row") or adm.get("invalid_handoff"):
+            if strict or adm.get("invalid_row") or adm.get("invalid_handoff") or adm.get("invalid_kind") or adm.get("invalid_contract"):
                 stop_reason = f"admit_refused:{tid}"
                 print(
                     f"GATE: task {tid} refused admission ({detail}) — stopping. "
@@ -3918,6 +4467,19 @@ def cmd_run(args) -> None:
 
         print(f"\nGATE: task {tid} ({slot + 1}/{max_tasks})")
         head_before = git(repo, "rev-parse", "HEAD").strip()
+        admitted_qtext = qtext
+        admitted_contracts, admitted_err = _evaluate_contract_texts(
+            cfg, admitted_qtext, admitted_qtext, [tid], require_single_doc_done=False
+        )
+        if admitted_err:
+            stop_reason = f"admit_refused:{tid}"
+            journal(
+                repo,
+                {"event": "admit_refused", "task": tid, "strict": strict, "verdict": "refuse", "reason": admitted_err},
+            )
+            print(f"GATE: task {tid} refused admission ({admitted_err}) — stopping.")
+            break
+        admitted_kind = admitted_contracts[tid]["kind"]
         attempts = 0
         dispatches = 0
         outcome = "unknown"
@@ -4038,20 +4600,38 @@ def cmd_run(args) -> None:
             except subprocess.TimeoutExpired:
                 proc, err = None, "timeout"
             took = round(time.time() - t0, 1)
-            if proc is not None and getattr(proc, "timed_out", False):
+            timed_out = proc is not None and getattr(proc, "timed_out", False)
+            if timed_out:
                 print(f"  timed out after {took}s — worker tree killed")
                 journal(repo, {"event": "attempt_timeout", "task": tid, "worker": worker})
                 notify(cfg, repo, f"{tid} timed out after {int(took // 60)}m")
-                attempts += 1
-                outcome = "timeout"
-                continue
-
-            if proc is None:
+            elif proc is None:
                 print(f"  worker unusable: {err}")
                 journal(
                     repo,
                     {"event": "worker_error", "task": tid, "worker": worker, "err": err},
                 )
+
+            head_after = git(repo, "rev-parse", "HEAD").strip()
+            queue_after_text = qpath.read_text(encoding="utf-8") if qpath.is_file() else ""
+            contract_err = _contract_freeze_error(
+                repo, cfg, admitted_qtext, tid,
+                head_before=head_before, head_after=head_after,
+                queue_after_text=queue_after_text,
+            )
+            if contract_err:
+                attempts += 1
+                outcome = "worker_protocol_error"
+                journal(repo, {"event": outcome, "task": tid, "worker": worker,
+                               "reason": contract_err, "log": str(logp)})
+                print(f"  {worker}: {contract_err} — stopping without retry; partial work preserved")
+                break
+
+            if timed_out:
+                attempts += 1
+                outcome = "timeout"
+                continue
+            if proc is None:
                 if err == "timeout":
                     attempts += 1
                     outcome = "timeout"
@@ -4191,12 +4771,14 @@ def cmd_run(args) -> None:
 
             if now_done and completed == [tid]:
                 outcome = "done"
+                done_kind = admitted_kind
                 print(f"  {tid} DONE in {took}s via {worker} ({head_after[:10]})")
                 journal(
                     repo,
                     {
                         "event": "task_done", "settlement_version": 1, "review_required": bool(jcfg.get("enabled")),
                         "task": tid,
+                        "kind": done_kind,
                         "worker": worker,
                         "base": head_before,
                         "commit": head_after,

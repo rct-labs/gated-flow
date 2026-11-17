@@ -56,6 +56,12 @@ each with a scope line so admission can judge it:
 <!-- task:WP-7 files: src/foo.py, tests/test_foo.py -->
 ```
 
+For genuine docs-only deliverables, opt in with `<!-- task:ID kind: document -->`
+(default `code`): declare substantive non-status `files:` and an explicit real
+task-specific `verify:` command (content validation is task-owned; see
+[document task rules](../../../docs/autonomy.md#2-test-selection)). Never
+reclassify code tasks as `document` or weaken checks to bypass Gate 1.
+
 Optionally give the table a `worker` column (`claude` / `codex` / `kimi` /
 `grok`, empty = no pin) so each task goes to the CLI that suits it; gate
 falls through to the run-wide list when the pin is benched.
