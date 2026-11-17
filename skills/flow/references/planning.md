@@ -1,21 +1,35 @@
 # Shape and queue authorized work
 
-**New idea / requirement** — shaping is a conversation grounded in the
-current system, not a form to fill. In order:
-1. **Survey first**: read the parts of the codebase and docs the idea
-   touches (data model, existing screens/flows, related past decisions).
-   Never shape against an imagined system.
-2. **Restate**: say back what you understood — the invariants of the idea,
-   with the user's examples explicitly marked as examples, plus what the
-   current system already has or conflicts with.
-3. **Discuss in small rounds**: one focused question at a time, each paired
-   with your recommendation and why (drawn from the survey). Offer better
-   alternatives when you see one; the user wants pushback, not dictation.
-4. Only when the shape is stable, write `docs/work/<id>/brief.md` from the
-   template, then `spec.md` when the goal is testable. Spec changed later?
-   Edit the same file, bump its `revision:` line — never a spec-v2 file.
-Never rush to tasks: a fuzzy idea that skips discussion becomes falsely
-precise tasks — the exact failure this workflow exists to prevent.
+**New idea / requirement** — shaping is proportional host reasoning, not a
+mandatory form or questionnaire:
+1. **Survey first**: in an existing codebase, read the code, callers, tests and
+   past decisions the request touches (failure and rollback surfaces included);
+   for greenfield work without an existing codebase, ground in stated
+   requirements, exemplars and constraints rather than presuming existing code
+   or an imagined system. Weigh only the engineering lenses relevant to the
+   slice: concrete outcome and non-goals, applicable data ownership and
+   interface contracts, existing reuse or greenfield baseline, and quality
+   constraints that materially affect design or acceptance.
+2. **Match depth to actual risk and ambiguity**: when existing code and a clear
+   reproduction settle a small local fix, state the scoped change and decisive
+   check directly without ceremonial questions. Sensitive repairs (data,
+   permissions, money, destructive or hard-to-reverse paths) keep full risk
+   judgment and clarify any ambiguous safety invariant before editing.
+3. **Restate and ask only decisive questions**: when requirements or shared
+   boundaries are genuinely open, state the core invariants (marking user
+   examples as examples) and what the current system or baseline already owns or
+   conflicts with. Discuss in small rounds — one focused question at a time,
+   paired with your grounded recommendation and pushback when a simpler option
+   fits; record relevant conclusions and routine implementation choices in
+   `spec.md` Decisions.
+4. **Stabilize before queueing**: capture exploratory intent in
+   `docs/work/<id>/brief.md`, then write `spec.md` when the goal is testable
+   (edit in place and bump `revision:` on change — never a `spec-v2` file). Use
+   the cheapest decisive proof for remaining uncertainty; for uncertain
+   greenfield work, resolve decisive product and critical-risk unknowns rather
+   than waterfall-specifying every detail upfront, then shape an early runnable
+   vertical slice. Never turn unresolved fuzziness into falsely precise tasks or
+   skip critical risks.
 
 **Show me options / prototype** — use the lowest-cost proof that matches the
 question:

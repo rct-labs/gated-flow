@@ -25,7 +25,8 @@
      reproduced and its fix verified; the same observation recurred and
      would prevent a future mistake. One row per lesson: a repeat updates
      the existing row. Never a row per session, never a preference guessed
-     from one choice.
+     from one choice; prospective opportunities and external references use
+     `Bounded experiment` below.
 
      Existing status values candidate | accepted | rejected | superseded stay
      readable. New fields below are optional; do not backfill invented evidence.
@@ -45,11 +46,14 @@
 |---|---|---|---|---|---|---|---|---|---|---|
 
 ## Bounded experiment (only when needed)
-<!-- For an external idea or proposed lesson change, reuse this work package;
-     do not create a learning database or plugin registry. -->
+<!-- For a user-curated source, `flow learn` opportunity or proposed lesson
+     change, reuse this work package; do not create a learning database or
+     plugin registry. Canonical rule: <flow home>/docs/autonomy.md,
+     section `Evidence learning and bounded experiments`.
+     Lookup: `cat "$(flow home)/docs/autonomy.md"` -->
 
-- Source and observed failure:
-- Owning rule, consumers, authorized scope and non-goals:
+- Source, mechanism and concrete local need (observed failure or bounded opportunity):
+- Owning rule (practice to replace/consolidate or capability gap), consumers, authorized scope and non-goals:
 - Frozen baseline / candidate revisions, representative supported tasks/inputs:
 - Frozen quality/safety floors and end-to-end success criteria:
 - Regression / evaluation command, result and evidence path:

@@ -565,14 +565,16 @@ Otherwise continue toward the goal. Never report a failed acceptance as complete
 
 ## Evidence learning and bounded experiments
 
-`docs/work/<id>/evidence.md` owns candidate lessons, using the existing
-[evidence template](../flow/templates/evidence.md). Record a lesson only after a
-concrete user correction, reproduced failure with verified fix, or recurring
-observation. Keep observed fact apart from generalization; cite durable commits,
-files/tests or logs, never transcripts, credentials or runtime artifacts.
-No confidence scores, speculative learning database or automatic policy overlay.
+`docs/work/<id>/evidence.md` owns candidate lessons and bounded experiment
+records, using the existing [evidence template](../flow/templates/evidence.md).
+Record a `Lessons` row only after a concrete user correction, reproduced failure
+with verified fix, or recurring observation; prospective ideas and external
+references use `Bounded experiment` instead. Keep observed fact apart from
+generalization; cite durable commits, files/tests or logs, never transcripts,
+credentials or runtime artifacts. No confidence scores, speculative learning
+database or automatic policy overlay.
 
-Promote through these evidence-backed steps in the same record:
+Promote observed lessons through these evidence-backed steps in the same record:
 
 1. **Observed failure**: preserve trigger, supported input, violated invariant,
    source and baseline. Update a repeated lesson rather than duplicating it.
@@ -606,28 +608,43 @@ multiple projects supplies evidence, never permission for global propagation.
 This package's authorization covers flow workflow improvements only, not other
 projects' policies, business execution or a new global installation.
 
-Adopt external ideas through existing seams, not plugin infrastructure. Record a
-source and concrete failure it may address; choose one bounded experiment in an
-existing work package with a baseline/candidate, scope, stop condition, cumulative
-budget and rollback. Reuse the task packet/handoff for bounded implementation
-context, existing `model_call_end`/metrics usage for measured provider evidence,
-and `verify --task` plus required stage/delivery/review gates for evaluation.
-Compare supported behavior, failures and comparable observed usage, marking
-missing usage unknown. A promising experiment does not activate itself; retain
-ordinary admission, fingerprints, review and irreversible approval boundaries.
-No new plugin registry, automatic learned config or speculative inference calls.
+One evidence authority governs both user-curated references (such as a shared
+URL, paper or repository) and learner-discovered opportunities (`flow learn`
+`project-led` and `opportunity-led` checks) through existing seams, with no
+plugin registry, automatic learned config or URL CLI flag. A shared URL or
+recommendation is research input, never automatic adoption, queue admission or
+execution dispatch. State the source's actual mechanism, local fit/constraints,
+non-goals and concrete local need (an observed failure or a bounded
+opportunity), plus either the active practice/owner to replace or consolidate,
+or the justified missing capability that existing seams do not cover. Apply no
+mechanical one-in-one-out deletion quota or byte/line cap; consolidate only
+competing active rules/owners while preserving superseded and rejected history
+and closed receipts.
 
-For a bounded comparison, freeze representative supported tasks/inputs, baseline
-and candidate revisions, and quality/safety floors before running it. Measure the
-end-to-end successful result (including required checks), failures and retries,
-actual provider usage and cache coverage/semantics, not just prompt size or one
-fast intermediate step. Distinguish offline fixtures/replays from live model
-behavior; fixtures prove only the exercised deterministic contract, not live
-quality or savings. Missing usage or cache data remains unknown.
+Run bounded experiments in an existing work package within existing cumulative
+authority and budget, each with an explicit scope, stop condition and rollback
+(no inferred automatic repeat or new authorization requirement), freezing
+representative supported tasks/inputs, baseline and candidate revisions, and
+quality/safety floors beforehand. Reuse the task packet/handoff for bounded
+implementation context, `model_call_end`/metrics for measured provider usage and
+cache coverage/semantics (missing data remains unknown), and `verify --task`
+plus required stage/delivery/review gates to compare end-to-end outcomes,
+failures and retries rather than prompt size or one fast intermediate step.
+Distinguish offline fixtures/replays (proving only the exercised deterministic
+contract) from live model behavior. Only when subjective output comparison needs
+judgment, blind candidate labels and use one scoped judge under existing
+authority and budget — no routine multi-model fanout, minimum iteration count or
+speculative inference/evaluation calls.
 
-Keep a change only after meaningful comparable evidence meets the frozen floors;
-otherwise revert it or mark the experiment inconclusive with the remaining risk.
-Only when subjective output comparison needs judgment, blind the candidate labels
-and use one scoped judge under existing authority and budget. No routine multi-model
-fanout, minimum iteration count or automatic evaluation model calls. Record the
-comparison in the existing evidence template; it does not bypass activation gates.
+Keep a change only after meaningful comparable evidence meets the frozen floors,
+and activate it only within existing scope authority while preserving existing
+evidence, admission, fingerprints, bad-case regression, independent review,
+rollback and irreversible approval guards; otherwise revert that experiment's
+change or mark the experiment `inconclusive` with the remaining risk (without
+rolling back unrelated work). Record `accepted`, `rejected` (mismatched
+mechanism, duplicate owner without meaningful gain, or failed floor) or
+`inconclusive` in `evidence.md`, and update `spec.md` Decisions when settling a
+design choice. Run `flow learn feedback` only when an actual learner-tracked
+item and applicable supported command apply (no new CLI behavior); never claim
+learner database persistence unless it occurred, and record owner-curated source
+notes in existing `evidence.md`.

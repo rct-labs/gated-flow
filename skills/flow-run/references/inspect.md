@@ -69,8 +69,10 @@ state rather than overriding this launch check. No
   (benefit, fit, evidence, uncertainty, effort/risk and next action) when
   available, and stays quiet when none exist. Do not fabricate or repeat empty
   learning sections during normal authorized execution.
-- Learning recommendations are advisory only and never grant execution
-  authority: paused or `BLOCKED` tasks (such as `CR-1`) remain paused.
+- Learning recommendations and user-curated sources/URLs are advisory only and
+  never grant adoption or execution authority: paused or `BLOCKED` tasks (such
+  as `CR-1`) remain paused; evaluate them under
+  [evidence learning and bounded experiments](../../../docs/autonomy.md#evidence-learning-and-bounded-experiments).
 - For natural-language project-improvement, preference-feedback, language, or
   learning-pause requests, route via `flow learn` (`onboard`, `check`,
   `results`, `feedback`, `pause`, `status`) using goal-level context without
