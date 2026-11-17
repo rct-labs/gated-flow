@@ -2,17 +2,21 @@
 
 Bare `$flow-run` resumes authorized work and selects a suitable implementation
 worker using trustworthy capacity evidence and project preference. No parameters
-are needed; natural language such as "use Gemini this time" overrides routing.
-Unknown allowance is recorded honestly, not ranked numerically. Existing verified
-native CLI wrappers are preserved. Codex and Gemini Carbon are preferred coding
-workers; required reviews remain independent of the implementer.
+are needed; natural language such as "use Gemini this time" overrides routing
+within policy-allowed roles. Unknown allowance is recorded honestly, not ranked
+numerically. Existing verified native CLI wrappers are preserved. Coding workers
+use the coding pool configured in your central
+`~/.config/mini-model-routing/policy.json` (Sol / Hydrogen, with Claude fallback
+only when primary coding routes are unavailable); design and required reviews
+use the separate design pool and remain independent of the implementer.
 
-`$model-debate` alone discusses without implementing: one independent round,
-then host evidence verification and synthesis. Unresolved disagreement is reported
-without automatic rebuttal calls. Adversarial rounds require an explicit request
-or an identified project hard requirement. Model packets use English, reports use
-the user's language, and Codex/Gemini/Claude default to medium effort unless
-explicitly overridden. Project quorum and financial/ownership gates still apply.
+`$model-debate` alone discusses without implementing: one independent blind
+round, then host evidence verification and synthesis. Unresolved disagreement is
+reported without automatic rebuttal calls. Adversarial rounds require an
+explicit request or an identified project hard requirement. Model packets use
+English, reports use the user's language, and model/effort pins follow the
+central policy by role (design vs coding) unless explicitly overridden within
+policy. Project quorum and financial/ownership gates still apply.
 
 
 [![CI](https://github.com/rct-labs/gated-flow/actions/workflows/validate.yml/badge.svg)](https://github.com/rct-labs/gated-flow/actions/workflows/validate.yml)
@@ -30,7 +34,7 @@ each one closed — without ever letting a model mark its own work done.
 | **flow-run** | `$flow-run [claude\|codex\|kimi\|grok]` | **Start here.** Host CLI inspects the project, decides the next slice, writes the queue, then runs it unattended; it loads the two skills below as it goes |
 | **flow** | `$flow <idea, question, or "tidy up">` | Planning only, runs nothing: survey the code, shape a brief and spec, queue admission-ready tasks, hand off a session, audit the tree (read-only) |
 | **run-queue** | `$run` | The queue is already written and you only want it run: `gate.py` runs one worker process per task, verifies each with the project's own acceptance command, stops at the first thing that needs a human |
-| **model-debate** | `$model-debate <draft>` | Role-based seats on two or more distinct models research, critique and cross-examine a draft; the host verifies every claim against evidence before freezing it |
+| **model-debate** | `$model-debate <draft>` | Role-based seats on two or more distinct models research and critique a draft in one blind round by default; the host verifies every claim against primary evidence before synthesizing |
 
 The sigil differs per CLI (`/flow` in Claude Code and Grok Build, `$flow` in
 Codex, `/skill:flow` in Kimi Code); the skill names are identical everywhere.
@@ -80,10 +84,13 @@ skills/
   flow-run/        inspect → decide → queue → run
   run-queue/       unattended execution and narration
   model-debate/    multi-model evidence-first review (+ references/)
-flow/              the `flow` command: flow.py, audit.py, templates/
-gate/              the engine: gate.py, launch-detached.ps1, supervise.ps1,
-                   watch-journal.sh, selftest.sh, unit tests, README.md
-docs/              usage.md (manual), design.md (contract), autonomy.md (unattended half)
+flow/              the `flow` command: flow.py, audit.py, continuity.py, learning.py,
+                   publication.py, release.py, skills.py, templates/
+gate/              the engine: gate.py, model_policy.py, review_packet.py,
+                   launch-detached.ps1, supervise.ps1, watch-journal.sh,
+                   selftest.sh, unit tests, README.md
+learner/           standalone two-mode directed learner package (no Flow imports)
+docs/              quickstart.md, usage.md (manual), design.md (contract), autonomy.md
 examples/          a small model-debate fixture you can inspect offline
 scripts/           verify_repository.py (whitelist + English-only + integrity check)
 publish-manifest.json   the explicit list of published files
@@ -132,7 +139,8 @@ flow doctor --repo .
 you set one — loud beats a guessed oracle.
 
 Before dispatching workers, configure the required local model policy and
-explicit worker model/effort pins. See [model routing setup](docs/autonomy.md#required-local-configuration).
+explicit worker model/effort pins. See [model routing setup](docs/autonomy.md#required-local-configuration)
+and the [quickstart guide](docs/quickstart.md).
 Missing or mismatched policy stops dispatch before any model call.
 
 ## Local maintenance releases
@@ -140,13 +148,20 @@ Missing or mismatched policy stops dispatch before any model call.
 For an existing compatible Linux installation, use the verified local release
 path instead of rerunning the legacy installer. After independent final review
 and full verification, the host runs `python3 flow/release.py inspect`, stages a
-unique version with the reviewed installation fingerprint, and activates it.
-The source checkout remains authoritative; deployment copies live under
-`~/.local/share/flow/<version>/runtime`. Hashed manifests, canonical skill
-backups, preserved symlink aliases, isolated offline smoke and an atomic shim
-switch support recovery with `python3 flow/release.py rollback --version <id>`.
-Policy bytes and existing project configs/hooks remain protected. See the
-[host commands and recovery procedure](docs/usage.md#verified-local-maintenance-release-linux).
+unique version with the reviewed installation fingerprint (and explicit
+`--policy-transition <json>` only when a reviewed `gate/model_policy.py`
+transition is authorized), and activates it. The source checkout remains
+authoritative; deployment copies live under
+`~/.local/share/flow/<version>/runtime` and include the standalone `learner/`
+package without private stores or untracked provider logs. Hashed manifests,
+canonical skill backups, preserved symlink aliases, isolated offline smoke
+(including standalone `learner` without `flow`/`gate` imports), and an atomic
+shim switch support recovery with `python3 flow/release.py rollback --version <id>`.
+Policy bytes by default, prior immutable releases, learning DB/evidence, and
+existing project configs/hooks remain protected. See the
+[host commands and recovery procedure](docs/usage.md#verified-local-maintenance-release-linux)
+and
+[directed learning release, verification, and rollback](docs/usage.md#directed-learning-release-verification-and-rollback).
 Implementation completion does not itself activate a release.
 
 ## Daily loop
@@ -163,8 +178,9 @@ Implementation completion does not itself activate a release.
    facts), `flow checkpoint` saves the snapshot atomically, and
    `flow recall <words>` finds saved decisions with file:line references.
 
-`docs/usage.md` is the full manual, including queue format, admission states,
-stop reasons and troubleshooting.
+[quickstart.md](docs/quickstart.md) covers common prompts and daily commands;
+[usage.md](docs/usage.md) is the full manual, including queue format, admission
+states, stop reasons and troubleshooting.
 
 ## Platform notes
 
@@ -188,13 +204,31 @@ stop reasons and troubleshooting.
 ## Validate
 
 ```bash
-python scripts/verify_repository.py      # whitelist, English-only, paths, links, frontmatter, parse checks
+python3 scripts/verify_repository.py     # whitelist, English-only, paths, links, frontmatter, parse checks
 bash gate/selftest.sh                    # 11 gate cases in a throwaway repo
-python -m unittest discover -s gate -p "test_*.py" -q
-python examples/model-debate/evidence.py
+python3 -m unittest discover -s gate -p "test_*.py" -q
+python3 -m unittest discover -s learner/tests -p "test_*.py" -q
+python3 -m unittest discover -s skills/flow/tests -p "test_*.py" -q
+python3 -m unittest discover -s scripts -p "test_debate_quota.py" -q
+python3 examples/model-debate/evidence.py
 ```
 
-CI runs the same checks. No test makes a real model call.
+CI runs the same checks plus an isolated install smoke test. No test makes a real model call.
+
+## Migration note
+
+- **History and export scope**: upstream `main` history is retained; new
+  capabilities are exported from the locally validated implementation without
+  publishing operator work packages, private project profiles, transcripts, or
+  runtime stores.
+- **Source checkout vs installed runtime**: the repository checkout is the
+  maintained source, while installed Linux releases run from immutable
+  per-version copies under `~/.local/share/flow/<version>/runtime` with
+  manifest digests and rollback backups.
+- **Configuration and state separation**: machine model routing
+  (`~/.config/mini-model-routing/`), per-project `.gate/` state, and learner
+  stores (`~/.local/share/flow/learner/`) live outside versioned source
+  commits and are never overwritten by repository updates.
 
 ## Maintenance
 

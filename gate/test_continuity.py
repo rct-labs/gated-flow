@@ -175,6 +175,68 @@ class ResumeTests(unittest.TestCase):
             self.assertIn(f"runner pid {os.getpid()} owns run live", out)
             self.assertIn("do not launch another run", out)
 
+    def test_progress_and_resume_share_identical_projection_and_leave_repo_unchanged(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = fixture(Path(td))
+            journal(
+                repo,
+                {"event": "run_start", "run": "r-prog", "runner_pid": os.getpid(), "stage": "delivery"},
+                {"event": "attempt_start", "task": "EAV-2", "worker": "codex", "attempt": 1},
+                {"event": "heartbeat", "task": "EAV-2", "worker": "codex", "seconds": 120, "last_line": "private"},
+                {"event": "full_acceptance_wait", "holder": "/other/project", "holder_pid": 9876},
+            )
+            before = tree_digest(repo)
+            prog_res = flow("progress", "--repo", str(repo), "--json")
+            self.assertEqual(prog_res.returncode, 0, prog_res.stderr)
+            res_res = flow("resume", "--repo", str(repo), "--json")
+            self.assertEqual(res_res.returncode, 0, res_res.stderr)
+            prog_json = json.loads(prog_res.stdout)
+            res_json = json.loads(res_res.stdout)
+            self.assertEqual(prog_json, res_json["progress"])
+            self.assertEqual(prog_json["state"], "waiting")
+            self.assertEqual(prog_json["acceptance_wait"]["holder"], "/other/project")
+            self.assertEqual(tree_digest(repo), before)
+
+    def test_resume_projects_publication_receipts_read_only_and_never_leaks_to_worker_packet(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = fixture(root)
+            bare = root / "bare-origin.git"
+            self.assertEqual(run("git", "init", "--bare", "-q", str(bare)).returncode, 0)
+            self.assertEqual(run("git", "-C", str(repo), "remote", "add", "origin", str(bare)).returncode, 0)
+            head = run("git", "-C", str(repo), "rev-parse", "HEAD").stdout.strip()
+            self.assertEqual(
+                run("git", "-C", str(bare), "fetch", "--update-head-ok", "-q", str(repo), f"+{head}:refs/heads/main").returncode,
+                0,
+            )
+            gate = load_gate_module()
+            cfg = gate.load_config(repo)
+            (repo / ".gate" / "verdict.json").write_text(
+                json.dumps({
+                    "result": "PASS",
+                    "scope": "queue",
+                    "stage": "delivery",
+                    "full_suite": True,
+                    "head": head,
+                    "candidate_fingerprint": gate.candidate_fingerprint(repo, cfg),
+                }),
+                encoding="utf-8",
+            )
+            pv = flow("publish-verify", "--repo", str(repo), "--remote", "origin", "--branch", "main", "--expect", head, "--json")
+            self.assertEqual(pv.returncode, 0, pv.stderr)
+            receipt_id = json.loads(pv.stdout)["id"]
+
+            before = tree_digest(repo)
+            res_json = json.loads(flow("resume", "--repo", str(repo), "--json").stdout)
+            self.assertTrue(res_json["publication"]["exists"])
+            self.assertTrue(res_json["publication"]["latest"]["current_delivery_verified"])
+            self.assertEqual(res_json["publication"]["latest"]["observed"]["receipt_id"], receipt_id)
+            self.assertEqual(tree_digest(repo), before, "resume must keep publication.ndjson byte-identical")
+
+            packet = gate.task_packet(repo, cfg, (repo / "TASK_QUEUE.md").read_text(encoding="utf-8"), "EAV-2", ["eav2.txt"])
+            self.assertNotIn(receipt_id, packet)
+            self.assertNotIn("publication.ndjson", packet)
+
 
 class CheckpointTests(unittest.TestCase):
     def test_a4_valid_draft_is_written_atomically_with_anchor(self):
@@ -427,7 +489,7 @@ class IsolationAndCompatibilityTests(unittest.TestCase):
             self.assertIn("No match", flow("recall", "nothing-here", "--repo", str(repo)).stdout)
             # Existing commands keep working and help lists the new ones.
             help_text = flow("--help").stdout
-            for cmd in ("resume", "checkpoint", "recall", "audit", "admit"):
+            for cmd in ("resume", "progress", "checkpoint", "recall", "publish-verify", "audit", "admit"):
                 self.assertIn(cmd, help_text)
 
     def test_a7_worker_packet_carries_no_host_history(self):
@@ -446,6 +508,47 @@ class IsolationAndCompatibilityTests(unittest.TestCase):
             self.assertNotIn("HOST-ONLY-SENTINEL", packet)
             self.assertNotIn("flow:checkpoint", packet)
             self.assertNotIn("Waiting on a human", packet)
+
+    def test_a7_scoped_handoff_extracts_only_task_section_without_host_history(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = fixture(Path(td), CONTEXT.replace("Ship the loader", "HOST-CONTEXT-SECRET"))
+            (repo / "eav2.txt").write_text("source\n", encoding="utf-8")
+            run("git", "-C", str(repo), "add", "eav2.txt")
+            run("git", "-C", str(repo), "commit", "-q", "-m", "seed eav2")
+            base = run("git", "-C", str(repo), "rev-parse", "HEAD").stdout.strip()
+            pkg = repo / "docs" / "work" / "WP"
+            pkg.mkdir(parents=True)
+            (pkg / "evidence.md").write_text("EVIDENCE-ONLY-SECRET\n", encoding="utf-8")
+            (pkg / "spec.md").write_text(
+                "# Spec\n\n## Acceptance\nKeep EAV-2 acceptance.\n\n"
+                "## Handoff EAV-2\n"
+                + "<!-- handoff: "
+                + json.dumps(
+                    {
+                        "base": base,
+                        "files": ["eav2.txt"],
+                        "role_sections": {"worker": ["Impl"], "review": ["Audit"]},
+                        "required_sections": ["Safety"],
+                    }
+                )
+                + " -->\n"
+                "Prelude citation `ev_cont_01`.\n\n"
+                "### Impl\nWorker step.\n\n"
+                "### Safety\nRequired invariant.\n\n"
+                "### Audit\nREVIEW-ONLY-SENTINEL\n\n"
+                "## Handoff EAV-3\nOTHER-TASK-SENTINEL\n",
+                encoding="utf-8",
+            )
+            qpath = repo / "TASK_QUEUE.md"
+            qpath.write_text(qpath.read_text(encoding="utf-8") + "<!-- task:EAV-2 spec: docs/work/WP/spec.md -->\n", encoding="utf-8")
+            gate = load_gate_module()
+            cfg = gate.load_config(repo)
+            packet = gate.task_packet(repo, cfg, qpath.read_text(encoding="utf-8"), "EAV-2", ["eav2.txt"])
+            self.assertIn("Prelude citation `ev_cont_01`.", packet)
+            self.assertIn("Worker step.", packet)
+            self.assertIn("Required invariant.", packet)
+            for forbidden in ("HOST-CONTEXT-SECRET", "EVIDENCE-ONLY-SECRET", "REVIEW-ONLY-SENTINEL", "OTHER-TASK-SENTINEL"):
+                self.assertNotIn(forbidden, packet)
 
 
 if __name__ == "__main__":

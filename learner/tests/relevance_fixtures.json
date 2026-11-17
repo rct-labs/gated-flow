@@ -1,0 +1,128 @@
+{
+  "version": 1,
+  "description": "Frozen manually adjudicated relevance fixture set for offline learner triage evaluation.",
+  "profile": {
+    "project_id": "flow-pilot-fixture",
+    "name": "Fixture Runner",
+    "root_path": "/tmp/fixture-runner",
+    "mission": "Deterministic verification and bounded evaluation harnesses",
+    "existing_capabilities": [
+      "deterministic test runner",
+      "atomic state store"
+    ],
+    "goals": [
+      "improve automated evaluation harnesses",
+      "bounded task scheduling"
+    ],
+    "known_gaps": [],
+    "exclusions": [
+      "crypto mining"
+    ],
+    "public_concepts": [
+      "evaluation harness",
+      "task scheduling"
+    ]
+  },
+  "items": [
+    {
+      "id": "adj_harness_bench",
+      "url": "https://github.com/eval-org/harness-bench",
+      "source_class": "github_trending",
+      "title": "eval-org / harness-bench",
+      "summary": "Lightweight evaluation harness for deterministic agent verification and task scheduling",
+      "popularity_signal_only": true,
+      "expected_decision": "qualify",
+      "adjudication_note": "Adjacent useful evaluation harness aligned with goals even without a predeclared gap."
+    },
+    {
+      "id": "direct_scheduler_queue",
+      "url": "https://arxiv.org/abs/2611.00123v1",
+      "source_class": "arxiv",
+      "title": "Bounded Evaluation Harnesses for Offline Task Scheduling",
+      "summary": "Deterministic evaluation harnesses and bounded scheduling algorithms.",
+      "popularity_signal_only": false,
+      "expected_decision": "qualify",
+      "adjudication_note": "Directly useful paper on bounded scheduling and evaluation."
+    },
+    {
+      "id": "already_impl_runner",
+      "url": "https://github.com/test-org/deterministic-runner",
+      "source_class": "github_popular",
+      "title": "test-org / deterministic-runner",
+      "summary": "Deterministic test runner with atomic state store for local suites",
+      "popularity_signal_only": true,
+      "expected_decision": "reject",
+      "adjudication_note": "Overlaps existing deterministic test runner and atomic state store capabilities."
+    },
+    {
+      "id": "popular_css_hype",
+      "url": "https://github.com/hyped-org/mega-popular-toy",
+      "source_class": "github_popular",
+      "title": "hyped-org/mega-popular-toy",
+      "summary": "Celebrity CSS animation generator with 120000 stars",
+      "popularity_signal_only": true,
+      "expected_decision": "reject",
+      "adjudication_note": "Popular hype repo unrelated to project goals."
+    },
+    {
+      "id": "trending_cats_meme",
+      "url": "https://github.com/meme-org/ascii-cat-party",
+      "source_class": "github_trending",
+      "title": "meme-org / ascii-cat-party",
+      "summary": "Animated terminal cats with 95000 stars and rainbow shaders",
+      "popularity_signal_only": true,
+      "expected_decision": "reject",
+      "adjudication_note": "Trending noise unrelated to verification or scheduling."
+    },
+    {
+      "id": "excluded_crypto_miner",
+      "url": "https://github.com/hash-org/gpu-crypto-mining-eval",
+      "source_class": "github_popular",
+      "title": "hash-org / gpu-crypto-mining-eval",
+      "summary": "Crypto mining benchmark and evaluation suite",
+      "popularity_signal_only": true,
+      "expected_decision": "reject",
+      "adjudication_note": "Hits explicit profile exclusion 'crypto mining' despite evaluation keyword."
+    },
+    {
+      "id": "ambiguous_vague_tool",
+      "url": "https://github.com/vague-org/next-gen-core",
+      "source_class": "github_popular",
+      "title": "vague-org / next-gen-core",
+      "summary": "Fast modular toolkit for modern builders",
+      "popularity_signal_only": true,
+      "expected_decision": "defer",
+      "adjudication_note": "Insufficient evidence in metadata to establish relevance or irrelevance."
+    },
+    {
+      "id": "adjacent_replay_tool",
+      "url": "https://github.com/replay-org/trace-replay",
+      "source_class": "github_popular",
+      "title": "replay-org / trace-replay",
+      "summary": "Record and replay tool for regression debugging of CLI pipelines",
+      "popularity_signal_only": true,
+      "expected_decision": "qualify",
+      "adjudication_note": "Useful adjacent verification capability despite lacking exact keyword 'harness'."
+    },
+    {
+      "id": "unrelated_game_engine",
+      "url": "https://github.com/game-org/voxel-physics",
+      "source_class": "github_trending",
+      "title": "game-org / voxel-physics",
+      "summary": "Real-time GPU voxel destruction engine",
+      "popularity_signal_only": true,
+      "expected_decision": "reject",
+      "adjudication_note": "Unrelated domain."
+    },
+    {
+      "id": "ambiguous_release_patch",
+      "url": "https://github.com/ops-org/queue-cli/releases/tag/v0.4.0",
+      "source_class": "github_releases",
+      "title": "ops-org/queue-cli v0.4.0",
+      "summary": "Maintenance release with minor bugfixes",
+      "popularity_signal_only": false,
+      "expected_decision": "defer",
+      "adjudication_note": "No concrete capability detail without reading changelog."
+    }
+  ]
+}

@@ -10,7 +10,9 @@ worker; then let the host select a fallback only after reconciling the stopped r
 for the run. Keep required reviews independent of the implementation worker:
 order `judge.chain` / `judge_cmds` so a distinct model/vendor reviews closed
 tasks rather than the implementer reviewing its own diff (disclose as unreviewed
-if no independent reviewer is usable). Resolve model and effort from the owner policy for the actual role. Never raise limits or weaken admission to get a task through.
+if no independent reviewer is usable). Resolve model and effort from the owner policy for the actual role. Change delivery limits only through the confirmed
+[budget continuation decision](../../../docs/autonomy.md#budget-continuation-decision);
+never silently raise them or weaken admission to get a task through.
 
 For any custom worker, reuse its verified executable and existing TLS wrapper.
 The gate resolves the worker key on PATH, replaces `template[0]` with that path,

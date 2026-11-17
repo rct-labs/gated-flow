@@ -116,7 +116,9 @@ def grok_windows(raw):
         raise ProbeError("UNKNOWN_PERIOD")
     if datetime.fromisoformat(period["start"].replace("Z", "+00:00")) > datetime.now(timezone.utc):
         raise ProbeError("FUTURE_PERIOD")
-    return [percent("weekly", config["creditUsagePercent"], period["end"])]
+    # Proto3 JSON omits a scalar at its default: an absent creditUsagePercent in a
+    # current weekly period means 0 used (observed 2026-09-28 at the start of a week).
+    return [percent("weekly", config.get("creditUsagePercent", 0), period["end"])]
 
 
 _HTTP = r'''

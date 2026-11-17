@@ -63,6 +63,23 @@ _usage = importlib.util.module_from_spec(_usage_spec)
 _usage_spec.loader.exec_module(_usage)
 
 _review_packet = None
+_skills_mod = None
+
+
+def skills_module():
+    """Optional governed skill/pin helper from sibling flow/skills.py."""
+    global _skills_mod
+    if _skills_mod is None:
+        skills_path = Path(__file__).resolve().parent.parent / "flow" / "skills.py"
+        if not skills_path.is_file():
+            return None
+        spec = importlib.util.spec_from_file_location("_gate_flow_skills", skills_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _skills_mod = module
+    return _skills_mod
 
 
 def review_packet_module():
@@ -230,7 +247,7 @@ DEFAULT_CONFIG = {
         "timeout_s": 1200,
         # Spend ceiling of one review, per reviewed task: a package review reads
         # the diff of every task it covers, so a flat ceiling that fits one
-        # task starves a review of four (alltom 2026-09-20: budget_exhausted at
+        # task starves a review of four (observed 2026-09-20: budget_exhausted at
         # $5 after 31 turns, the package closed unreviewed).
         "budget_usd_per_task": 5,
     },
@@ -743,28 +760,328 @@ def spec_acceptance(repo: Path, cfg: dict, text: str, task: str) -> str:
     return section.group(1).strip() if section else ""
 
 
-def spec_handoff(repo: Path, cfg: dict, text: str, task: str) -> str:
-    """Carry bounded task-local prose with mechanically checked source anchors.
+ALLOWED_HANDOFF_ROLES = ("worker", "review")
+HANDOFF_META_KEYS = frozenset({"base", "files", "role_sections", "required_sections"})
+HANDOFF_OPT_IN_KEYS = ("role_sections", "required_sections")
+_MALFORMED_OPT_IN_SCAN_RE = re.compile(
+    r'"(?P<dq>(?:\\.|[^"\\])*)"(?P<dqc>\s*:)?'
+    r"|'(?P<sq>(?:\\.|[^'\\])*)'(?P<sqc>\s*:)"
+    r"|'(?:\\.|[^'\\])*'"
+    r"|\b(?P<uq>role_sections|required_sections)[\"']?\s*:"
+)
 
-    The spec owns the assumptions; Git only verifies related-file freshness,
-    never the truth of the prose. Missing/invalid evidence cannot imply trust.
-    """
-    source, body = task_spec(repo, cfg, text, task)
-    section = re.search(r"^##[ \t]+Handoff[ \t]+" + re.escape(task)
-                        + r"[ \t]*$(.*?)(?=^##[ \t]|\Z)", body, re.S | re.M)
-    if not section:
+
+def _malformed_metadata_opts_in(raw_text: str) -> bool:
+    for m in _MALFORMED_OPT_IN_SCAN_RE.finditer(raw_text):
+        dq = m.group("dq")
+        if dq is not None:
+            if m.group("dqc") is not None and dq in HANDOFF_OPT_IN_KEYS:
+                return True
+            continue
+        sq = m.group("sq")
+        if sq is not None:
+            if m.group("sqc") is not None and sq in HANDOFF_OPT_IN_KEYS:
+                return True
+            continue
+        if m.group("uq") in HANDOFF_OPT_IN_KEYS:
+            return True
+    return False
+
+
+def _parsed_non_object_opts_in(value: object) -> bool:
+    if isinstance(value, dict):
+        return any(k in value for k in HANDOFF_OPT_IN_KEYS)
+    if isinstance(value, list):
+        return any(_parsed_non_object_opts_in(item) for item in value)
+    return False
+
+
+def _extract_unclosed_meta_prefix(raw_tail: str) -> str:
+    lines = raw_tail.splitlines()
+    if not lines:
         return ""
-    handoff = section.group(1).strip()
-    reason = "missing or invalid base/files metadata"
-    metadata = re.search(r"<!--\s*handoff:\s*(\{.*?\})\s*-->", handoff, re.S)
+    kept = [lines[0]]
+    started_compound = lines[0].lstrip().startswith(("{", "["))
+    if not started_compound:
+        return lines[0]
+    for ln in lines[1:]:
+        stripped = ln.strip()
+        if not stripped or stripped.startswith(("#", "<!--")):
+            break
+        if not re.match(r'^(?:["\'{}\[\],]|[-0-9]|[A-Za-z_][\w-]*\s*:)', stripped):
+            break
+        kept.append(ln)
+    return "\n".join(kept)
+
+
+def _inspect_handoff_comment(raw_payload: str) -> tuple[bool, dict | None, str | None]:
+    raw_json = raw_payload.strip()
     try:
-        anchor = json.loads(metadata.group(1)) if metadata else {}
+        parsed_meta = json.loads(raw_json)
+    except ValueError:
+        if _malformed_metadata_opts_in(raw_json):
+            return True, None, "invalid JSON in handoff metadata comment"
+        return False, None, None
+
+    if not isinstance(parsed_meta, dict):
+        if _parsed_non_object_opts_in(parsed_meta):
+            return True, None, "handoff metadata must be a JSON object"
+        return False, None, None
+
+    if any(k in parsed_meta for k in HANDOFF_OPT_IN_KEYS):
+        unknown_keys = sorted(set(parsed_meta) - HANDOFF_META_KEYS)
+        if unknown_keys:
+            return True, parsed_meta, f"unknown handoff metadata key(s): {', '.join(unknown_keys)}"
+        return True, parsed_meta, None
+
+    return False, parsed_meta, None
+
+
+def _sha256_utf8(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _safe_handoff_rel_path(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.strip() == value
+        and bool(value)
+        and not Path(value).is_absolute()
+        and ".." not in Path(value).parts
+        and "\\" not in value
+        and not value.startswith(":")
+    )
+
+
+def _find_handoff_raw(body: str, task: str) -> str | None:
+    section = re.search(
+        r"^##[ \t]+Handoff[ \t]+" + re.escape(task) + r"[ \t]*$(.*?)(?=^##[ \t]|\Z)",
+        body,
+        re.S | re.M,
+    )
+    return section.group(1).strip() if section else None
+
+
+def parse_handoff_section(raw_handoff: str) -> dict:
+    """Parse and validate optional declarative handoff metadata and ### subsections."""
+    handoff = raw_handoff.strip()
+    open_matches = list(re.finditer(r"<!--\s*handoff:", handoff))
+    anchor: dict = {}
+    schema_error: str | None = None
+    opted_in = False
+    meta_comment = ""
+
+    closed_segments: list[tuple[str, str]] = []
+    unclosed_segments: list[str] = []
+    for idx, open_m in enumerate(open_matches):
+        seg_end = open_matches[idx + 1].start() if idx + 1 < len(open_matches) else len(handoff)
+        seg = handoff[open_m.end() : seg_end]
+        close_idx = seg.find("-->")
+        if close_idx >= 0 and "<!--" not in seg[:close_idx]:
+            full_comment = handoff[open_m.start() : open_m.end() + close_idx + 3].strip()
+            closed_segments.append((full_comment, seg[:close_idx]))
+        else:
+            unclosed_segments.append(_extract_unclosed_meta_prefix(seg))
+
+    if unclosed_segments:
+        if any(_inspect_handoff_comment(body)[0] for _, body in closed_segments) or any(
+            _malformed_metadata_opts_in(u_seg) for u_seg in unclosed_segments
+        ):
+            schema_error = "unclosed handoff metadata comment"
+            opted_in = True
+    elif len(closed_segments) > 1:
+        if any(_inspect_handoff_comment(body)[0] for _, body in closed_segments):
+            schema_error = "duplicate handoff metadata comments"
+            opted_in = True
+    elif len(closed_segments) == 1:
+        c_opted_in, c_dict, c_err = _inspect_handoff_comment(closed_segments[0][1])
+        if c_opted_in:
+            opted_in = True
+            meta_comment = closed_segments[0][0]
+            schema_error = c_err
+            if c_dict is not None:
+                anchor = c_dict
+        elif c_dict is not None:
+            anchor = c_dict
+
+    if not opted_in and not anchor and (len(closed_segments) > 1 or bool(unclosed_segments)):
+        legacy_meta = re.search(r"<!--\s*handoff:\s*(\{.*?\})\s*-->", handoff, re.S)
+        if legacy_meta:
+            try:
+                parsed_legacy = json.loads(legacy_meta.group(1))
+                if isinstance(parsed_legacy, dict):
+                    anchor = parsed_legacy
+            except ValueError:
+                anchor = {}
+
+    lines = handoff.splitlines()
+    in_fence: tuple[str, int] | None = None
+    h3_positions: list[tuple[int, str]] = []
+    for idx, line in enumerate(lines):
+        m_fence = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if in_fence is None:
+            if m_fence and (m_fence.group(1)[0] == "~" or "`" not in m_fence.group(2)):
+                in_fence = (m_fence.group(1)[0], len(m_fence.group(1)))
+                continue
+        else:
+            fchar, flen = in_fence
+            if re.match(rf"^ {{0,3}}{re.escape(fchar)}{{{flen},}}[ \t]*$", line):
+                in_fence = None
+            continue
+        m_h3 = re.match(r"^###(?![#])(.*)$", line)
+        if m_h3:
+            h3_positions.append((idx, m_h3.group(1).strip()))
+
+    if h3_positions:
+        raw_prelude = "\n".join(lines[: h3_positions[0][0]]).strip()
+    else:
+        raw_prelude = handoff
+
+    sections: list[dict] = []
+    for i, (start_idx, title) in enumerate(h3_positions):
+        end_idx = h3_positions[i + 1][0] if i + 1 < len(h3_positions) else len(lines)
+        sec_lines = lines[start_idx:end_idx]
+        sec_text = "\n".join(sec_lines).strip()
+        body_meaningful = re.sub(r"<!--.*?-->", "", "\n".join(sec_lines[1:]), flags=re.S).strip()
+        sections.append(
+            {
+                "name": title,
+                "text": sec_text,
+                "bytes": len(sec_text.encode("utf-8")),
+                "sha256": _sha256_utf8(sec_text),
+                "empty_body": body_meaningful == "",
+            }
+        )
+
+    prelude_text = re.sub(r"<!--\s*handoff:.*?-->", "", raw_prelude, flags=re.S).strip()
+    prelude_meaningful = re.sub(r"<!--.*?-->", "", prelude_text, flags=re.S).strip()
+
+    role_sections_map: dict[str, list[str]] = {}
+    req_sections_list: list[str] = []
+
+    if opted_in and schema_error is None:
+        if "files" in anchor and anchor["files"] is not None:
+            raw_files = anchor["files"]
+            if not isinstance(raw_files, list):
+                schema_error = "handoff files must be a list of relative paths"
+            elif any(not _safe_handoff_rel_path(f) for f in raw_files):
+                schema_error = "invalid path in handoff files"
+
+        if schema_error is None and "role_sections" in anchor:
+            rs = anchor["role_sections"]
+            if not isinstance(rs, dict) or not rs:
+                schema_error = "role_sections must be a non-empty JSON object"
+            else:
+                for r_name, secs in rs.items():
+                    if r_name not in ALLOWED_HANDOFF_ROLES:
+                        schema_error = (
+                            f"unknown handoff role {r_name!r}; allowed roles: "
+                            + ", ".join(ALLOWED_HANDOFF_ROLES)
+                        )
+                        break
+                    if not isinstance(secs, list) or not secs:
+                        schema_error = f"role_sections.{r_name} must be a non-empty list of ### headings"
+                        break
+                    seen_r: set[str] = set()
+                    for h in secs:
+                        if not isinstance(h, str) or not h.strip() or h != h.strip() or "\n" in h or "\r" in h:
+                            schema_error = f"invalid heading entry {h!r} in role_sections.{r_name}"
+                            break
+                        if h in seen_r:
+                            schema_error = f"duplicate heading {h!r} in role_sections.{r_name}"
+                            break
+                        seen_r.add(h)
+                    if schema_error is not None:
+                        break
+                    role_sections_map[r_name] = list(secs)
+
+        if schema_error is None and "required_sections" in anchor:
+            reqs = anchor["required_sections"]
+            if not isinstance(reqs, list):
+                schema_error = "required_sections must be a list of ### headings"
+            elif "role_sections" not in anchor and not reqs:
+                schema_error = "required_sections cannot be empty when role_sections is omitted"
+            else:
+                seen_req: set[str] = set()
+                for h in reqs:
+                    if not isinstance(h, str) or not h.strip() or h != h.strip() or "\n" in h or "\r" in h:
+                        schema_error = f"invalid heading entry {h!r} in required_sections"
+                        break
+                    if h in seen_req:
+                        schema_error = f"duplicate heading {h!r} in required_sections"
+                        break
+                    seen_req.add(h)
+                if schema_error is None:
+                    req_sections_list = list(reqs)
+
+        if schema_error is None:
+            seen_doc: set[str] = set()
+            sections_by_name: dict[str, dict] = {}
+            for sec in sections:
+                if sec["name"] == "":
+                    schema_error = "empty ### heading in handoff"
+                    break
+                if sec["name"] in seen_doc:
+                    schema_error = f"duplicate ### heading in handoff: {sec['name']!r}"
+                    break
+                seen_doc.add(sec["name"])
+                sections_by_name[sec["name"]] = sec
+
+            if schema_error is None:
+                for h in req_sections_list:
+                    if h not in sections_by_name:
+                        schema_error = f"missing required ### heading in handoff: {h!r}"
+                        break
+                    if sections_by_name[h]["empty_body"]:
+                        schema_error = f"empty required ### section in handoff: {h!r}"
+                        break
+
+            if schema_error is None:
+                for r_name, secs in role_sections_map.items():
+                    for h in secs:
+                        if h not in sections_by_name:
+                            schema_error = f"missing selected ### heading {h!r} for role {r_name}"
+                            break
+                        if sections_by_name[h]["empty_body"]:
+                            schema_error = f"empty selected ### section {h!r} for role {r_name}"
+                            break
+                    if schema_error is not None:
+                        break
+
+    return {
+        "handoff": handoff,
+        "anchor": anchor,
+        "meta_comment": meta_comment,
+        "opted_in": opted_in,
+        "schema_error": schema_error,
+        "prelude_text": prelude_text,
+        "has_prelude": bool(prelude_meaningful),
+        "sections": sections,
+        "role_sections": role_sections_map,
+        "required_sections": req_sections_list,
+    }
+
+
+def handoff_schema_error(repo: Path, cfg: dict, text: str, task: str) -> str | None:
+    """Validate optional scoped handoff metadata without invoking Git subprocesses."""
+    _, body = task_spec(repo, cfg, text, task)
+    raw = _find_handoff_raw(body, task)
+    if raw is None:
+        return None
+    return parse_handoff_section(raw)["schema_error"]
+
+
+def _verify_handoff_freshness(repo: Path, cfg: dict, anchor: dict) -> tuple[bool, str]:
+    reason = "missing or invalid base/files metadata"
+    try:
         base, files = anchor.get("base"), anchor.get("files")
-        valid = (isinstance(base, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base)
-                 and isinstance(files, list) and bool(files)
-                 and all(isinstance(f, str) and f.strip() == f and f
-                         and not Path(f).is_absolute() and ".." not in Path(f).parts
-                         and "\\" not in f and not f.startswith(":") for f in files))
+        valid = (
+            isinstance(base, str)
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base) is not None
+            and isinstance(files, list)
+            and bool(files)
+            and all(_safe_handoff_rel_path(f) for f in files)
+        )
         if valid:
             # Literal paths only: no accidental Git pathspec expansion or excludes.
             paths = [":(literal)" + prefixed(cfg, f) for f in files]
@@ -773,25 +1090,280 @@ def spec_handoff(repo: Path, cfg: dict, text: str, task: str) -> str:
                 ("diff", "--quiet", base, "--", *paths),
                 ("status", "--porcelain", "--untracked-files=all", "--", *paths),
             ]
-            results = [subprocess.run(["git", *args], cwd=repo, capture_output=True)
-                       for args in commands]
+            results = [subprocess.run(["git", *args], cwd=repo, capture_output=True) for args in commands]
             exists = all(
                 (repo / prefixed(cfg, f)).exists()
-                and subprocess.run(["git", "cat-file", "-e", f"{base}:{prefixed(cfg, f)}"],
-                                   cwd=repo, capture_output=True).returncode == 0
-                for f in files)
+                and subprocess.run(
+                    ["git", "cat-file", "-e", f"{base}:{prefixed(cfg, f)}"],
+                    cwd=repo,
+                    capture_output=True,
+                ).returncode
+                == 0
+                for f in files
+            )
             if exists and all(r.returncode == 0 for r in results) and not results[-1].stdout:
                 reason = "related files unchanged against base (prose still requires judgment)"
             else:
                 reason = "base is unavailable/nonancestor, related files drifted, or Git check failed"
     except (ValueError, AttributeError, OSError):
         pass
-    current = reason.startswith("related files unchanged")
+    return reason.startswith("related files unchanged"), reason
+
+
+def extract_spec_handoff(
+    repo: Path,
+    cfg: dict,
+    text: str,
+    task: str,
+    role: str = "worker",
+) -> dict:
+    """Extract role-scoped or full task handoff with compact provenance and freshness bounds."""
+    if role not in ALLOWED_HANDOFF_ROLES:
+        raise ValueError(f"Unknown handoff role: {role!r}")
+    source, body = task_spec(repo, cfg, text, task)
+    raw = _find_handoff_raw(body, task)
+    if raw is None:
+        return {
+            "present": False,
+            "task": task,
+            "role": role,
+            "source": source,
+            "current": False,
+            "status": "",
+            "reason": "",
+            "opted_in": False,
+            "schema_error": None,
+            "filtered": False,
+            "mode": "absent",
+            "required_sections": [],
+            "role_selected_sections": None,
+            "included": [],
+            "omitted_sections": [],
+            "full_bytes": 0,
+            "full_sha256": "",
+            "selected_bytes": 0,
+            "selected_sha256": "",
+            "body": "",
+            "text": "",
+        }
+
+    parsed = parse_handoff_section(raw)
+    handoff = parsed["handoff"]
+    full_bytes = len(handoff.encode("utf-8"))
+    full_sha256 = _sha256_utf8(handoff)
+    prelude_text = parsed["prelude_text"]
+    prelude_item = (
+        [
+            {
+                "name": "prelude",
+                "kind": "prelude",
+                "bytes": len(prelude_text.encode("utf-8")),
+                "sha256": _sha256_utf8(prelude_text),
+            }
+        ]
+        if parsed["has_prelude"]
+        else []
+    )
+    stale_instruction = (
+        "Before implementation, reread the related source/callers and replan; "
+        "do not trust these stale or unverified assumptions. Preserve all stop conditions."
+    )
+    current_instruction = "Use these assumptions only after inspecting the relevant implementation."
+
+    if parsed["schema_error"] is not None:
+        err_reason = f"invalid handoff schema ({parsed['schema_error']})"
+        rendered_text = f"handoff ({source}, STALE/UNVERIFIED: {err_reason}):\n{stale_instruction}\n{handoff}"
+        return {
+            "present": True,
+            "task": task,
+            "role": role,
+            "source": source,
+            "current": False,
+            "status": "STALE/UNVERIFIED",
+            "reason": err_reason,
+            "opted_in": True,
+            "schema_error": parsed["schema_error"],
+            "filtered": False,
+            "mode": "invalid_schema",
+            "required_sections": parsed["required_sections"],
+            "role_selected_sections": parsed["role_sections"].get(role),
+            "included": [],
+            "omitted_sections": [],
+            "full_bytes": full_bytes,
+            "full_sha256": full_sha256,
+            "selected_bytes": full_bytes,
+            "selected_sha256": full_sha256,
+            "body": handoff,
+            "text": rendered_text,
+        }
+
+    current, reason = _verify_handoff_freshness(repo, cfg, parsed["anchor"])
     status = "CURRENT" if current else "STALE/UNVERIFIED"
-    instruction = ("Use these assumptions only after inspecting the relevant implementation."
-                   if current else "Before implementation, reread the related source/callers and replan; "
-                   "do not trust these stale or unverified assumptions. Preserve all stop conditions.")
-    return f"handoff ({source}, {status}: {reason}):\n{instruction}\n{handoff}"
+    instruction = current_instruction if current else stale_instruction
+    req_list = parsed["required_sections"]
+    req_set = set(req_list)
+    role_sel = parsed["role_sections"].get(role)
+
+    if not parsed["opted_in"]:
+        rendered_text = f"handoff ({source}, {status}: {reason}):\n{instruction}\n{handoff}"
+        return {
+            "present": True,
+            "task": task,
+            "role": role,
+            "source": source,
+            "current": current,
+            "status": status,
+            "reason": reason,
+            "opted_in": False,
+            "schema_error": None,
+            "filtered": False,
+            "mode": "legacy",
+            "required_sections": [],
+            "role_selected_sections": None,
+            "included": [
+                *prelude_item,
+                *[
+                    {"name": s["name"], "kind": "full", "bytes": s["bytes"], "sha256": s["sha256"]}
+                    for s in parsed["sections"]
+                ],
+            ],
+            "omitted_sections": [],
+            "full_bytes": full_bytes,
+            "full_sha256": full_sha256,
+            "selected_bytes": full_bytes,
+            "selected_sha256": full_sha256,
+            "body": handoff,
+            "text": rendered_text,
+        }
+
+    if not current:
+        # Stale/unverified source disables role filtering and retains the full handoff with reread warning.
+        rendered_text = f"handoff ({source}, {status}: {reason}):\n{instruction}\n{handoff}"
+        return {
+            "present": True,
+            "task": task,
+            "role": role,
+            "source": source,
+            "current": False,
+            "status": status,
+            "reason": reason,
+            "opted_in": True,
+            "schema_error": None,
+            "filtered": False,
+            "mode": "stale_fallback",
+            "required_sections": req_list,
+            "role_selected_sections": role_sel,
+            "included": [
+                *prelude_item,
+                *[
+                    {
+                        "name": s["name"],
+                        "kind": "required" if s["name"] in req_set else "full",
+                        "bytes": s["bytes"],
+                        "sha256": s["sha256"],
+                    }
+                    for s in parsed["sections"]
+                ],
+            ],
+            "omitted_sections": [],
+            "full_bytes": full_bytes,
+            "full_sha256": full_sha256,
+            "selected_bytes": full_bytes,
+            "selected_sha256": full_sha256,
+            "body": handoff,
+            "text": rendered_text,
+        }
+
+    if role_sel is None:
+        # Roles without a selection receive the full handoff.
+        mode = "full_role"
+        filtered = False
+        rendered_body = handoff
+        included = [
+            *prelude_item,
+            *[
+                {
+                    "name": s["name"],
+                    "kind": "required" if s["name"] in req_set else "full",
+                    "bytes": s["bytes"],
+                    "sha256": s["sha256"],
+                }
+                for s in parsed["sections"]
+            ],
+        ]
+        omitted_sections: list[str] = []
+    else:
+        mode = "scoped"
+        filtered = True
+        keep_names = req_set | set(role_sel)
+        kept_secs = [s for s in parsed["sections"] if s["name"] in keep_names]
+        omitted_sections = [s["name"] for s in parsed["sections"] if s["name"] not in keep_names]
+        included = [
+            *prelude_item,
+            *[
+                {
+                    "name": s["name"],
+                    "kind": "required" if s["name"] in req_set else "selected",
+                    "bytes": s["bytes"],
+                    "sha256": s["sha256"],
+                }
+                for s in kept_secs
+            ],
+        ]
+        meta_comment = parsed["meta_comment"]
+        header_part = (
+            f"{meta_comment}\n{prelude_text}"
+            if (meta_comment and prelude_text)
+            else (meta_comment or prelude_text)
+        )
+        body_parts = ([header_part] if header_part else []) + [s["text"] for s in kept_secs]
+        rendered_body = "\n\n".join(body_parts)
+
+    sel_bytes = len(rendered_body.encode("utf-8"))
+    sel_sha256 = _sha256_utf8(rendered_body)
+    inc_tokens = [
+        f"{it['name']}{'(' + it['kind'] + ')' if it['kind'] == 'required' else ''}@{it['sha256'][:12]}:{it['bytes']}B"
+        for it in included
+    ]
+    omit_token = "[" + ", ".join(omitted_sections) + "]" if omitted_sections else "none"
+    prov_line = (
+        f"handoff_provenance: role={role} mode={mode} "
+        f"included=[{', '.join(inc_tokens)}] omitted={omit_token} "
+        f"bytes={sel_bytes}/{full_bytes}"
+    )
+    rendered_text = f"handoff ({source}, {status}: {reason}):\n{instruction}\n{prov_line}\n{rendered_body}"
+    return {
+        "present": True,
+        "task": task,
+        "role": role,
+        "source": source,
+        "current": True,
+        "status": status,
+        "reason": reason,
+        "opted_in": True,
+        "schema_error": None,
+        "filtered": filtered,
+        "mode": mode,
+        "required_sections": req_list,
+        "role_selected_sections": role_sel,
+        "included": included,
+        "omitted_sections": omitted_sections,
+        "full_bytes": full_bytes,
+        "full_sha256": full_sha256,
+        "selected_bytes": sel_bytes,
+        "selected_sha256": sel_sha256,
+        "body": rendered_body,
+        "text": rendered_text,
+    }
+
+
+def spec_handoff(repo: Path, cfg: dict, text: str, task: str, role: str = "worker") -> str:
+    """Carry bounded task-local prose with mechanically checked source anchors.
+
+    The spec owns the assumptions; Git only verifies related-file freshness,
+    never the truth of the prose. Missing/invalid evidence cannot imply trust.
+    """
+    return extract_spec_handoff(repo, cfg, text, task, role=role)["text"]
 
 
 def task_packet(repo: Path, cfg: dict, text: str, task: str, files: list[str]) -> str:
@@ -837,6 +1409,9 @@ def task_packet(repo: Path, cfg: dict, text: str, task: str, files: list[str]) -
         parts.append(handoff)
     if diff_stat:
         parts.append("current uncommitted diff:\n" + diff_stat)
+    smod = skills_module()
+    if smod is not None:
+        parts.append(smod.format_pin_line(repo, task, skill_name=cfg.get("worker_skill") or "flow-run"))
     parts.append("Follow the installed agent-skills disciplines (incremental "
                  "implementation, test-driven development, debugging and error "
                  "recovery) when they are available to you.")
@@ -1810,6 +2385,14 @@ def admit_verdicts(
     known = known_workers(cfg)
     order = list(tasks)
     row_errors = queue_row_errors(queue_text)
+    spec_qtext = queue_text
+    if not spec_qtext:
+        qpath = repo / prefixed(cfg, cfg["queue_file"])
+        if qpath.is_file():
+            try:
+                spec_qtext = qpath.read_text(encoding="utf-8")
+            except OSError:
+                spec_qtext = ""
 
     def ordered_pair(a: str, b: str) -> bool:
         return b in after_map.get(a, []) or a in after_map.get(b, [])
@@ -1824,6 +2407,9 @@ def admit_verdicts(
             }
             continue
         reasons = [row_errors[tid]] if tid in row_errors else []
+        h_err = handoff_schema_error(repo, cfg, spec_qtext, tid)
+        if h_err:
+            reasons.append(f"invalid-handoff: {h_err}")
         if len(files) > cfg["max_task_files"]:
             reasons.append(
                 f"too-broad: {len(files)} files > max_task_files={cfg['max_task_files']}"
@@ -1870,6 +2456,7 @@ def admit_verdicts(
             "reason": "; ".join(reasons),
             "needs_approval": needs_approval,
             "invalid_row": tid in row_errors,
+            "invalid_handoff": bool(h_err),
         }
     return out
 
@@ -1945,6 +2532,9 @@ def planning_diagnostics(repo: Path, cfg: dict, text: str, tasks: list[str]) -> 
         spec = re.search(r"<!--\s*task:" + re.escape(tid) + r"\s+spec:\s*(\S+)\s*-->", text)
         if spec and not spec_acceptance(repo, cfg, text, tid):
             note("error", f"spec acceptance is missing or unreadable: {spec.group(1)}")
+        h_err = handoff_schema_error(repo, cfg, text, tid)
+        if h_err:
+            note("error", f"invalid handoff schema: {h_err}")
         if tid in requests:
             missing = sorted(set(requests[tid]) - set(files.get(tid, [])))
             if missing or not requests[tid]:
@@ -2178,6 +2768,102 @@ class WorkerResult:
         self.timed_out = timed_out
 
 
+def worker_policy_context(repo: Path, cfg: dict, task: str | None) -> dict | None:
+    """Derive actual repository, package and task context for policy checks.
+
+    Never reads exception assertions from cfg; all repository, queue and spec
+    facts come from the git repository root and disk files.
+    """
+    if not isinstance(task, str) or not task.strip():
+        return None
+    task = task.strip()
+    ctx: dict = {
+        "repository": None,
+        "project_prefix": (cfg.get("project_prefix") or "").strip("/"),
+        "task": task,
+        "task_status": None,
+        "dispatchable": False,
+        "package": None,
+        "spec": None,
+    }
+    repo_path = Path(repo)
+    try:
+        if not repo_path.is_dir():
+            return ctx
+        resolved_repo = repo_path.resolve()
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=str(resolved_repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return ctx
+        git_top = Path(proc.stdout.strip()).resolve()
+    except OSError:
+        return ctx
+    if git_top != resolved_repo:
+        return ctx
+    ctx["repository"] = str(git_top)
+
+    raw_qf = cfg.get("queue_file") if isinstance(cfg, dict) else None
+    if raw_qf is None or raw_qf == "":
+        q_rel = "TASK_QUEUE.md"
+    elif isinstance(raw_qf, str) and raw_qf.strip():
+        q_rel = raw_qf.strip()
+    else:
+        return ctx
+    try:
+        qpath = (git_top / prefixed(cfg, q_rel)).resolve()
+        if not qpath.is_relative_to(git_top) or not qpath.is_file():
+            return ctx
+        qtext = qpath.read_text(encoding="utf-8")
+    except OSError:
+        return ctx
+    if sum(1 for ln in qtext.splitlines() if _task_id_from_row(ln) == task) != 1:
+        return ctx
+    if task in queue_row_errors(qtext):
+        return ctx
+    row = parse_queue(qtext).get(task)
+    if not row:
+        return ctx
+    status = row.get("status")
+    ctx["task_status"] = status
+    dispatchable_markers = set(cfg.get("todo_markers") or ["TODO"]) | set(
+        cfg.get("in_progress_markers") or ["IN_PROGRESS"]
+    )
+
+    spec_matches = re.findall(
+        r"<!--\s*task:" + re.escape(task) + r"\s+spec:\s*(\S+)\s*-->",
+        qtext,
+    )
+    if len(spec_matches) != 1:
+        return ctx
+    spec_rel = spec_matches[0].strip()
+    if (
+        not spec_rel
+        or spec_rel.startswith(("/", ":"))
+        or "\\" in spec_rel
+        or ".." in Path(spec_rel).parts
+    ):
+        return ctx
+    try:
+        spec_path = (git_top / prefixed(cfg, spec_rel)).resolve()
+        work_root = (git_top / "docs" / "work").resolve()
+        if not spec_path.is_file() or not spec_path.is_relative_to(work_root):
+            return ctx
+    except OSError:
+        return ctx
+    ctx["dispatchable"] = status in dispatchable_markers
+    rel_parts = spec_path.relative_to(work_root).parts
+    if len(rel_parts) >= 2:
+        ctx["package"] = rel_parts[0]
+        ctx["spec"] = spec_path.relative_to(git_top).as_posix()
+    return ctx
+
+
 def spawn_worker(
     repo: Path,
     cfg: dict,
@@ -2189,11 +2875,13 @@ def spawn_worker(
     template: list[str] | None = None,
     timeout_s: float | None = None,
     extra: dict[str, str] | None = None,
+    task: str | None = None,
 ):
     """Spawn one headless CLI process and stream it. `template` overrides the
     worker contract (used by the read-only judge and the usage probe, which
     are not queue workers and skip the worker-model policy); `timeout_s`
-    overrides task_timeout_s; `extra` adds placeholder substitutions."""
+    overrides task_timeout_s; `extra` adds placeholder substitutions; `task`
+    identifies the queue task so worker policy derives actual engine context."""
     role = "probe" if prompt == PROBE_PROMPT else ("review" if template is not None else "worker")
     projdir = repo / (cfg.get("project_prefix") or "")
     exe = resolve_tool(worker)
@@ -2207,7 +2895,26 @@ def spawn_worker(
             return None, f"no invocation contract for {worker}"
     model = (cfg.get("worker_models") or {}).get(worker) or ""
     if role == "worker":
-        policy_error = validate_worker(worker, template, model, cfg)
+        pinned_policy_path = None
+        if task:
+            smod = skills_module()
+            if smod is not None and repo.is_dir():
+                pinned_policy_path, pin_err = smod.resolve_pinned_policy_for_spawn(
+                    repo,
+                    task,
+                    model_policy_py=Path(_model_policy.__file__),
+                )
+                if pin_err:
+                    return None, pin_err
+        policy_context = worker_policy_context(repo, cfg, task)
+        policy_error = validate_worker(
+            worker,
+            template,
+            model,
+            cfg,
+            policy_path=pinned_policy_path,
+            context=policy_context,
+        )
         if policy_error:
             return None, policy_error
     if any("{model}" in part for part in template) and not model:
@@ -2742,6 +3449,29 @@ def review_package(
         if (event.get("event") == "task_done" and event.get("task") in originals
                 and candidate and review_packet_module().ancestor(repo, candidate, base_head)):
             base_head = candidate
+    review_handoffs: dict[str, dict] = {}
+    handoff_errors: list[str] = []
+    for t in sorted(originals | set(tasks)):
+        h = extract_spec_handoff(repo, cfg, qtext, t, role="review")
+        if h["schema_error"]:
+            handoff_errors.append(f"{t}: {h['schema_error']}")
+        elif h["present"]:
+            review_handoffs[t] = {
+                "source": h["source"],
+                "status": h["status"],
+                "reason": h["reason"],
+                "role": h["role"],
+                "mode": h["mode"],
+                "filtered": h["filtered"],
+                "required_sections": h["required_sections"],
+                "included": h["included"],
+                "omitted_sections": h["omitted_sections"],
+                "full_bytes": h["full_bytes"],
+                "full_sha256": h["full_sha256"],
+                "selected_bytes": h["selected_bytes"],
+                "selected_sha256": h["selected_sha256"],
+                "text": h["text"],
+            }
     packet = review_packet_module().build(
         repo, base_head, head, delivery_stage(cfg), tasks,
         {t: [prefixed(cfg, p) for p in paths] for t, paths in parse_task_files(qtext).items()
@@ -2752,7 +3482,8 @@ def review_package(
                                    *(cfg.get("irreversible_globs") or [])]], review_of=mappings,
         semantic_config_paths=[] if os.environ.get("GATE_CONFIG") else [f"{GATE_DIR}/{CONFIG_NAME}"],
         navigation_paths=[prefixed(cfg, cfg["queue_file"]),
-                          (Path(prefixed(cfg, cfg["queue_file"])).parent / REVIEW_NOTES_NAME).as_posix()])
+                          (Path(prefixed(cfg, cfg["queue_file"])).parent / REVIEW_NOTES_NAME).as_posix()],
+        handoffs=review_handoffs or None)
     base_head = packet["base"]
     # Existing templates ask for base..HEAD; for a validated repair the base
     # placeholder must actually be the repair anchor, never the original base.
@@ -2777,7 +3508,9 @@ def review_package(
                    "reviewer_read_coverage": "unknown; no read claims inferred from packet inclusion"})
     journal(repo, dict(receipt, event="review_start", commit=head))
     print(f"  review of {', '.join(tasks)} ...")
-    if len(prompt.encode("utf-8")) > 32000:
+    if handoff_errors:
+        verdict, member = None, f"invalid_handoff: {'; '.join(handoff_errors)}"
+    elif len(prompt.encode("utf-8")) > 32000:
         verdict, member = None, "review_packet_too_large: inspect full packet and shorten project template"
     else:
         verdict, member = judge_once(repo, cfg, prompt, run_dir, tag, run_id, n_tasks=len(tasks))
@@ -3171,7 +3904,7 @@ def cmd_run(args) -> None:
                 {"event": "admit_refused", "task": tid, "strict": strict, **adm},
             )
             detail = f"{adm['verdict']}: {adm['reason']}"
-            if strict or adm.get("invalid_row"):
+            if strict or adm.get("invalid_row") or adm.get("invalid_handoff"):
                 stop_reason = f"admit_refused:{tid}"
                 print(
                     f"GATE: task {tid} refused admission ({detail}) — stopping. "
@@ -3209,7 +3942,32 @@ def cmd_run(args) -> None:
                     "instead of selecting another task"
                 )
                 break
+            retry_handoff_err = handoff_schema_error(repo, cfg, attempt_queue_text, tid)
+            if retry_handoff_err:
+                outcome = "admit_refused"
+                journal(
+                    repo,
+                    {
+                        "event": "admit_refused",
+                        "task": tid,
+                        "strict": strict,
+                        "verdict": "refuse",
+                        "reason": f"invalid-handoff: {retry_handoff_err}",
+                        "invalid_handoff": True,
+                    },
+                )
+                print(f"  {tid} has invalid handoff schema ({retry_handoff_err}) — stopping")
+                break
 
+            smod = skills_module()
+            if smod is not None:
+                smod.pin_task_start(
+                    repo,
+                    tid,
+                    skill_name=cfg.get("worker_skill") or "flow-run",
+                    policy_path=Path(_model_policy.POLICY_PATH),
+                    model_policy_py=Path(_model_policy.__file__),
+                )
             prompt = cfg["worker_prompt"].format(
                 skill=cfg.get("worker_skill") or "the project's next-session",
                 task=tid,
@@ -3276,7 +4034,7 @@ def cmd_run(args) -> None:
 
             t0 = time.time()
             try:
-                proc, err = spawn_worker(repo, cfg, worker, prompt, pf, log_path=logp, on_beat=beat)
+                proc, err = spawn_worker(repo, cfg, worker, prompt, pf, log_path=logp, on_beat=beat, task=tid)
             except subprocess.TimeoutExpired:
                 proc, err = None, "timeout"
             took = round(time.time() - t0, 1)

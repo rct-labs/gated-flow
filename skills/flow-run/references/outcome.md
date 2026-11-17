@@ -30,6 +30,10 @@ language, leading with the measured result or the blocking fact.
   manufacture those receipts or retry the conflicting packet automatically.
 - `prompt_too_large:<id>`: remove unrelated context or split the task; never truncate or weaken acceptance/stop conditions.
 - `needs_approval:<id>`: show the scope line, ask once, add the line on yes.
+- `budget:model_calls` / `run_timeout`: reconcile per-run versus cumulative limits
+  using the [budget continuation decision](../../../docs/autonomy.md#budget-continuation-decision).
+  Offer the choices when delivery authority is insufficient; never reset counters
+  or infer an extension from a new session or restored provider quota.
 
 A stage is finished when its selected checks and required reviews pass.
 Disclose untested scope and unavailable reviews. A final delivery needs
@@ -44,6 +48,6 @@ Rebuild `CONTEXT.md` and save it with `flow checkpoint`: a stopped or
 interrupted task is written as such, with its failing command, the
 uncommitted paths and the log path, never as done; read the checkpoint's
 warnings. If the run brought a user correction or a verified failure and fix,
-record one candidate lesson in the package's `evidence.md` ([evidence learning](../../../docs/autonomy.md#evidence-learning-and-bounded-experiments)) and the decision in the spec; otherwise none. Checkpoint again at
+record one candidate lesson in the package's `evidence.md` ([evidence learning](../../../docs/autonomy.md#evidence-learning-and-bounded-experiments)) and the decision in the spec; otherwise none. When a learning-backed or skill experiment completes (accepted, rejected, or inconclusive), record the project-owned experiment/review outcome and any natural-language matching preference via `flow learn feedback` without relying on model opinion alone. Checkpoint again at
 package closure. If the user asked to finish everything and TODO rows
 remain for a reason other than a genuine blocker, say so and launch again.

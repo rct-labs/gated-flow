@@ -63,7 +63,25 @@ while stopped before another dispatch; this preserves partial work and reconcile
 state rather than overriding this launch check. No
 `verify_cmd`: say admission will refuse code tasks until the user sets one.
 
+### Bounded learning evidence
+
+- `flow resume --repo .` surfaces at most three bounded learning recommendations
+  (benefit, fit, evidence, uncertainty, effort/risk and next action) when
+  available, and stays quiet when none exist. Do not fabricate or repeat empty
+  learning sections during normal authorized execution.
+- Learning recommendations are advisory only and never grant execution
+  authority: paused or `BLOCKED` tasks (such as `CR-1`) remain paused.
+- For natural-language project-improvement, preference-feedback, language, or
+  learning-pause requests, route via `flow learn` (`onboard`, `check`,
+  `results`, `feedback`, `pause`, `status`) using goal-level context without
+  asking users for daily keywords, models, or skill files.
+
 ## 2. Decide
+
+Before selecting executable work, apply the shared
+[budget continuation decision](../../../docs/autonomy.md#budget-continuation-decision).
+Carry remaining allowance across sessions; offer the confirmed-choice flow only
+when an explicit delivery limit cannot cover the next bounded slice and review.
 
 Use [shared adaptive workflow, stage and budget rules](../../../docs/autonomy.md).
 Select simple, scoped or sensitive from actual behavior without asking the user

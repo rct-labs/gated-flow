@@ -1,11 +1,14 @@
 """Offline Git evidence and receipt regressions for EV-2."""
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import review_packet as packet
 from test_compat import run, load_gate_module, committed_runner_repo
+from test_autonomy import verdict
 
 
 class PacketTests(unittest.TestCase):
@@ -73,6 +76,39 @@ class PacketTests(unittest.TestCase):
         self.assertEqual(json.loads(artifact.read_text()), p)
         self.assertIn(self.base, prompt)
         self.assertIn('--binary', prompt)
+
+    def test_inline_handoffs_projection_preserves_acceptance_and_honest_cap_omission(self):
+        handoffs = {
+            'FIX': {
+                'source': 'docs/work/pkg/spec.md',
+                'status': 'CURRENT',
+                'role': 'review',
+                'mode': 'scoped',
+                'filtered': True,
+                'included': [{'name': 'Review Focus', 'kind': 'selected', 'bytes': 42, 'sha256': 'a' * 64}],
+                'omitted_sections': ['Worker Steps'],
+                'text': '### Review Focus\nCheck citation `ev_abcdef012345`.',
+            }
+        }
+        p = self.build(handoffs=handoffs)
+        artifact = self.repo / '.gate/handoff-packet.json'
+        artifact.write_text(json.dumps(p))
+        self.assertTrue(packet.artifact_valid(dict(p, packet=str(artifact))))
+        rendered = packet.render(p, artifact, cap=24000)
+        self.assertIn('acceptance: {"FIX": "real acceptance"}', rendered)
+        self.assertIn('handoffs: ', rendered)
+        self.assertIn('ev_abcdef012345', rendered)
+        self.assertLess(rendered.index('acceptance: '), rendered.index('handoffs: '))
+
+        # Under a tight cap, mandatory acceptance stays inline ahead of large handoffs, which omit honestly without slicing JSON.
+        big_handoffs = dict(handoffs, FIX=dict(handoffs['FIX'], text='x' * 5000))
+        p_big = self.build(handoffs=big_handoffs)
+        artifact.write_text(json.dumps(p_big))
+        tight = packet.render(p_big, artifact, cap=3200)
+        self.assertLessEqual(len(tight.encode()), 3200)
+        self.assertIn('acceptance: {"FIX": "real acceptance"}', tight)
+        self.assertIn('handoffs: OMITTED from prompt; read ', tight)
+        self.assertEqual(json.loads(artifact.read_text()), p_big)
 
     def test_valid_delta_retains_manifest_findings_and_blocker_ids(self):
         self.prior()
@@ -198,6 +234,98 @@ class PacketTests(unittest.TestCase):
         Path(prior['packet']).write_text('{}')
         self.assertEqual(self.build()['mode'], 'full')
         self.assertFalse(packet.receipt_valid(self.repo, cfg, prior, ['ORIGINAL']))
+
+    def native_review(self, findings=None):
+        gate = load_gate_module()
+        cfg_path = self.repo / '.gate/config.json'
+        cfg = json.loads(cfg_path.read_text())
+        cfg.update(verify_cmd="python3 -c \"print('1 passed')\"",
+                   serialize_full_acceptance=False,
+                   delivery={'stage': 'module'}, judge={'enabled': True})
+        self.change('.gate/config.json', json.dumps(cfg).encode())
+        queue = self.repo / 'TASK_QUEUE.md'
+        check = json.dumps({'cmd': cfg['verify_cmd'], 'timeout_s': 10}).encode()
+        self.change('TASK_QUEUE.md', queue.read_bytes().replace(b'`TODO`', b'`DONE`') +
+                    b'<!-- task:EAV-2 impact: local -->\n' +
+                    b'<!-- task:EAV-2 verify: ' + check + b' -->\n')
+        for name in ('.gate/journal.ndjson', '.gate/evidence.txt', 'spec.md',
+                     'REVIEW-NOTES.md', 'unrelated.txt', '.gate/journal.ndjson.bak',
+                     'odd\nname.txt'):
+            self.change(name, b'')
+        # Exercise the real packet, journal and notes lifecycle; only the model
+        # boundary is stubbed. In particular, do not manufacture a receipt.
+        with mock.patch.dict(os.environ, {'GATE_CONFIG': ''}):
+            cfg = gate.load_config(self.repo)
+            with mock.patch.object(gate, 'judge_once',
+                                   return_value=(verdict(94, 'pass', findings=findings or []), 'offline')) as judge:
+                result = gate.review_package(self.repo, cfg, 'offline', self.repo / '.gate',
+                                             ['EAV-2'], self.base, {'EAV-2': ['eav2.txt']})
+        judge.assert_called_once()
+        self.assertEqual(result['final'], 'pass')
+        receipt = [e for e in packet.events(self.repo) if e['event'] == 'review_verdict'][-1]
+        self.assertTrue(packet.artifact_valid(receipt))
+        return gate, cfg, receipt
+
+    def test_native_tracked_review_journal_append_then_stage_acceptance(self):
+        gate, cfg, receipt = self.native_review()
+        self.assertNotEqual(run('git', '-C', str(self.repo), 'diff', '--quiet', 'HEAD').returncode, 0)
+        self.assertTrue(packet.receipt_valid(self.repo, cfg, receipt, ['EAV-2'], receipt['contract_hash']))
+        gate.journal(self.repo, {'event': 'checkpoint', 'tasks': ['EAV-2']})
+        # A staged native append must have the same behavior as an unstaged one.
+        self.assertEqual(run('git', '-C', str(self.repo), 'add', '.gate/journal.ndjson').returncode, 0)
+        self.assertEqual(gate.valid_review_tasks(self.repo, cfg, ['EAV-2']), {'EAV-2'})
+        accepted = gate.run_stage_acceptance(self.repo, cfg, ['EAV-2'], receipt['head'])
+        self.assertEqual(accepted['result'], 'PASS', accepted['tail'])
+        self.assertEqual(accepted['scope'], 'stage')
+        self.assertTrue(any(e['event'] == 'stage_acceptance' and e['result'] == 'PASS'
+                            for e in packet.events(self.repo)))
+        self.assertEqual([e for e in packet.events(self.repo) if e['event'] == 'review_verdict'], [receipt])
+        self.assertEqual(gate.valid_review_tasks(self.repo, cfg, ['EAV-2']), {'EAV-2'})
+
+    def test_native_journal_allowance_preserves_tracked_and_untracked_drift_guards(self):
+        gate, cfg, receipt = self.native_review()
+        for name in ('src.txt', '.gate/config.json', 'spec.md', 'TASK_QUEUE.md',
+                     'REVIEW-NOTES.md', '.gate/evidence.txt', 'unrelated.txt',
+                     '.gate/journal.ndjson.bak', 'odd\nname.txt'):
+            path = self.repo / name
+            original = path.read_bytes()
+            for staged in (False, True):
+                with self.subTest(path=name, staged=staged):
+                    path.write_bytes(original + b'drift\n')
+                    if staged:
+                        self.assertEqual(run('git', '-C', str(self.repo), 'add', '--', name).returncode, 0)
+                    self.assertFalse(packet.receipt_valid(self.repo, cfg, receipt, ['EAV-2']))
+                    self.assertEqual(run('git', '-C', str(self.repo), 'restore', '--source=HEAD',
+                                         '--staged', '--worktree', '--', name).returncode, 0)
+        (self.repo / 'src.txt').unlink()
+        self.assertFalse(packet.receipt_valid(self.repo, cfg, receipt, ['EAV-2']))
+        self.assertEqual(run('git', '-C', str(self.repo), 'restore', '--', 'src.txt').returncode, 0)
+        for name in ('untracked.py', 'journal.ndjson', 'odd\nnew.txt'):
+            with self.subTest(untracked=name):
+                (self.repo / name).write_text('new work')
+                self.assertFalse(packet.receipt_valid(self.repo, cfg, receipt, ['EAV-2']))
+                (self.repo / name).unlink()
+        self.assertTrue(packet.receipt_valid(self.repo, cfg, receipt, ['EAV-2']))
+        self.assertFalse(packet.receipt_valid(self.repo, {'delivery': {'stage': 'delivery'}}, receipt, ['EAV-2']))
+        self.assertFalse(packet.receipt_valid(self.repo, cfg, receipt, ['EAV-2'], 'changed contract'))
+        self.assertFalse(packet.receipt_valid(self.repo, cfg, dict(receipt, parsed_review={}), ['EAV-2']))
+        artifact = Path(receipt['packet'])
+        original = artifact.read_text()
+        artifact.write_text('{}')
+        self.assertFalse(packet.receipt_valid(self.repo, cfg, receipt, ['EAV-2']))
+        artifact.write_text(original)
+        self.change('src.txt', b'committed drift')
+        self.assertFalse(packet.receipt_valid(self.repo, cfg, receipt, ['EAV-2']))
+
+    def test_native_journal_append_preserves_only_recorded_notes_head_allowance(self):
+        gate, cfg, receipt = self.native_review(findings=[
+            {'severity': 'low', 'file': 'src.txt', 'issue': 'polish', 'fix': 'later', 'action': 'optional'}])
+        self.assertNotEqual(receipt['head'], receipt['recorded_head'])
+        self.assertEqual(self.head(), receipt['recorded_head'])
+        self.assertTrue(packet.receipt_valid(self.repo, cfg, receipt, ['EAV-2']))
+        self.assertFalse(packet.receipt_valid(self.repo, cfg, dict(receipt, recorded_head=receipt['head']), ['EAV-2']))
+        self.change('REVIEW-NOTES.md', b'unauthorized later notes')
+        self.assertFalse(packet.receipt_valid(self.repo, cfg, receipt, ['EAV-2']))
 
     def test_mixed_legacy_closure_and_new_skipped_review_survive_restart(self):
         gate = load_gate_module()

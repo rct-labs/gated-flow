@@ -62,7 +62,8 @@ def parsed(value):
 
 
 def build(repo, base, head, stage, tasks, declared, acceptance, evidence, defects,
-          contract, repairs, full_globs=(), review_of=None, navigation_paths=(), semantic_config_paths=()):
+          contract, repairs, full_globs=(), review_of=None, navigation_paths=(),
+          semantic_config_paths=(), handoffs=None):
     base = git(repo, 'rev-parse', '--verify', base + '^{commit}').decode().strip()
     head = git(repo, 'rev-parse', '--verify', head + '^{commit}').decode().strip()
     review_of = review_of or {}
@@ -117,6 +118,8 @@ def build(repo, base, head, stage, tasks, declared, acceptance, evidence, defect
                    acceptance=acceptance, evidence=evidence, defects=defects,
                    prior_blockers=(prior or {}).get('blocker_ids', []),
                    prior_findings=((prior or {}).get('parsed_review') or {}).get('findings', []) if parsed((prior or {}).get('parsed_review')) else [])
+    if handoffs:
+        payload['handoffs'] = handoffs
     payload['packet_hash'] = digest(payload)
     return payload
 
@@ -136,8 +139,9 @@ def render(packet, artifact, cap=24000):
                     'Prior blocker IDs stay stable; status labels alone never resolve defects.\n')
     # The original JSON is never truncated. Each projection is either included
     # whole or explicitly omitted; the cap never silently slices evidence.
-    for key in ('tasks', 'acceptance', 'manifest', 'delta', 'evidence', 'defects',
-                'prior_blockers', 'prior_findings'):
+    keys = ('tasks', 'acceptance', *(['handoffs'] if packet.get('handoffs') else []),
+            'manifest', 'delta', 'evidence', 'defects', 'prior_blockers', 'prior_findings')
+    for key in keys:
         section = key + ': ' + json.dumps(packet[key], ensure_ascii=True) + '\n'
         if len((instructions + section).encode()) <= cap - 1200:
             instructions += section
@@ -169,7 +173,10 @@ def receipt_valid(repo, cfg, receipt, tasks, contract_hash=None):
         return False
     if not artifact_valid(receipt):
         return False
-    if subprocess.run(['git', '-C', str(repo), 'diff', '--quiet', 'HEAD'], capture_output=True).returncode:
+    # Native review/acceptance appends to this tracked journal itself. Keep
+    # every other tracked path (including gate config and evidence) immutable.
+    changed = git(repo, 'diff', '--no-renames', '--name-only', '-z', 'HEAD').split(b'\0')
+    if any(path and path != b'.gate/journal.ndjson' for path in changed):
         return False
     untracked = git(repo, 'ls-files', '--others', '--exclude-standard', '-z').split(b'\0')
     if any(path and not path.startswith(b'.gate/') for path in untracked):

@@ -539,6 +539,35 @@ class ReviewTests(ReviewHarness):
             self.assertEqual(seen, [])
             self.assertIn("prompt_too_large:EAV-2", report)
 
+    def test_invalid_review_handoff_schema_refuses_host_review_without_model_call(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = judged_runner_repo(Path(td), ["claude"])
+            base = run("git", "-C", str(repo), "rev-parse", "HEAD").stdout.strip()
+            self._spawn([])(repo, {}, "claude", "task EAV-2", None)
+            (repo / "spec.md").write_text(
+                "## Acceptance\nKeep contract.\n\n"
+                "## Handoff EAV-2\n"
+                '<!-- handoff: {"role_sections": {"review": ["MissingSection"]}} -->\n'
+                "### Existing\nBody.\n",
+                encoding="utf-8",
+            )
+            qpath = repo / "TASK_QUEUE.md"
+            qpath.write_text(qpath.read_text(encoding="utf-8") + "<!-- task:EAV-2 spec: spec.md -->\n", encoding="utf-8")
+            run("git", "-C", str(repo), "add", "spec.md", "TASK_QUEUE.md")
+            run("git", "-C", str(repo), "commit", "-qm", "broken review handoff schema")
+            forbidden_judge = mock.Mock(side_effect=AssertionError("must not invoke judge on invalid handoff schema"))
+            with (
+                mock.patch.dict(os.environ, {"GATE_CONFIG": ""}),
+                mock.patch.object(self.gate, "judge_once", side_effect=forbidden_judge),
+                self.assertRaisesRegex(SystemExit, "3"),
+            ):
+                self.gate.cmd_review(
+                    SimpleNamespace(repo=str(repo), tasks="EAV-2", base=base, no_acceptance=True, acceptance_only=False)
+                )
+            forbidden_judge.assert_not_called()
+            report = (repo / ".gate" / "RUN-REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("invalid_handoff:", report)
+
 
 class ReviewIsAGateTests(ReviewHarness):
     """A review blocks on a high finding and does nothing else to the queue:
@@ -797,7 +826,7 @@ class ReviewIsAGateTests(ReviewHarness):
             never, _ = self._judge([])
             self._run(repo, self._spawn(seen), never, expect_exit="3")
 
-    def test_replay_of_the_alltom_incident_ends_after_round_one(self) -> None:
+    def test_replay_of_multi_round_review_incident_ends_after_round_one(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             repo = judged_runner_repo(Path(td), ["claude"])
             judge, calls = self._judge([verdict(86, "pass", findings=[

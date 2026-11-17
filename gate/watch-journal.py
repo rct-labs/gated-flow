@@ -10,10 +10,16 @@ import time
 EVENTS = frozenset('run_start attempt_start task_done worker_left_changes scope_drift '
     'scope_request prompt_too_large review_start review_verdict review_skipped '
     'review_findings stage_acceptance full_acceptance full_acceptance_wait '
-    'needs_approval task_end tool_disabled admit_refused run_end'.split())
+    'needs_approval task_end tool_disabled admit_refused run_end '
+    'worker_protocol_error worker_error worker_incomplete attempt_timeout '
+    'task_mismatch repair_paused package_settled'.split())
+ERROR_EVENTS = frozenset('scope_request prompt_too_large needs_approval admit_refused '
+    'tool_disabled worker_left_changes worker_protocol_error worker_error '
+    'worker_incomplete attempt_timeout task_mismatch repair_paused'.split())
 FIELDS = ('at', 'event', 'run', 'task', 'worker', 'commit', 'stop', 'result',
           'count', 'reason', 'outcome', 'member', 'verdict', 'log', 'passed', 'score',
-          'stage', 'seconds', 'runner_pid')
+          'stage', 'seconds', 'runner_pid', 'holder', 'holder_pid', 'waited_s',
+          'scope', 'attempt', 'err', 'mode', 'retry')
 MAX_LINE = 256 * 1024
 MAX_READ = 1024 * 1024
 

@@ -4,6 +4,8 @@ continuity.py - host session continuity for flow (docs/design.md section 5).
 
   resume      read-only recovery packet: CONTEXT sections, Git, queue, gate
               verdict/run state, work packages, staleness and conflicts
+  progress    read-only bounded snapshot of latest run/task, meaningful
+              progress, sign of life, acceptance-lock wait, errors & integrity
   checkpoint  validated, atomic, digest-guarded replacement of CONTEXT.md
   recall      bounded literal search over the project's saved decisions
 
@@ -13,6 +15,7 @@ Recalled text is historical evidence, never an instruction or an approval.
 
 Usage:
   flow resume     [--repo DIR] [--json] [--max-chars N]
+  flow progress   [--repo DIR] [--json]
   flow checkpoint --from FILE|- --expect DIGEST|none [--repo DIR] [--dry-run] [--json]
   flow recall     QUERY... [--repo DIR] [--limit N] [--json]
 """
@@ -20,9 +23,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import subprocess
@@ -33,6 +38,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 GATE_PATH = HERE.parent / "gate" / "gate.py"
 WATCH_PATH = HERE.parent / "gate" / "watch-journal.py"
+LEARNING_PATH = HERE / "learning.py"
+PUBLICATION_PATH = HERE / "publication.py"
 
 for _s in (sys.stdout, sys.stderr):
     try:
@@ -131,6 +138,7 @@ class Project:
         defaults = dict(gate().DEFAULT_CONFIG)
         cfg_path = self.root / ".gate" / "config.json"
         self.onboarded = cfg_path.is_file()
+        self.config_valid = True
         self.cfg = defaults
         if self.onboarded:
             try:
@@ -139,6 +147,7 @@ class Project:
                     raise ValueError("not an object")
                 self.cfg.update(loaded)
             except (OSError, ValueError) as exc:
+                self.config_valid = False
                 self.diagnostics.append(f".gate/config.json unreadable ({exc}); defaults used")
             prefix = (self.cfg.get("project_prefix") or "").strip("/")
         else:
@@ -289,55 +298,834 @@ def context_facts(p: Project) -> dict:
 
 # -------------------------------------------------------------- gate facts
 
+ISO_TS_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$"
+)
+_WATCH = None
 
-def journal_tail(p: Project) -> tuple[list[dict], int]:
+
+def watch_module():
+    """watch-journal.py owns meaningful event vocabulary, compact fields and PID liveness."""
+    global _WATCH
+    if _WATCH is None:
+        _WATCH = _load("flow_continuity_watch", WATCH_PATH)
+    return _WATCH
+
+
+def _no_json_constants(val: str):
+    raise ValueError(f"non-standard JSON constant: {val}")
+
+
+def valid_timestamp(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    m = ISO_TS_RE.match(s)
+    if not m:
+        return None
+    base, frac, tz = m.groups()
+    norm_tz = "+00:00" if tz == "Z" else tz
+    norm_frac = f".{frac[:6]}" if frac else ""
+    try:
+        datetime.fromisoformat(f"{base}{norm_frac}{norm_tz}")
+    except ValueError:
+        return None
+    return s
+
+
+def _pos_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def _nonneg_number(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+        return float(value)
+    return None
+
+
+def _clean_str(value: object, limit: int = 256) -> str | None:
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    return s[:limit] if s else None
+
+
+def read_journal_tail(p: Project, *, max_bytes: int | None = None) -> dict:
+    limit = JOURNAL_TAIL_BYTES if max_bytes is None else max(1, int(max_bytes))
     path = p.gate_file("journal.ndjson")
     if not path.is_file():
-        return [], 0
+        return {
+            "exists": False,
+            "size": 0,
+            "events": [],
+            "malformed_records": 0,
+            "window_truncated": False,
+            "unterminated_record": False,
+        }
     size = path.stat().st_size
     with path.open("rb") as stream:
-        start = max(0, size - JOURNAL_TAIL_BYTES)
+        start = max(0, size - limit)
         stream.seek(start)
         chunk = stream.read()
+    window_truncated = start > 0
+    unterminated_record = bool(chunk) and not chunk.endswith(b"\n")
     lines = chunk.split(b"\n")
-    if start:
-        lines = lines[1:]  # first line is partial
-    events, warnings = [], 0
+    if window_truncated and lines:
+        lines = lines[1:]  # first fragment starts mid-record at seek boundary
+    if unterminated_record and lines:
+        lines.pop()  # trailing record has no terminating newline; never trust partial JSON
+    events: list[dict] = []
+    malformed = 0
     for raw in lines:
         if not raw.strip():
             continue
         try:
-            event = json.loads(raw.decode("utf-8"))
+            event = json.loads(raw.decode("utf-8"), parse_constant=_no_json_constants)
             if not isinstance(event, dict):
-                raise ValueError
+                raise ValueError("not an object")
             events.append(event)
         except (ValueError, UnicodeDecodeError):
-            warnings += 1
-    return events, warnings
+            malformed += 1
+    return {
+        "exists": True,
+        "size": size,
+        "events": events,
+        "malformed_records": malformed,
+        "window_truncated": window_truncated,
+        "unterminated_record": unterminated_record,
+    }
+
+
+def journal_tail(p: Project) -> tuple[list[dict], int]:
+    tail = read_journal_tail(p)
+    bad = tail["malformed_records"] + (1 if tail["unterminated_record"] else 0)
+    return tail["events"], bad
 
 
 def process_alive(pid: int) -> bool | None:
     try:
-        return _load("flow_continuity_watch", WATCH_PATH).process_alive(pid)
+        return watch_module().process_alive(pid)
     except Exception:  # noqa: BLE001 - liveness is best effort; unknown is honest
         return None
 
 
-def gate_facts(p: Project, g: dict) -> dict:
+def _attribute_latest_run(events: list[dict]) -> dict | None:
+    starts = [i for i, e in enumerate(events) if e.get("event") == "run_start"]
+    if not starts:
+        return None
+    start_idx = starts[-1]
+    start_ev = events[start_idx]
+    run_id = _clean_str(start_ev.get("run"), 128)
+    attributed: list[tuple[dict, str]] = [(start_ev, "explicit" if run_id else "positional")]
+    end_ev: dict | None = None
+    cross_run_excluded = 0
+    for ev in events[start_idx + 1:]:
+        has_run_key = "run" in ev and ev.get("run") is not None
+        if has_run_key:
+            ev_run = _clean_str(ev.get("run"), 128)
+            if run_id is None or ev_run is None or ev_run != run_id:
+                cross_run_excluded += 1
+                continue
+            attr = "explicit"
+        else:
+            if end_ev is not None:
+                continue
+            attr = "positional"
+        if end_ev is not None:
+            continue
+        attributed.append((ev, attr))
+        if ev.get("event") == "run_end":
+            end_ev = ev
+    return {
+        "start_ev": start_ev,
+        "run_id": run_id,
+        "attributed": attributed,
+        "end_ev": end_ev,
+        "cross_run_excluded": cross_run_excluded,
+    }
+
+
+def _summarize_meaningful_event(c: dict, raw_ev: dict) -> str:
+    ev_name = _clean_str(c.get("event"), 64) or "unknown"
+    task = _clean_str(c.get("task"), 128)
+    worker = _clean_str(c.get("worker"), 128)
+    if ev_name == "run_start":
+        stage = _clean_str(c.get("stage"), 64) or "default"
+        mode = _clean_str(c.get("mode"), 64)
+        return f"run_start ({mode + ', ' if mode else ''}{stage})"
+    if ev_name == "attempt_start":
+        att = _pos_int(c.get("attempt"))
+        return (f"attempt_start {task or '?'} via {worker or '?'}"
+                + (f" (attempt {att})" if att else ""))
+    if ev_name == "task_done":
+        commit = _clean_str(c.get("commit"), 40)
+        return f"task_done {task or '?'}" + (f" ({commit[:10]})" if commit else "")
+    if ev_name == "task_end":
+        return f"task_end {task or '?'}:{_clean_str(c.get('outcome'), 64) or '?'}"
+    if ev_name == "review_start":
+        return f"review_start ({_clean_str(c.get('stage'), 64) or 'review'})"
+    if ev_name == "review_verdict":
+        passed = c.get("passed")
+        score = _nonneg_number(c.get("score"))
+        return (f"review_verdict passed={passed}"
+                + (f" score={int(score) if score.is_integer() else score}" if score is not None else ""))
+    if ev_name == "review_skipped":
+        return f"review_skipped ({_clean_str(c.get('reason'), 128) or _clean_str(c.get('outcome'), 64) or '?'})"
+    if ev_name == "review_findings":
+        return "review_findings recorded"
+    if ev_name == "full_acceptance_wait":
+        return f"full_acceptance_wait (holder {_clean_str(c.get('holder')) or 'unknown'})"
+    if ev_name in ("full_acceptance", "stage_acceptance"):
+        return f"{ev_name} {_clean_str(c.get('result'), 32) or '?'}"
+    if ev_name == "package_settled":
+        return f"package_settled ({_clean_str(c.get('stage'), 64) or '?'})"
+    if ev_name == "run_end":
+        return f"run_end ({_clean_str(c.get('stop'), 128) or '?'})"
+    detail = _clean_str(c.get("reason"), 120) or _clean_str(c.get("err"), 120)
+    return ev_name + (f" {task}" if task else "") + (f": {detail}" if detail else "")
+
+
+def _update_last_error(
+    last_error: dict | None,
+    c: dict,
+    raw_event: dict,
+    ts: str | None,
+    attr: str,
+) -> dict | None:
+    wm = watch_module()
+    ev_name = _clean_str(c.get("event"), 64) or ""
+    ev_task = _clean_str(c.get("task"), 128)
+    ev_worker = _clean_str(c.get("worker"), 128)
+    ev_log = _clean_str(c.get("log"))
+
+    def _entry(reason: str | None, *, task: str | None = ev_task, stop: str | None = None) -> dict:
+        entry: dict = {
+            "event": ev_name,
+            "at": ts,
+            "task": task,
+            "worker": ev_worker,
+            "reason": reason,
+            "log": ev_log,
+            "attribution": attr,
+        }
+        if stop:
+            entry["stop"] = stop
+        return entry
+
+    if ev_name in wm.ERROR_EVENTS:
+        if (ev_name == "admit_refused" and raw_event.get("strict") is False
+                and not raw_event.get("invalid_row") and not raw_event.get("invalid_handoff")):
+            return last_error
+        if ev_name == "worker_error":
+            reason = _clean_str(c.get("err")) or _clean_str(c.get("reason")) or "worker_error"
+        elif ev_name == "worker_left_changes":
+            reason = _clean_str(c.get("reason")) or (
+                "uncommitted changes left (retry scheduled)" if c.get("retry") is True
+                else "uncommitted changes left"
+            )
+        elif ev_name == "attempt_timeout":
+            reason = _clean_str(c.get("reason")) or "worker attempt timed out"
+        elif ev_name == "prompt_too_large":
+            reason = _clean_str(c.get("reason")) or "worker packet exceeded byte limit"
+        else:
+            reason = (
+                _clean_str(c.get("reason"))
+                or _clean_str(c.get("err"))
+                or _clean_str(c.get("verdict"))
+                or ev_name
+            )
+        return _entry(reason)
+
+    if ev_name == "review_verdict":
+        if c.get("passed") is False or c.get("outcome") == "failed":
+            reason = _clean_str(c.get("reason")) or _clean_str(c.get("verdict")) or "review failed"
+            return _entry(reason)
+        return last_error
+
+    if ev_name == "review_skipped":
+        if c.get("reason") != "disabled":
+            reason = _clean_str(c.get("reason")) or _clean_str(c.get("outcome")) or "review skipped"
+            return _entry(reason)
+        return last_error
+
+    if ev_name in ("stage_acceptance", "full_acceptance"):
+        res = _clean_str(c.get("result"), 32)
+        if res and res != "PASS":
+            detail = _clean_str(c.get("reason"))
+            return _entry(f"{res}: {detail}" if detail else res)
+        return last_error
+
+    if ev_name == "repair_batch_result":
+        if raw_event.get("passed") is False:
+            return _entry(_clean_str(c.get("stop")) or "repair batch failed")
+        return last_error
+
+    if ev_name == "task_end":
+        outcome = _clean_str(c.get("outcome"), 64)
+        checkpoint = _clean_str(raw_event.get("checkpoint"), 64)
+        if (outcome and outcome != "done") or checkpoint in ("failed", "skipped"):
+            if last_error is not None and (
+                (ev_task and last_error.get("task") == ev_task
+                 and last_error.get("event") in (outcome, "worker_error", "worker_left_changes",
+                                                 "attempt_timeout", "tool_disabled"))
+                or (checkpoint in ("failed", "skipped")
+                    and last_error.get("event") in ("review_verdict", "review_skipped"))
+            ):
+                return last_error
+            reason = (
+                _clean_str(c.get("reason"))
+                or (f"checkpoint {checkpoint}" if outcome == "done" and checkpoint else outcome)
+                or "task_failed"
+            )
+            return _entry(reason)
+        return last_error
+
+    if ev_name == "run_end":
+        stop = _clean_str(c.get("stop"), 128)
+        if stop and stop not in ("queue_empty", "budget", "budget:model_calls"):
+            stop_kind, _, stop_target = stop.partition(":")
+            target = _clean_str(stop_target, 128)
+            if last_error is not None:
+                prev_ev = last_error.get("event")
+                prev_task = last_error.get("task")
+                same_root = (
+                    (stop_kind == prev_ev and (not target or prev_task in (None, target)))
+                    or (stop_kind in ("full_acceptance_failed", "stage_acceptance_failed")
+                        and prev_ev in ("full_acceptance", "stage_acceptance"))
+                    or (stop_kind in ("review_failed", "review_loop", "review_unavailable")
+                        and prev_ev in ("review_verdict", "review_skipped"))
+                    or (prev_ev == "task_end" and (not target or prev_task == target))
+                )
+                if same_root:
+                    merged = dict(last_error)
+                    merged.setdefault("stop", stop)
+                    return merged
+            return _entry(stop, task=target or ev_task, stop=stop)
+        return last_error
+
+    return last_error
+
+
+def _empty_wait() -> dict:
+    return {
+        "state": "none",
+        "active": False,
+        "holder": None,
+        "holder_pid": None,
+        "started_at": None,
+        "ended_at": None,
+        "waited_s": None,
+        "cleared_by": None,
+        "attribution": None,
+    }
+
+
+def _finalize_wait(pending_wait: dict | None, completed_wait: dict | None, base_state: str) -> tuple[str, dict]:
+    if pending_wait is not None:
+        if base_state == "live":
+            wait_state, wait_active, final_state = "waiting", True, "waiting"
+        elif base_state == "dead":
+            wait_state, wait_active, final_state = "dead", False, "dead"
+        else:
+            wait_state, wait_active, final_state = "unknown", False, "unknown"
+        return final_state, {
+            "state": wait_state,
+            "active": wait_active,
+            "holder": pending_wait["holder"],
+            "holder_pid": pending_wait["holder_pid"],
+            "started_at": pending_wait["started_at"],
+            "ended_at": None,
+            "waited_s": None,
+            "cleared_by": None,
+            "attribution": pending_wait["attribution"],
+        }
+    if completed_wait is not None:
+        return base_state, {
+            "state": "cleared",
+            "active": False,
+            "holder": completed_wait["holder"],
+            "holder_pid": completed_wait["holder_pid"],
+            "started_at": completed_wait["started_at"],
+            "ended_at": completed_wait["ended_at"],
+            "waited_s": completed_wait["waited_s"],
+            "cleared_by": completed_wait["cleared_by"],
+            "attribution": completed_wait["attribution"],
+        }
+    return base_state, _empty_wait()
+
+
+def _scan_wait_and_errors(
+    pairs: list[tuple[dict, str]],
+) -> tuple[dict | None, dict | None, dict | None, dict | None, str | None]:
+    """Walk (event, attribution) pairs once for sign-of-life, lock-wait, and last error."""
+    wm = watch_module()
+    pending_wait: dict | None = None
+    completed_wait: dict | None = None
+    just_cleared_by_check = False
+    last_sign: dict | None = None
+    last_error: dict | None = None
+    sign_task: str | None = None
+
+    for ev, attr in pairs:
+        c = wm.compact(ev)
+        ev_name = _clean_str(c.get("event"), 64) or "unknown"
+        ts = valid_timestamp(ev.get("at"))
+        ev_task = _clean_str(c.get("task"), 128)
+        ev_worker = _clean_str(c.get("worker"), 128)
+
+        last_sign = {
+            "event": ev_name,
+            "at": ts,
+            "attribution": attr,
+            "task": ev_task,
+            "worker": ev_worker,
+            "seconds": _nonneg_number(c.get("seconds")),
+            "is_heartbeat": ev_name == "heartbeat",
+        }
+        if ev_task:
+            sign_task = ev_task
+
+        if ev_name == "full_acceptance_wait":
+            pending_wait = {
+                "holder": _clean_str(c.get("holder")),
+                "holder_pid": _pos_int(c.get("holder_pid")),
+                "started_at": ts,
+                "attribution": attr,
+            }
+            just_cleared_by_check = False
+        elif ev_name == "acceptance_check" and c.get("scope") == "queue":
+            w_s = _nonneg_number(c.get("waited_s"))
+            if pending_wait is not None:
+                completed_wait = {
+                    **pending_wait,
+                    "ended_at": ts,
+                    "waited_s": w_s,
+                    "cleared_by": "acceptance_check",
+                }
+                pending_wait = None
+                just_cleared_by_check = True
+            elif w_s is not None and w_s > 0:
+                completed_wait = {
+                    "holder": None,
+                    "holder_pid": None,
+                    "started_at": None,
+                    "ended_at": ts,
+                    "waited_s": w_s,
+                    "cleared_by": "acceptance_check",
+                    "attribution": attr,
+                }
+                just_cleared_by_check = True
+        elif ev_name in ("full_acceptance", "stage_acceptance"):
+            fa_w_s = _nonneg_number(c.get("waited_s"))
+            if pending_wait is not None:
+                completed_wait = {
+                    **pending_wait,
+                    "ended_at": ts,
+                    "waited_s": fa_w_s,
+                    "cleared_by": ev_name,
+                }
+                pending_wait = None
+                just_cleared_by_check = False
+            elif just_cleared_by_check and completed_wait is not None:
+                completed_wait["cleared_by"] = ev_name
+                completed_wait["ended_at"] = ts or completed_wait["ended_at"]
+                if fa_w_s is not None:
+                    completed_wait["waited_s"] = fa_w_s
+                just_cleared_by_check = False
+            elif fa_w_s is not None and fa_w_s > 0:
+                completed_wait = {
+                    "holder": None,
+                    "holder_pid": None,
+                    "started_at": None,
+                    "ended_at": ts,
+                    "waited_s": fa_w_s,
+                    "cleared_by": ev_name,
+                    "attribution": attr,
+                }
+                just_cleared_by_check = False
+        elif ev_name == "run_end":
+            if pending_wait is not None:
+                completed_wait = {
+                    **pending_wait,
+                    "ended_at": ts,
+                    "waited_s": None,
+                    "cleared_by": "run_end",
+                }
+                pending_wait = None
+            just_cleared_by_check = False
+
+        last_error = _update_last_error(last_error, c, ev, ts, attr)
+
+    return pending_wait, completed_wait, last_sign, last_error, sign_task
+
+
+def build_progress(p: Project, *, tail: dict | None = None, max_bytes: int | None = None) -> dict:
+    """Pure bounded read-only progress snapshot reusing journal_tail and watch-journal vocabulary."""
+    note = "Read-only snapshot; no journal, lock, cursor or config writes."
+    if not p.onboarded:
+        return {
+            "project": p.root.as_posix(),
+            "available": False,
+            "state": "unavailable",
+            "run": {
+                "id": None,
+                "state": "unavailable",
+                "pid": None,
+                "liveness": None,
+                "started_at": None,
+                "ended_at": None,
+                "stage": None,
+                "mode": None,
+                "stop": None,
+            },
+            "task": None,
+            "meaningful_progress": {"count": 0, "tasks_done": [], "last": None},
+            "last_sign_of_life": None,
+            "acceptance_wait": _empty_wait(),
+            "last_error": None,
+            "integrity": {
+                "ok": True,
+                "malformed_records": 0,
+                "truncated_tail": False,
+                "window_truncated": False,
+                "unterminated_record": False,
+                "missing_run_start": False,
+                "bad_timestamps": 0,
+                "cross_run_excluded": 0,
+                "warnings": [],
+            },
+            "note": note,
+        }
+
+    tail_data = read_journal_tail(p, max_bytes=max_bytes) if tail is None else tail
+    events = tail_data["events"]
+    malformed = tail_data["malformed_records"]
+    window_truncated = tail_data["window_truncated"]
+    unterminated_record = tail_data["unterminated_record"]
+    truncated_tail = window_truncated or unterminated_record
+    bad_timestamps = sum(1 for ev in events if valid_timestamp(ev.get("at")) is None)
+    run_slice = _attribute_latest_run(events)
+    has_activity = bool(events) or malformed > 0 or truncated_tail
+    missing_run_start = has_activity and run_slice is None
+
+    integrity_warnings: list[str] = []
+    if window_truncated:
+        integrity_warnings.append(
+            f"journal tail truncated to last {max_bytes or JOURNAL_TAIL_BYTES} bytes; older records omitted"
+        )
+    if unterminated_record:
+        integrity_warnings.append("journal ends with an incomplete/truncated record")
+    if malformed:
+        integrity_warnings.append(f"{malformed} malformed journal record(s) skipped")
+    if missing_run_start:
+        integrity_warnings.append("missing run_start in journal tail; run identity and liveness are unknown")
+    if bad_timestamps:
+        integrity_warnings.append(f"{bad_timestamps} journal record(s) have missing or invalid timestamp")
+
+    integrity = {
+        "ok": not integrity_warnings,
+        "malformed_records": malformed,
+        "truncated_tail": truncated_tail,
+        "window_truncated": window_truncated,
+        "unterminated_record": unterminated_record,
+        "missing_run_start": missing_run_start,
+        "bad_timestamps": bad_timestamps,
+        "cross_run_excluded": run_slice["cross_run_excluded"] if run_slice else 0,
+        "warnings": integrity_warnings,
+    }
+
+    if not has_activity:
+        return {
+            "project": p.root.as_posix(),
+            "available": True,
+            "state": "idle",
+            "run": {
+                "id": None,
+                "state": "idle",
+                "pid": None,
+                "liveness": None,
+                "started_at": None,
+                "ended_at": None,
+                "stage": None,
+                "mode": None,
+                "stop": None,
+            },
+            "task": None,
+            "meaningful_progress": {"count": 0, "tasks_done": [], "last": None},
+            "last_sign_of_life": None,
+            "acceptance_wait": _empty_wait(),
+            "last_error": None,
+            "integrity": integrity,
+            "note": note,
+        }
+
+    if run_slice is None:
+        # Missing run_start: never invent run identity or live waiting; retain orphan error/sign-of-life as unattributed.
+        orphan_pairs = [(ev, "unattributed") for ev in events]
+        pending_wait, completed_wait, last_sign, last_error, _ = _scan_wait_and_errors(orphan_pairs)
+        _, wait_info = _finalize_wait(pending_wait, completed_wait, "unknown")
+        return {
+            "project": p.root.as_posix(),
+            "available": True,
+            "state": "unknown",
+            "run": {
+                "id": None,
+                "state": "unknown",
+                "pid": None,
+                "liveness": "unknown",
+                "started_at": None,
+                "ended_at": None,
+                "stage": None,
+                "mode": None,
+                "stop": None,
+            },
+            "task": None,
+            "meaningful_progress": {"count": 0, "tasks_done": [], "last": None},
+            "last_sign_of_life": last_sign,
+            "acceptance_wait": wait_info,
+            "last_error": last_error,
+            "integrity": integrity,
+            "note": note,
+        }
+
+    start_ev = run_slice["start_ev"]
+    run_id = run_slice["run_id"]
+    attributed = run_slice["attributed"]
+    end_ev = run_slice["end_ev"]
+    pid = _pos_int(start_ev.get("runner_pid"))
+
+    if end_ev is not None:
+        liveness: str | None = None
+        base_state = "finished"
+    elif pid is None:
+        liveness = "unknown"
+        base_state = "unknown"
+    else:
+        alive = process_alive(pid)
+        if alive is True:
+            liveness = "live"
+            base_state = "live"
+        elif alive is False:
+            liveness = "dead"
+            base_state = "dead"
+        else:
+            liveness = "unknown"
+            base_state = "unknown"
+
+    wm = watch_module()
+    meaningful_count = 0
+    tasks_done: list[str] = []
+    last_meaningful: dict | None = None
+    meaningful_task: str | None = None
+
+    for ev, attr in attributed:
+        c = wm.compact(ev)
+        ev_name = _clean_str(c.get("event"), 64) or "unknown"
+        if ev_name not in wm.EVENTS:
+            continue
+        meaningful_count += 1
+        ts = valid_timestamp(ev.get("at"))
+        ev_task = _clean_str(c.get("task"), 128)
+        ev_worker = _clean_str(c.get("worker"), 128)
+        if ev_task:
+            meaningful_task = ev_task
+        elif isinstance(ev.get("tasks"), list) and not meaningful_task:
+            batch_tasks = [_clean_str(t, 64) for t in ev["tasks"][:8]]
+            joined = ",".join(t for t in batch_tasks if t)
+            if joined:
+                meaningful_task = joined
+        if ev_name == "task_done" and ev_task:
+            tasks_done.append(ev_task)
+        last_meaningful = {
+            "event": ev_name,
+            "at": ts,
+            "summary": _summarize_meaningful_event(c, ev),
+            "attribution": attr,
+            "task": ev_task,
+            "worker": ev_worker,
+        }
+
+    pending_wait, completed_wait, last_sign, last_error, sign_task = _scan_wait_and_errors(attributed)
+    final_state, wait_info = _finalize_wait(pending_wait, completed_wait, base_state)
+
+    start_compact = wm.compact(start_ev)
+    end_compact = wm.compact(end_ev) if end_ev is not None else {}
+    return {
+        "project": p.root.as_posix(),
+        "available": True,
+        "state": final_state,
+        "run": {
+            "id": run_id,
+            "state": final_state,
+            "pid": pid,
+            "liveness": liveness,
+            "started_at": valid_timestamp(start_ev.get("at")),
+            "ended_at": valid_timestamp(end_ev.get("at")) if end_ev is not None else None,
+            "stage": _clean_str(start_compact.get("stage"), 64),
+            "mode": _clean_str(start_compact.get("mode"), 64),
+            "stop": _clean_str(end_compact.get("stop"), 128) if end_ev is not None else None,
+        },
+        "task": meaningful_task or sign_task,
+        "meaningful_progress": {
+            "count": meaningful_count,
+            "tasks_done": tasks_done[-8:],
+            "last": last_meaningful,
+        },
+        "last_sign_of_life": last_sign,
+        "acceptance_wait": wait_info,
+        "last_error": last_error,
+        "integrity": integrity,
+        "note": note,
+    }
+
+
+def progress_lines(prog: dict) -> list[str]:
+    if not prog.get("available"):
+        return ["- progress: unavailable (project not onboarded; no .gate/config.json)"]
+    state = prog.get("state")
+    run = prog.get("run") or {}
+    mp = prog.get("meaningful_progress") or {}
+    life = prog.get("last_sign_of_life")
+    wait = prog.get("acceptance_wait") or {}
+    err = prog.get("last_error")
+    integ = prog.get("integrity") or {}
+
+    lines: list[str] = []
+    if state == "idle":
+        lines.append("- run: none (idle; no journal events recorded)")
+    elif integ.get("missing_run_start"):
+        lines.append("- run: unknown (missing run_start; pid unknown, liveness unknown)")
+    else:
+        rid = run.get("id") or "unknown"
+        parts = [str(run.get("state") or state or "unknown")]
+        if run.get("pid") is not None or run.get("liveness") is not None:
+            parts.append(f"pid {run.get('pid') if run.get('pid') is not None else 'unknown'}")
+        if run.get("liveness") is not None:
+            parts.append(f"liveness {run['liveness']}")
+        parts.append(f"started {run.get('started_at') or 'unknown'}")
+        if run.get("ended_at") is not None or run.get("state") == "finished":
+            parts.append(f"ended {run.get('ended_at') or 'unknown'}")
+        if run.get("stop"):
+            parts.append(f"stop {run['stop']}")
+        if run.get("stage"):
+            parts.append(f"stage {run['stage']}")
+        lines.append(f"- run: {rid} ({', '.join(parts)}); task: {prog.get('task') or 'none'}")
+
+    last_mp = mp.get("last")
+    if last_mp:
+        done_part = f", tasks done: {', '.join(mp['tasks_done'])}" if mp.get("tasks_done") else ""
+        lines.append(
+            f"- meaningful progress: {last_mp['summary']} at {last_mp.get('at') or 'unknown'} "
+            f"[{last_mp.get('attribution') or 'unknown'} attribution; {mp.get('count', 0)} event(s){done_part}]"
+        )
+    elif integ.get("missing_run_start"):
+        lines.append("- meaningful progress: unknown (missing run_start; unscoped events not attributed)")
+    else:
+        lines.append("- meaningful progress: none")
+
+    if life:
+        who = []
+        if life.get("task"):
+            who.append(f"task {life['task']}")
+        if life.get("worker"):
+            who.append(f"via {life['worker']}")
+        if life.get("seconds") is not None:
+            sec = life["seconds"]
+            who.append(f"{int(sec) if float(sec).is_integer() else sec}s")
+        detail = f" ({', '.join(who)})" if who else ""
+        hb_note = "; heartbeat not counted as progress" if life.get("is_heartbeat") else ""
+        lines.append(
+            f"- last sign of life: {life['event']}{detail} at {life.get('at') or 'unknown'} "
+            f"[{life.get('attribution') or 'unknown'}{hb_note}]"
+        )
+    else:
+        lines.append("- last sign of life: none")
+
+    w_state = wait.get("state") or "none"
+    holder = wait.get("holder") or "unknown"
+    hpid = wait.get("holder_pid") if wait.get("holder_pid") is not None else "unknown"
+    if w_state == "waiting":
+        lines.append(
+            f"- acceptance-lock wait: waiting on holder {holder} (holder pid {hpid}) "
+            f"since {wait.get('started_at') or 'unknown'} [{wait.get('attribution') or 'unknown'}]"
+        )
+    elif w_state == "cleared":
+        waited = f"{wait['waited_s']}s" if wait.get("waited_s") is not None else "unknown"
+        lines.append(
+            f"- acceptance-lock wait: cleared by {wait.get('cleared_by') or 'unknown'} "
+            f"(holder {holder}, holder pid {hpid}, waited {waited})"
+        )
+    elif w_state == "dead":
+        lines.append(
+            f"- acceptance-lock wait: not live (runner pid {run.get('pid') or 'unknown'} is dead; "
+            f"holder {holder}, holder pid {hpid}, started {wait.get('started_at') or 'unknown'})"
+        )
+    elif w_state == "unknown":
+        lines.append(
+            f"- acceptance-lock wait: unknown (runner liveness unknown; holder {holder}, "
+            f"holder pid {hpid}, started {wait.get('started_at') or 'unknown'})"
+        )
+    else:
+        lines.append("- acceptance-lock wait: none")
+
+    if err:
+        target = f" on {err['task']}" if err.get("task") else ""
+        via = f" via {err['worker']}" if err.get("worker") else ""
+        log_part = f" (log: {err['log']})" if err.get("log") else ""
+        lines.append(
+            f"- last error: {err['event']}{target}{via}: {err.get('reason') or 'unknown'}{log_part} "
+            f"at {err.get('at') or 'unknown'} [{err.get('attribution') or 'unknown'}]"
+        )
+    else:
+        lines.append("- last error: none")
+
+    if integ.get("warnings"):
+        lines.append("- integrity warnings: " + "; ".join(integ["warnings"]))
+    else:
+        lines.append("- integrity: ok")
+    return lines
+
+
+def render_progress(prog: dict) -> str:
+    return "\n".join([
+        f"# flow progress - {prog['project']}",
+        "",
+        *progress_lines(prog),
+        "",
+        prog["note"],
+    ])
+
+
+def cmd_progress(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(prog="flow progress")
+    ap.add_argument("--repo", default=".")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    p = Project(args.repo)
+    prog = build_progress(p)
+    if args.json:
+        print(json.dumps(prog, ensure_ascii=False, indent=2))
+    else:
+        print(render_progress(prog))
+    return 0
+
+
+def gate_facts(p: Project, g: dict, *, tail: dict | None = None) -> dict:
     out: dict = {"available": p.onboarded, "problems": []}
     if not p.onboarded:
         return out
     # Last run, from a bounded journal tail.
-    events, warnings = journal_tail(p)
+    tail_data = read_journal_tail(p) if tail is None else tail
+    events = tail_data["events"]
+    warnings = tail_data["malformed_records"] + (1 if tail_data["unterminated_record"] else 0)
     if warnings:
         out["problems"].append(f"journal tail has {warnings} unreadable record(s)")
-    starts = [i for i, e in enumerate(events) if e.get("event") == "run_start"]
-    if starts:
-        i = starts[-1]
-        start = events[i]
+    run_slice = _attribute_latest_run(events)
+    if run_slice is not None:
+        start = run_slice["start_ev"]
         run_id = start.get("run")
-        later = events[i + 1:]
-        end = next((e for e in later if e.get("event") == "run_end" and e.get("run") == run_id), None)
+        later = [ev for ev, _ in run_slice["attributed"][1:]]
+        end = run_slice["end_ev"]
         run = {"id": run_id, "started": start.get("at"), "stage": start.get("stage")}
         done = [e.get("task") for e in later if e.get("event") == "task_done"]
         ends = [f"{e.get('task')}:{e.get('outcome') or e.get('reason') or '?'}"
@@ -348,15 +1136,15 @@ def gate_facts(p: Project, g: dict) -> dict:
         if end:
             run.update(state="finished", stop=end.get("stop"), ended=end.get("at"))
         else:
-            pid = start.get("runner_pid")
-            alive = process_alive(pid) if isinstance(pid, int) and pid > 0 else None
+            pid = _pos_int(start.get("runner_pid"))
+            alive = process_alive(pid) if pid is not None else None
             if alive is True:
                 run.update(state="active", pid=pid)
             elif alive is False:
                 run.update(state="interrupted", pid=pid)
             else:
-                run.update(state="unknown", pid=pid)
-        last = events[-1] if events else {}
+                run.update(state="unknown", pid=start.get("runner_pid"))
+        last = run_slice["attributed"][-1][0] if run_slice["attributed"] else {}
         run["last_event"] = f"{last.get('event')} at {last.get('at')}"
         out["run"] = run
     report = p.gate_file("RUN-REPORT.md")
@@ -441,10 +1229,88 @@ def work_packages(p: Project, context_text: str) -> list[dict]:
 # ------------------------------------------------------------------ resume
 
 
-def build_resume(p: Project) -> dict:
+def _learning_summary(
+    p: Project,
+    *,
+    include_status: bool = False,
+    user_language: str | None = None,
+) -> dict:
+    """Read-only learning recommendations; absence/failure never breaks resume or calls a model."""
+    if not LEARNING_PATH.is_file():
+        return {"available": False, "quiet": True, "recommendations": [],
+                "reason": "learning_adapter_absent", "status_requested": include_status}
+    try:
+        mod = _load("flow_continuity_learning", LEARNING_PATH)
+        return mod.resume_learning_summary(
+            p.root,
+            user_language=user_language,
+            include_status=include_status,
+        )
+    except Exception as exc:  # noqa: BLE001 - continuity must remain usable
+        return {"available": False, "quiet": True, "recommendations": [],
+                "reason": f"learning_error:{type(exc).__name__}", "status_requested": include_status}
+
+
+_PUB = None
+
+
+def publication_module():
+    """publication.py owns receipt tail reading, remote target binding and delivery freshness."""
+    global _PUB
+    if _PUB is None:
+        _PUB = _load("flow_continuity_publication", PUBLICATION_PATH)
+    return _PUB
+
+
+def _publication_summary(p: Project, g: dict) -> dict:
+    if not PUBLICATION_PATH.is_file():
+        return {
+            "exists": False,
+            "total_attempts_in_tail": 0,
+            "latest": None,
+            "targets": [],
+            "problems": [],
+            "integrity": {
+                "ok": True,
+                "malformed_records": 0,
+                "window_truncated": False,
+                "unterminated_record": False,
+                "unsafe_storage": False,
+                "warnings": [],
+            },
+            "authority_note": "Observed remote state only; receipts never grant push or release authority.",
+        }
+    pm = publication_module()
+    ctx_rel = rel(p.context, p.root) if p.context else None
+    return pm.build_publication_summary(
+        p.root,
+        cfg=p.cfg,
+        onboarded=p.onboarded,
+        config_valid=p.config_valid,
+        head_sha=g["head"].lower() if g.get("head") else None,
+        tree_clean=not g.get("dirty"),
+        context_rel=ctx_rel,
+    )
+
+
+def _publication_lines(pub: dict | None) -> list[str]:
+    if not pub or not PUBLICATION_PATH.is_file():
+        return []
+    return publication_module().publication_lines(pub)
+
+
+def build_resume(
+    p: Project,
+    *,
+    include_learning_status: bool = False,
+    user_language: str | None = None,
+) -> dict:
     g = git_facts(p)
     c = context_facts(p)
-    gf = gate_facts(p, g)
+    tail = read_journal_tail(p) if p.onboarded else None
+    gf = gate_facts(p, g, tail=tail)
+    prog = build_progress(p, tail=tail)
+    pub = _publication_summary(p, g)
     q = queue_facts(p)
     parsed = c.get("parsed") or {"sections": {}, "marker": {}}
     context_text = p.context.read_text(encoding="utf-8", errors="replace") if c["exists"] else ""
@@ -503,11 +1369,39 @@ def build_resume(p: Project) -> dict:
         warnings.append("conflict: snapshot prose reads as complete/passed, but the gate facts "
                         "above say otherwise. Prose is never a verdict; the facts win")
 
+    if pub.get("problems"):
+        for prob in pub["problems"]:
+            if p.onboarded:
+                gf.setdefault("problems", []).append(prob)
+            else:
+                warnings.append(prob)
+    pub_latest = pub.get("latest")
+    if pub_latest is not None:
+        obs_status = (pub_latest.get("observed") or {}).get("status")
+        if pub_latest.get("stale"):
+            warnings.append(
+                "publication receipt stale ("
+                + "; ".join((pub_latest.get("stale_reasons") or ["drift"])[:2])
+                + "): does not establish current delivery"
+            )
+        elif obs_status == "match" and not (pub_latest.get("local_acceptance") or {}).get("fresh_delivery"):
+            acc_issues = (pub_latest.get("local_acceptance") or {}).get("issues") or ["unverified"]
+            warnings.append(
+                "remote matched at receipt time, but local delivery acceptance is not fresh ("
+                + "; ".join(acc_issues[:2])
+                + "): does not establish current delivery"
+            )
+
     sections = {}
     for n in range(1, 6):
         sec = parsed["sections"].get(n)
         sections[n] = {"title": sec["title"], "line": sec["line"], "body": sec["body"]} if sec else None
     next_step = sections[4]["body"] if sections.get(4) else []
+    learning = _learning_summary(
+        p,
+        include_status=include_learning_status,
+        user_language=user_language,
+    )
     return {
         "project": {"root": p.root.as_posix(), "prefix": p.prefix, "onboarded": p.onboarded,
                     "diagnostics": p.diagnostics},
@@ -516,7 +1410,10 @@ def build_resume(p: Project) -> dict:
         "git": {k: v for k, v in g.items() if k != "dirty_paths"},
         "queue": q,
         "gate": gf,
+        "progress": prog,
+        "publication": pub,
         "work_packages": wp,
+        "learning": learning,
         "warnings": warnings,
         "gate_overrides": overrides,
         "next_step": next_step,
@@ -601,12 +1498,53 @@ def render_resume(r: dict, max_chars: int) -> str:
             L.extend(f"  {x}" for x in gf.get("report_waiting", []))
         for x in gf.get("problems", []):
             L.append(f"- problem: {x}")
+        if r.get("progress"):
+            L.append("### Progress")
+            L.extend(progress_lines(r["progress"]))
+        pub_lines = _publication_lines(r.get("publication"))
+        if pub_lines:
+            L.append("### Publication")
+            L.extend(pub_lines)
         L.append("")
+    else:
+        pub_lines = _publication_lines(r.get("publication"))
+        if pub_lines:
+            L.append("## Publication (machine facts)")
+            L.extend(pub_lines)
+            L.append("")
     if r["work_packages"]:
         L.append("## Work packages")
         for w in r["work_packages"]:
             L.append(f"- {w['path']} [{', '.join(w['files'])}] modified {w['modified']}"
                      + (" (named in snapshot)" if w["referenced"] else ""))
+        L.append("")
+    learning = r.get("learning") or {}
+    recs = (learning.get("recommendations") or [])[:3]
+    if recs:
+        labels = learning.get("labels") or {}
+        L.append(f"## {labels.get('heading', 'Learning recommendations')} "
+                 f"({len(recs)}/{learning.get('total_available', len(recs))})")
+        for idx, rec in enumerate(recs, 1):
+            L.append(f"{idx}. {rec.get('title')} ({rec.get('canonical_url')})")
+            L.append(f"   - {labels.get('benefit', 'Expected benefit')}: {rec.get('benefit')}")
+            L.append(f"   - {labels.get('fit', 'Why it fits')}: {rec.get('fit')}")
+            L.append(f"   - {labels.get('evidence', 'Evidence')}: {len(rec.get('evidence') or [])} cited; "
+                     f"{labels.get('proposal_only', 'recommendation only')}")
+            L.append(f"   - {labels.get('uncertainty', 'Uncertainty')}: {rec.get('uncertainty')}")
+            L.append(f"   - {labels.get('effort_risk', 'Effort & risk')}: {rec.get('effort_risk')}")
+            L.append(f"   - {labels.get('next_action', 'Recommended next action')}: {rec.get('next_action')}")
+        L.append("")
+    elif learning.get("status_requested"):
+        L.append("## Learning status")
+        if not learning.get("available"):
+            L.append(f"- unavailable ({learning.get('reason', 'absent')})")
+        elif not learning.get("registered"):
+            L.append(f"- not registered ({learning.get('reason', 'unregistered')})")
+        else:
+            covs = learning.get("coverage") or []
+            L.append(f"- project {learning.get('project_id')}: 0 recommendations; "
+                     f"coverage entries={len(covs)} incomplete={learning.get('incomplete_coverage', False)} "
+                     f"unknown={len(learning.get('unknown_dispatches') or [])}")
         L.append("")
     L.append("## Next safe action")
     if r["gate_overrides"]:
@@ -626,9 +1564,15 @@ def cmd_resume(argv: list[str]) -> int:
     ap.add_argument("--repo", default=".")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--max-chars", type=int, default=12000)
+    ap.add_argument("--learning-status", action="store_true")
+    ap.add_argument("--user-language")
     args = ap.parse_args(argv)
     p = Project(args.repo)
-    r = build_resume(p)
+    r = build_resume(
+        p,
+        include_learning_status=args.learning_status,
+        user_language=args.user_language,
+    )
     if args.json:
         print(json.dumps(r, ensure_ascii=False, indent=2))
     else:
@@ -976,7 +1920,12 @@ def main(argv: list[str] | None = None) -> None:
         print(__doc__.strip())
         raise SystemExit(0)
     cmd, rest = argv[0], argv[1:]
-    handlers = {"resume": cmd_resume, "checkpoint": cmd_checkpoint, "recall": cmd_recall}
+    handlers = {
+        "resume": cmd_resume,
+        "progress": cmd_progress,
+        "checkpoint": cmd_checkpoint,
+        "recall": cmd_recall,
+    }
     if cmd not in handlers:
         die(f"unknown continuity command: {cmd}")
     raise SystemExit(handlers[cmd](rest))

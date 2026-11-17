@@ -391,6 +391,51 @@ actual provider usage and defect outcomes before claiming token savings. No toke
 conversion from prompt bytes or cost claims from subscription call counts.
 
 
+## Budget continuation decision
+
+At `$flow-run` entry and a budget stop, reconcile the current delivery allowance,
+actual consumption and remaining calls/time from existing budget records and
+CONTEXT. A new session, runner, task name or recovered provider quota never resets
+them. If the remaining allowance covers the next bounded slice and its required
+review, continue without a budget question. A per-run cap alone can be reconciled
+within the existing delivery allowance while stopped; it is not a new grant.
+
+When an explicit delivery limit is exhausted or insufficient, keep dispatch
+stopped and present one concise budget decision in the user's language. Show the
+scope, spent/limit/remaining, why the next slice cannot fit, and these choices:
+
+| Choice | Effect after explicit confirmation |
+|---|---|
+| Add 120 model calls (recommended) | Keep the current scope and consumed count; record a separate +120 grant and increase the cumulative cap by 120 |
+| Start a new bounded batch | Agree its scope and finite allowance (suggest 120 calls), archive the old batch and record the new batch at 0/120 with its predecessor and outstanding obligations |
+| Custom allowance | Accept a positive finite additional call count, or clarify the exact requested cap/unit before changing it |
+| Progress only | Report pending work and stop without dispatch or a budget change |
+
+120 is a suggested increment, never an automatic grant or a promise to finish.
+Honor a different explicit user choice already supplied in the session without
+asking again. Use a selection tool when available and permitted for this decision;
+otherwise offer the same numbered choices in chat. A preselected recommendation,
+silence, timeout, bare `$flow-run`, or a session switch is not confirmation. Keep
+the decision pending; do not launch dependent work while awaiting a reply. A
+read-only/status request does not trigger a launch or require a budget decision.
+
+Before resuming, record the user's decision, scope, timestamp, previous cap and
+consumption, grant delta and resulting cap in the existing budget authority and
+CONTEXT; do not introduce a competing budget store. Example: 120/120 plus 120
+becomes 120/240, not 0/120. A new batch can display 0/120 only for that batch;
+retain historical consumption and do not reset a still-binding parent program
+cap. Identify every binding exhausted parent/package/time limit together, so the
+user can approve the necessary changes in one decision. A call-only grant does
+not extend deadlines, token/spending limits or closed package repair allowances.
+New batches preserve pending review, failures, partial work and task identities;
+they never turn unfinished work into accepted work or replay completed tasks.
+
+Update only stopped-run limits to fit the confirmed remaining allowance, reserve
+required review/repair capacity, reconcile task ownership and refresh admission.
+If another limit or technical blocker remains, state it; budget confirmation does
+not waive scope, independent review, data, publication or safety gates.
+
+
 ## Scope request recovery
 
 A genuine worker scope request stops the runner immediately, including on a dirty

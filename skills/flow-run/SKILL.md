@@ -22,13 +22,18 @@ For separately installed skills, `flow home` locates repository documents:
 resolve shared rules at `<home>/docs/autonomy.md` and other repository links
 against that home. Within-skill references stay relative to this skill.
 
-Inspect and resume only already-authorized work. A status question alone is
-read-only; analysis-only, plan-only, standalone debate and paused-business
-requests never launch execution. Follow current user scope and limits.
+Inspect and resume only already-authorized work. A status or project-improvement
+question (such as checking recent improvement opportunities, reviewing learning
+suggestions, giving preference feedback, or pausing learning) is read-only/advisory
+and routes through [Inspect and decide](references/inspect.md) and `flow learn`;
+analysis-only, plan-only, standalone debate and paused-business requests never
+launch execution. Follow current user scope and limits, without asking the user
+for daily model, keyword, or skill-file choices.
 
 Read [shared workflow rules](../../docs/autonomy.md), the authority for role
 policy, adaptive risk, approvals, review, repair, cumulative limits and evidence.
-Load each operational reference only when that phase is needed:
+Load skill metadata first and load each operational reference progressively only
+when that phase is needed:
 
 1. [Inspect and decide](references/inspect.md): resume facts, select an eligible
    worker from real available evidence, choose the next milestone.

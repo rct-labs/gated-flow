@@ -158,6 +158,44 @@ class WatchTests(unittest.TestCase):
         proc.wait(timeout=5)
         self.assertFalse(watch.process_alive(proc.pid))
 
+    def test_lock_holder_and_error_fields_are_compacted_without_private_payloads(self):
+        watch.initialize(self.journal, self.cursor)
+        self.append({
+            'at': '2026-11-16T13:28:43Z',
+            'event': 'full_acceptance_wait',
+            'holder': '/tmp/other-project',
+            'holder_pid': 4125984,
+            'prompt': 'secret-prompt',
+        })
+        self.append({
+            'at': '2026-11-16T13:29:00Z',
+            'event': 'worker_error',
+            'task': 'IL-15',
+            'worker': 'agy-flow',
+            'err': 'spawn_failed',
+            'last_line': 'private-transcript-line',
+        })
+        self.append({
+            'at': '2026-11-16T13:29:05Z',
+            'event': 'worker_protocol_error',
+            'task': 'IL-15',
+            'worker': 'agy-flow',
+            'reason': 'Malformed FLOW_RESULT',
+            'findings': ['private-finding'],
+        })
+        result = self.read()
+        self.assertEqual(
+            [e['event'] for e in result['events']],
+            ['full_acceptance_wait', 'worker_error', 'worker_protocol_error'],
+        )
+        self.assertEqual(result['events'][0]['holder'], '/tmp/other-project')
+        self.assertEqual(result['events'][0]['holder_pid'], 4125984)
+        self.assertEqual(result['events'][1]['err'], 'spawn_failed')
+        self.assertEqual(result['events'][2]['reason'], 'Malformed FLOW_RESULT')
+        dumped = json.dumps(result)
+        for secret in ('secret-prompt', 'private-transcript-line', 'private-finding'):
+            self.assertNotIn(secret, dumped)
+
 
 if __name__ == '__main__':
     unittest.main()
