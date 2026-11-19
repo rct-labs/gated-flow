@@ -8,6 +8,8 @@ never issues network or model calls and leaves Flow usable if learner is absent.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import subprocess
 import importlib
 import json
 import os
@@ -45,6 +47,50 @@ def import_learner():
         return importlib.import_module("learner")
     except ImportError:
         return None
+
+
+def is_flow_repo(root: Path) -> bool:
+    return all((root / p).is_file() for p in
+               ("gate/gate.py", "flow/continuity.py", "skills/flow-run/SKILL.md"))
+
+
+def project_root(path: Path) -> Path:
+    root = path.resolve()
+    if not root.is_dir():
+        raise ValueError("Project directory does not exist")
+    try:
+        result = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+                                capture_output=True, text=True)
+    except FileNotFoundError:
+        return root
+    return Path(result.stdout.strip()).resolve() if result.returncode == 0 else root
+
+
+def generic_profile(learner_mod: Any, root: Path, project_id: str | None = None, *, goals=(), mission_override=None) -> Any:
+    pid = project_id or f"{root.name}-{hashlib.sha256(str(root).encode()).hexdigest()[:12]}"
+    local = root / ".flow" / "learner-profile.json"
+    raw = json.loads(local.read_text()) if local.is_file() else {}
+    if raw and Path(raw.get("root_path", "")).resolve() != root:
+        raise learner_mod.ValidationError("Local learner profile must bind root_path to this repository")
+    if project_id and raw.get("project_id", project_id) != project_id:
+        raise learner_mod.ValidationError("Local profile project identity differs from --project-id")
+    draft = learner_mod.draft_profile_from_docs(pid, root, name=root.name).profile.to_dict()
+    draft["public_concepts"] = []  # Unauthored local docs are private context only.
+    return learner_mod.ProjectProfile.from_dict({
+        **draft,
+        "project_id": pid, "name": root.name, "root_path": str(root),
+        "mission": draft["mission"],
+        **raw,
+        **({"goals": list(goals)} if goals else {}),
+        **({"mission": mission_override} if mission_override else {}),
+        "root_path": str(root), "adapter": "standalone",
+        "learning_enabled": True, "execution_paused": True,
+        "export_policy": {"allow_public_concept_queries": False,
+                          "allow_shared_public_evidence": False,
+                          "private_retention": "purge_private", **raw.get("export_policy", {})},
+        "provenance": {**draft["provenance"], **raw.get("provenance", {}), "finite_project_budget": True,
+                       "outcome_bridge": True},
+    })
 
 
 def detect_input_language(text: str | None) -> str | None:
@@ -169,7 +215,13 @@ def derive_flow_profile_draft(
 
 def _resolve_project_id(store: Any, repo_root: Path, explicit_project_id: str | None) -> str | None:
     if explicit_project_id:
-        return explicit_project_id
+        prof = store.get_profile(explicit_project_id)
+        if prof is not None and Path(prof.root_path).resolve() != repo_root.resolve():
+            raise ValueError("Project identity belongs to a different repository")
+        for other in store.list_profiles():
+            if Path(other.root_path).resolve() == repo_root.resolve() and other.project_id != explicit_project_id:
+                raise ValueError("Repository already belongs to a different project identity")
+        return explicit_project_id if prof is not None else None
     resolved_repo = repo_root.resolve()
     for prof in store.list_profiles():
         try:
@@ -290,7 +342,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--storage-root")
     ap.add_argument("--project-id")
     ap.add_argument("--json", action="store_true")
-    sub = ap.add_subparsers(dest="subcmd", required=True)
+    sub = ap.add_subparsers(dest="subcmd")
 
     p_on = sub.add_parser("onboard", parents=[common], help="Goal-level explicit project onboarding")
     p_on.add_argument("--goal", action="append", default=[])
@@ -329,6 +381,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("pause", parents=[common], help="Pause learning independently without changing execution state")
     sub.add_parser("resume", parents=[common], help="Resume learning independently without clearing execution pauses")
     sub.add_parser("status", parents=[common], help="Show learning registration, coverage, failures, and trial status")
+    p_un = sub.add_parser("unregister", parents=[common], help="Unregister this project using its private retention policy")
+    p_un.add_argument("--retention", choices=("purge_private", "retain_redacted"))
     return ap
 
 
@@ -340,23 +394,59 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("flow learn: learner package is unavailable", file=sys.stderr)
         return 1
 
-    repo_root = Path(args.repo).resolve()
     storage_root = Path(args.storage_root).resolve() if args.storage_root else default_storage_root()
 
     try:
+        repo_root = project_root(Path(args.repo))
+        if not repo_root.is_dir():
+            raise ValueError("Repository directory does not exist")
+        if args.subcmd is None:
+            store = learner_mod.LearnerStore(storage_root)
+            try:
+                pid = _resolve_project_id(store, repo_root, args.project_id)
+                created = pid is None
+                if created:
+                    if is_flow_repo(repo_root):
+                        profile = derive_flow_profile_draft(learner_mod, repo_root, project_id=args.project_id).profile
+                    else:
+                        profile = generic_profile(learner_mod, repo_root, args.project_id)
+                    try:
+                        saved = store.register_profile(profile)
+                    except learner_mod.ValidationError:
+                        saved = store.get_profile(profile.project_id)
+                        if saved is None or Path(saved.root_path).resolve() != repo_root:
+                            raise
+                        created = False
+                    pid = saved.project_id
+                prof = store.get_profile(pid)
+                res = learner_mod.get_recommendations(store, project_id=pid)
+                from learner.feedback import eligible_outcomes
+                verified_count = sum(1 for _ in eligible_outcomes(store, pid))
+                payload = {"registered": created, "profile": prof.to_dict(), "verified_outcomes": verified_count, **res}
+                _emit(payload, as_json=args.json,
+                      summary=f"{prof.name}: learning {'enabled' if prof.learning_enabled else 'paused'}; verified outcomes={verified_count}; recommendations={res['total_available']}; {'waiting for feedback' if not verified_count else 'local feedback available'}")
+                if not args.json:
+                    rendered = learner_mod.format_user_recommendations(res)
+                    if rendered:
+                        print(rendered)
+                return 0
+            finally:
+                store.close()
         if args.subcmd == "onboard":
-            draft = derive_flow_profile_draft(
-                learner_mod,
-                repo_root,
-                project_id=args.project_id,
-                goals=args.goal,
-                mission_override=args.mission,
-            )
+            if is_flow_repo(repo_root):
+                draft = derive_flow_profile_draft(
+                    learner_mod, repo_root, project_id=args.project_id,
+                    goals=args.goal, mission_override=args.mission,
+                )
+            else:
+                profile = generic_profile(learner_mod, repo_root, args.project_id, goals=args.goal, mission_override=args.mission)
+                draft = learner_mod.ProjectProfileDraft(profile=profile, activated=False, source_docs=(), warnings=())
             if args.draft_only:
                 _emit(draft.to_dict(), as_json=args.json, summary=f"draft {draft.profile.project_id}: activated=False")
                 return 0
             store = learner_mod.LearnerStore(storage_root)
             try:
+                _resolve_project_id(store, repo_root, draft.profile.project_id)
                 existing = store.get_profile(draft.profile.project_id)
                 if existing is not None:
                     updates: dict[str, Any] = {
@@ -391,6 +481,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         store = learner_mod.LearnerStore(storage_root)
         try:
             pid = _resolve_project_id(store, repo_root, args.project_id)
+            if args.subcmd == "unregister":
+                if not pid:
+                    raise ValueError("Project is not registered")
+                result = store.unregister_profile(pid, retention=args.retention)
+                _emit(result, as_json=args.json, summary=f"unregistered {pid}: retention={result['retention']} revoked={result['revoked_assessments']}")
+                return 0
+            if pid is None and args.subcmd != "status":
+                raise ValueError("Project is not registered; run flow learn")
             if args.subcmd == "check":
                 if not pid:
                     raise learner_mod.ValidationError(f"Project is not registered for {repo_root}; run `flow learn onboard` first")
@@ -482,17 +580,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _emit(
                     prof.to_dict(),
                     as_json=args.json,
-                    summary=f"{args.subcmd} {prof.project_id}: learning_enabled={prof.learning_enabled} execution_paused={prof.execution_paused}",
+                    summary=f"{prof.name}: learning {'enabled' if prof.learning_enabled else 'paused'}",
                 )
                 return 0
 
             if args.subcmd == "status":
-                store.recover_stale_dispatches()
-                profiles = [p.to_dict() for p in ([store.get_profile(pid)] if pid else store.list_profiles()) if p is not None]
-                coverage = [c.to_dict() for c in store.list_coverage()]
+                profiles = [store.get_profile(pid).to_dict()] if pid else []
+                coverage = []
                 unknowns = [
                     u.to_dict()
-                    for u in store.list_dispatches(project_id=pid, state="unknown", include_shared=True)
+                    for u in (store.list_dispatches(project_id=pid, state="unknown", include_shared=is_flow_repo(repo_root)) if pid else [])
                 ]
                 payload = {
                     "profiles": profiles,
@@ -503,13 +600,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "trial_grant": store.get_trial_status(),
                     "languages": learner_mod.get_language_preferences(store, project_id=pid),
                 }
+                from learner.feedback import eligible_outcomes
+                verified_count = sum(1 for _ in eligible_outcomes(store, pid)) if pid else 0
+                recommendation_count = learner_mod.get_recommendations(store, project_id=pid)["total_available"] if pid else 0
+                payload.update(verified_outcomes=verified_count, recommendations=recommendation_count)
                 _emit(
                     payload,
                     as_json=args.json,
                     summary=(
-                        f"profiles={len(profiles)} coverage={len(coverage)} "
-                        f"incomplete={payload['incomplete_coverage']} unknown={len(unknowns)} "
-                        f"trial={payload['trial_grant']['state']}({payload['trial_grant'].get('mode', 'inactive')})"
+                        f"{profiles[0]['name']}: learning {'enabled' if profiles[0]['learning_enabled'] else 'paused'}; "
+                        f"verified outcomes={verified_count}; recommendations={recommendation_count}"
+                        + ("; waiting for feedback" if recommendation_count and not verified_count else "")
+                        if profiles else "Project is not registered"
                     ),
                 )
                 return 0

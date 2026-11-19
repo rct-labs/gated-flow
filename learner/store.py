@@ -93,6 +93,11 @@ CREATE TABLE IF NOT EXISTS project_profiles (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS project_identity_bindings (
+    project_id TEXT PRIMARY KEY,
+    root_digest TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS profile_revisions (
     project_id TEXT NOT NULL,
     revision INTEGER NOT NULL,
@@ -228,6 +233,42 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
+def _canonical_root_path(raw_path: str) -> str:
+    cleaned = str(raw_path or "").strip()
+    if not cleaned:
+        return ""
+    try:
+        return str(Path(cleaned).expanduser().resolve())
+    except OSError:
+        return cleaned
+
+
+def _trusted_flow_source() -> Path | None:
+    """Resolve identity from this package, or its owner-published installation."""
+    package_parent = Path(__file__).resolve().parent.parent
+    releases = Path.home() / ".local" / "share" / "flow"
+    if package_parent.name != "runtime":
+        return package_parent
+    release = package_parent.parent
+    # Check the executing package layout before reading any release metadata.
+    if release.parent != releases or releases.resolve() != releases:
+        return None
+    manifest_path = release / "manifest.json"
+    try:
+        if manifest_path.is_symlink():
+            return None
+        manifest = json.loads(manifest_path.read_text())
+        if (not isinstance(manifest, dict) or type(manifest.get("format")) is not int
+                or manifest["format"] != 1 or manifest.get("version") != release.name):
+            return None
+        source = Path(manifest["source"])
+        if not source.is_absolute() or source.resolve() != source or not source.is_dir():
+            return None
+        return source
+    except (OSError, ValueError, TypeError, KeyError, RecursionError):
+        return None
+
+
 class LearnerStore:
     """Durable SQLite + immutable content-addressed store for standalone learning."""
 
@@ -243,6 +284,14 @@ class LearnerStore:
         self.evidence_dir.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._conn().executescript(_SCHEMA_SQL)
+            # Identity survives both retention policies without retaining private profile data.
+            for row in self._conn().execute("SELECT project_id, profile_json FROM project_profiles").fetchall():
+                root = json.loads(row["profile_json"]).get("root_path")
+                if root:
+                    self._conn().execute(
+                        "INSERT OR IGNORE INTO project_identity_bindings VALUES (?, ?)",
+                        (row["project_id"], sha256_bytes(_canonical_root_path(root).encode())),
+                    )
 
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -276,14 +325,20 @@ class LearnerStore:
     def _tx(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
             conn = self._conn()
-            conn.execute("BEGIN IMMEDIATE;")
+            nested = conn.in_transaction
+            savepoint = "nested_" + uuid.uuid4().hex
+            conn.execute(f"SAVEPOINT {savepoint}" if nested else "BEGIN IMMEDIATE;")
             try:
                 yield conn
             except Exception:
-                conn.execute("ROLLBACK;")
+                if nested:
+                    conn.execute(f"ROLLBACK TO {savepoint}")
+                    conn.execute(f"RELEASE {savepoint}")
+                else:
+                    conn.execute("ROLLBACK;")
                 raise
             else:
-                conn.execute("COMMIT;")
+                conn.execute(f"RELEASE {savepoint}" if nested else "COMMIT;")
 
     def now(self) -> float:
         return float(self.clock())
@@ -306,11 +361,31 @@ class LearnerStore:
         now = self.now()
         with self._tx() as conn:
             row = conn.execute(
-                "SELECT revision, status FROM project_profiles WHERE project_id = ?",
+                "SELECT revision, status, profile_json FROM project_profiles WHERE project_id = ?",
                 (profile.project_id,),
             ).fetchone()
             if row is not None and row["status"] == "active":
                 raise ValidationError(f"Profile {profile.project_id!r} is already registered")
+            new_root = _canonical_root_path(profile.root_path)
+            binding = conn.execute("SELECT root_digest FROM project_identity_bindings WHERE project_id = ?",
+                                   (profile.project_id,)).fetchone()
+            digest = sha256_bytes(new_root.encode())
+            if row is not None and binding is None:
+                raise ValidationError("Existing tombstone has no identity binding; use a new project identity")
+            if binding is not None and binding["root_digest"] != digest:
+                raise ValidationError("Project identity is bound to a different repository")
+            conn.execute("INSERT OR IGNORE INTO project_identity_bindings VALUES (?, ?)",
+                         (profile.project_id, digest))
+            if new_root:
+                for active_row in conn.execute(
+                    "SELECT project_id, profile_json FROM project_profiles WHERE status = 'active' AND project_id != ?",
+                    (profile.project_id,),
+                ).fetchall():
+                    other = json.loads(active_row["profile_json"])
+                    if _canonical_root_path(str(other.get("root_path") or "")) == new_root:
+                        raise ValidationError(
+                            f"Repository path {new_root!r} is already registered under project {active_row['project_id']!r}"
+                        )
             next_rev = max(profile.revision, (int(row["revision"]) + 1) if row is not None else 1)
             stored = ProjectProfile.from_dict(profile.to_dict() | {"revision": next_rev, "status": "active"})
             payload = json.dumps(stored.to_dict(), sort_keys=True)
@@ -422,6 +497,9 @@ class LearnerStore:
                 prov["revision_note"] = note
             merged["provenance"] = prov
             revised = ProjectProfile.from_dict(merged)
+            new_root = _canonical_root_path(revised.root_path)
+            if new_root != _canonical_root_path(current.root_path):
+                raise ValidationError("Project root cannot change during revision; unregister and register the destination identity")
 
             changed_fields = [
                 k for k in current.to_dict()
@@ -1340,6 +1418,7 @@ class LearnerStore:
         evaluator: str,
         external_release_ref: str | None = None,
         feedback_note: str | None = None,
+        owner_attested: bool = False,
     ) -> OutcomeReference:
         """Store a lightweight outcome reference (not an experiment ledger) and attach a verified observation."""
         now = self.now()
@@ -1390,6 +1469,8 @@ class LearnerStore:
                 {
                     "claim_kind": "verified_observation",
                     "outcome_id": outcome.outcome_id,
+                    "project_id": project_id,
+                    "verification_provenance": "owner_attestation" if owner_attested is True else "unverified_reference",
                     "status": outcome.status,
                     "external_experiment_ref": outcome.external_experiment_ref,
                     "external_release_ref": outcome.external_release_ref,
@@ -1678,6 +1759,11 @@ class LearnerStore:
                 "baseline_calls": baseline,
                 "prior_grant_id": prev_grant.get("grant_id") if prev_grant is not None else None,
             }
+            if unlimited and scope == "flow_learning":
+                owners = self._flow_grant_owners_tx(conn)
+                if len(owners) != 1:
+                    raise ValidationError("flow_learning unlimited grant requires its registered Flow owner")
+                grant["owner_project_id"] = owners[0].project_id
             conn.execute(
                 """
                 INSERT INTO learner_settings(setting_key, value_json, updated_at)
@@ -1849,6 +1935,27 @@ class LearnerStore:
                 f"Local trial grant {grant.get('grant_id')!r} is revoked",
             )
 
+    @staticmethod
+    def _owns_flow_grant(profile: ProjectProfile, grant: dict[str, Any]) -> bool:
+        return (profile.project_id == "flow" and profile.adapter == "flow"
+                and grant.get("owner_project_id") == profile.project_id
+                and Path(profile.root_path).resolve() == _trusted_flow_source())
+
+    @classmethod
+    def _flow_grant_owners_tx(cls, conn: sqlite3.Connection) -> list[ProjectProfile]:
+        profiles = [ProjectProfile.from_dict(json.loads(r["profile_json"])) for r in conn.execute(
+            "SELECT profile_json FROM project_profiles WHERE status = 'active'").fetchall()]
+        return [p for p in profiles if cls._owns_flow_grant(p, {"owner_project_id": p.project_id})]
+
+    @staticmethod
+    def _profile_budget_limit(profile: ProjectProfile, bucket: str) -> int:
+        return {
+            "daily_calls": min(profile.budget.daily_calls, PILOT_MAX_HYDROGEN_CALLS_PER_DAY),
+            "weekly_deep_calls": min(profile.budget.weekly_deep_calls, PILOT_MAX_DEEP_CANDIDATES_PER_WEEK),
+            "weekly_carbon_calls": PILOT_MAX_CARBON_CALLS_PER_WEEK,
+            "daily_fetches": profile.budget.daily_fetches,
+        }[bucket]
+
     def reserve_dispatch(
         self,
         *,
@@ -1898,6 +2005,16 @@ class LearnerStore:
                 )
 
             unlimited_active = self._is_unlimited_active_tx(conn)
+            grant_row = conn.execute("SELECT value_json FROM learner_settings WHERE setting_key = ?", (_TRIAL_SETTING_KEY,)).fetchone()
+            grant = json.loads(grant_row["value_json"]) if grant_row else {}
+            flow_scoped = grant.get("scope") == "flow_learning"
+            if flow_scoped and not grant.get("owner_project_id"):
+                # Pin legacy Flow grants once; profile provenance cannot opt into this authority.
+                owners = self._flow_grant_owners_tx(conn)
+                if len(owners) == 1:
+                    grant["owner_project_id"] = owners[0].project_id
+                    conn.execute("UPDATE learner_settings SET value_json = ? WHERE setting_key = ?",
+                                 (json.dumps(grant, sort_keys=True), _TRIAL_SETTING_KEY))
             cap: int | None
             if project_id == "__shared__":
                 cap = self._compute_shared_cap(conn, budget_bucket, cap_override)
@@ -1916,18 +2033,47 @@ class LearnerStore:
                 profile = ProjectProfile.from_dict(json.loads(prow["profile_json"]))
                 if budget_bucket not in ("daily_calls", "weekly_deep_calls", "weekly_carbon_calls", "daily_fetches"):
                     raise ValidationError(f"Unknown budget_bucket: {budget_bucket!r}")
-                if unlimited_active and budget_bucket in _UNCAPPED_MODEL_BUCKETS:
+                owns_grant = self._owns_flow_grant(profile, grant)
+                legacy_scope = not flow_scoped and not profile.provenance.get("finite_project_budget")
+                if unlimited_active and (owns_grant if flow_scoped else legacy_scope) and budget_bucket in _UNCAPPED_MODEL_BUCKETS:
                     cap = None
-                elif cap_override is not None:
-                    cap = cap_override
-                elif budget_bucket == "daily_calls":
-                    cap = min(profile.budget.daily_calls, PILOT_MAX_HYDROGEN_CALLS_PER_DAY)
-                elif budget_bucket == "weekly_deep_calls":
-                    cap = min(profile.budget.weekly_deep_calls, PILOT_MAX_DEEP_CANDIDATES_PER_WEEK)
-                elif budget_bucket == "weekly_carbon_calls":
-                    cap = PILOT_MAX_CARBON_CALLS_PER_WEEK
                 else:
-                    cap = profile.budget.daily_fetches
+                    cap = self._profile_budget_limit(profile, budget_bucket)
+                    if cap_override is not None:
+                        cap = min(cap, cap_override)
+
+            if flow_scoped and budget_bucket in _UNCAPPED_MODEL_BUCKETS:
+                # Shared pipeline dispatches must also consume each non-owner's finite budget.
+                targets = list(dict.fromkeys(target_project_ids)) if project_id == "__shared__" else [project_id]
+                if project_id == "__shared__" and not targets:
+                    cap = self._shared_envelope_limit(budget_bucket)
+                    if cap_override is not None:
+                        cap = min(cap, cap_override)
+                for target in targets:
+                    target_row = conn.execute(
+                        "SELECT profile_json, status, learning_enabled FROM project_profiles WHERE project_id = ?",
+                        (target,),
+                    ).fetchone()
+                    if target_row is None or target_row["status"] != "active":
+                        raise DispatchBlockedError("not_registered", f"Target {target!r} is not registered")
+                    if not target_row["learning_enabled"]:
+                        raise DispatchBlockedError("learning_disabled", f"Learning is disabled for {target!r}")
+                    target_profile = ProjectProfile.from_dict(json.loads(target_row["profile_json"]))
+                    if self._owns_flow_grant(target_profile, grant):
+                        continue
+                    target_used = conn.execute(
+                        """SELECT COALESCE(SUM(CASE
+                            WHEN d.state = 'settled' THEN COALESCE(d.actual_units, d.units)
+                            WHEN d.state IN ('reserved', 'dispatched', 'unknown') THEN d.units
+                            ELSE 0 END), 0)
+                        FROM dispatch_reservations d LEFT JOIN dispatch_scopes s USING (reservation_id)
+                        WHERE d.budget_bucket = ? AND d.window_key = ? AND
+                            (d.project_id = ? OR (d.project_id = '__shared__' AND EXISTS (
+                                SELECT 1 FROM json_each(s.target_project_ids_json) WHERE value = ?)))""",
+                        (budget_bucket, window, target, target),
+                    ).fetchone()[0]
+                    if target_used + units > self._profile_budget_limit(target_profile, budget_bucket):
+                        raise DispatchBlockedError("budget_exhausted", f"Budget exhausted for target {target}/{budget_bucket}")
 
             self._check_trial_grant_tx(
                 conn,

@@ -1755,6 +1755,8 @@ def assess_pending_work(
             "assessment_summary": summary,
         }
 
+    from learner.feedback import project_scores
+    outcome_scores = {p.project_id: project_scores(store, p.project_id) for p in target_profiles}
     profiles_by_id = {p.project_id: p for p in target_profiles}
     artifacts_by_id = {a.source_id: a for a in store.list_source_artifacts()}
 
@@ -2119,7 +2121,9 @@ def assess_pending_work(
                     elif asmt.last_completed_step == "assessed_deferred":
                         score -= 1  # Refresh new/primary_fetch_deferred items ahead of already-assessed defers.
                     proj_candidates.append((score, asmt))
-        proj_candidates.sort(key=lambda pair: (-pair[0], pair[1].created_at, pair[1].assessment_id))
+        proj_candidates.sort(key=lambda pair: (
+            -pair[0], -outcome_scores[p.project_id].get((pair[1].goal_ref, pair[1].capability_ref), 0.0),
+            pair[1].created_at, pair[1].assessment_id))
         matched_candidates.extend(asmt for _, asmt in proj_candidates)
 
     def _run_metered_primary_fetch(
@@ -3384,6 +3388,14 @@ def run_due(
     start_mono = clock_monotonic()
     deadline_mono = start_mono + min(env.wall_limit_s, PILOT_MAX_WALL_SECONDS)
 
+    # Bounded local IO precedes the shared schedule lease; one project cannot abort others.
+    from learner.feedback import consume_project_outcomes
+    import_errors = {}
+    for profile in active_profiles:
+        try:
+            consume_project_outcomes(store, profile)
+        except (OSError, ValueError, TypeError, RecursionError, LearnerError) as exc:
+            import_errors[profile.project_id] = str(exc)
     store.acquire_lease("schedule:due", lease_owner, ttl_s=min(env.wall_limit_s, PILOT_MAX_WALL_SECONDS))
     try:
         now = store.now()
@@ -3427,7 +3439,8 @@ def run_due(
             else:
                 due_status = "noop"
             return {
-                "status": due_status,
+                "status": "degraded" if import_errors else due_status,
+                "outcome_import_errors": import_errors,
                 "reason": "resumed_pending_work" if did_work and due_status == "ok" else "not_due",
                 "modes_run": [],
                 "assessment": assess_res,
@@ -3548,6 +3561,7 @@ def run_due(
         incomplete = any(c.get("incomplete") for c in all_coverage)
         is_degraded = (
             incomplete
+            or bool(import_errors)
             or bool(intake_errors)
             or bool(plan_errors)
             or assess_res["status"] in ("degraded", "blocked")
@@ -3560,6 +3574,7 @@ def run_due(
         return {
             "status": status,
             "run_id": effective_run_id,
+            "outcome_import_errors": import_errors,
             "modes_run": modes_run,
             "assessments_created": created_total,
             "assessments_deduplicated": deduped_total,
@@ -3793,8 +3808,14 @@ def get_recommendations(
             }
         )
 
-    # Newest first, capped at `limit` (3 by default).
-    items.sort(key=lambda r: float(r["updated_at"]), reverse=True)
+    from learner.feedback import project_scores
+    scores = {pid: project_scores(store, pid) for pid in {i["project_id"] for i in items}}
+    for item in items:
+        a = store.get_assessment(item["assessment_id"])
+        p = profiles[item["project_id"]]
+        item["verified_outcome_rank"] = (scores[a.project_id].get((a.goal_ref, a.capability_ref), 0.0)
+                                         if p.learning_enabled else 0.0)
+    items.sort(key=lambda r: (r["verified_outcome_rank"], float(r["updated_at"])), reverse=True)
     total_available = len(items)
     top_items = items[:limit]
 

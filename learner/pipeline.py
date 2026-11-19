@@ -76,7 +76,8 @@ def draft_profile_from_docs(
             raise ValidationError(f"Doc path escapes root_path: {rel!r}")
         if not target.is_file():
             continue
-        raw = target.read_bytes()[:max_bytes_per_file]
+        with target.open("rb") as stream:
+            raw = stream.read(max_bytes_per_file)
         text = raw.decode("utf-8", errors="replace")
         read_docs.append(str(target.relative_to(root)))
         doc_texts.append(text)
