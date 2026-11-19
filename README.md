@@ -1,14 +1,13 @@
 # flow — an evidence-gated development workflow for coding agents
 
-Bare `$flow-run` resumes authorized work and selects a suitable implementation
-worker using trustworthy capacity evidence and project preference. No parameters
-are needed; natural language such as "use Gemini this time" overrides routing
-within policy-allowed roles. Unknown allowance is recorded honestly, not ranked
-numerically. Existing verified native CLI wrappers are preserved. Coding workers
-use the coding pool configured in your central
-`~/.config/mini-model-routing/policy.json` (Sol / Hydrogen, with Claude fallback
-only when primary coding routes are unavailable); design and required reviews
-use the separate design pool and remain independent of the implementer.
+Bare `$flow-run` resumes authorized work and routes new packages by task class
+(`routine` defaults to Gemini, `complex` to Codex, with mutual backup) under the
+installed owner model policy, trustworthy capacity evidence, and recorded
+implementation outcomes. No parameters are needed; natural language distinguishes
+one-off exact pins ("use Gemini this time"), tolerant preferences, and explicitly
+persisted scoped project defaults. Unknown allowance is recorded honestly, not
+ranked numerically, existing verified native CLI wrappers are preserved, and
+required reviews remain independent of the implementer.
 
 `$model-debate` alone discusses without implementing: one independent blind
 round, then host evidence verification and synthesis. Unresolved disagreement is

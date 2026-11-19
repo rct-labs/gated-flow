@@ -2,10 +2,11 @@
 name: flow-run
 description: >
   The default entry for this workflow: inspect and resume already-authorized
-  project work as the host CLI, automatically choose a suitable available
-  implementation worker (using the owner machine model policy and trustworthy
-  capacity and suitability evidence, overridden by an explicit later
-  natural-language worker choice), write an admission-ready TASK_QUEUE, then
+  project work as the host CLI, deterministically select a suitable available
+  implementation worker via `scripts/route.py` subordinate to the owner machine
+  model policy, trustworthy capacity, and verified task-class outcomes
+  (overridden by an explicit one-off pin, tolerant preference, or persisted
+  scoped project default), write an admission-ready TASK_QUEUE, then
   unattended-run it. It loads $flow and $run for their steps, so the user never
   has to pick between them. Known worker ids: codex, agy (custom
   worker_cmds.agy or an existing verified alias), claude, kimi, grok, pi. Use when the user types $flow-run

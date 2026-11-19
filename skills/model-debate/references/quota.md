@@ -13,16 +13,23 @@ while keeping `scripts/quota_guard.py` strict and unchanged:
   applicable project-required guard.
 - **Ordinary bounded selection (default single-round review or `flow-run` worker
   routing on existing authenticated subscriptions when no formal `READY` gate
-  applies)**: honor owner exclusions and observed exhaustion/near-exhaustion
-  before any probe or call, read available native read-only metadata without
-  inference sweeps, and never use implicit paid fallback or overage. Where a
-  provider has no read-only quota reader (for example Gemini `agy`, Claude/Fable
-  or native `kimi`) or exposes incompatible units, treat `UNKNOWN` as unmeasured—
-  **not** `0`, **not** exhausted, and **not** a comparable numeric rank across
-  percent/currency/token/request units. Within explicit call caps (such as one
-  blind call per seat in default single-round review or bounded `max_model_calls`),
-  select by trustworthy same-unit capacity when comparable and otherwise follow
-  documented project preference (or the available current host) while persisting
+  applies)**: filter by live owner-policy eligibility and availability first—honoring
+  owner exclusions and evidenced exhaustion/near-exhaustion before any probe or call
+  while preserving conditionally eligible fallbacks and never bypassing invalid
+  policy—read available native read-only metadata without inference sweeps, and
+  never use implicit paid fallback or overage. Where a provider has no read-only
+  quota reader (for example Gemini `agy`, Claude/Fable or native `kimi`) or exposes
+  incompatible units, treat `UNKNOWN` as unmeasured—**not** `0`, **not** exhausted,
+  and **not** a comparable numeric rank across percent/currency/token/request units.
+  Within explicit call caps: default single-round review keeps its adviser seat
+  rules untouched (one blind call per seat, selecting by trustworthy comparable
+  same-unit capacity when available or otherwise documented project preference /
+  available current host under default single-round adviser seat rules); `flow-run`
+  (within bounded `max_model_calls`) does no capacity-first re-ranking, ordering
+  eligible choices by **user override > explicit durable preference > learned/default
+  class rank** (`route.py recommend`, or the same class defaults via independent live
+  policy validation if missing; never historic `.gate/config.json` or current host as
+  a durable default, reporting if no authorized eligible route remains). Persist
   `quota: unknown (<reason>)` and freshness timestamps in `CONTEXT.md` or run
   records instead of claiming `READY`.
 

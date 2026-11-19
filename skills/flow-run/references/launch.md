@@ -2,9 +2,7 @@
 
 ## 4. Configure and launch
 
-`.gate/config.json`: `workers` (selected worker first, verified fallbacks after, unless project policy requires exactly one active
-worker; then let the host select a fallback only after reconciling the stopped run),
-`worker_cmds` or `worker_models` when a CLI needs pinned model/effort flags,
+`.gate/config.json`: only an **owner strict pin** (explicit one-off exact worker/model request or policy single-worker rule) constrains `workers` to that single exact worker with no automatic fallback and reconciles conflicting queued row pins while preserving other rows without broadening (reconcile only after stopping). An ordinary queued row worker pin is not a strict owner demand; `gate/gate.py` preserves its fall-through to the run-wide `workers` list. For a **tolerant preference**, explicit durable preference, or `route.py recommend` selection, order `workers` with the primary exact pin first and verified policy-eligible backup(s) (preserving conditionally eligible fallbacks) after, setting `worker_cmds` or `worker_models` to enforce exact model and effort flags,
 `judge.enabled` and `judge.chain` when the project wants a package review,
 `judge.checkpoints` for rows that must be reviewed on their own, `max_model_calls`
 for the run. Keep required reviews independent of the implementation worker:

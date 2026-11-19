@@ -16,32 +16,34 @@ or natural-language worker request overrides automatic selection:
 | pi, openrouter, or an OpenRouter model id | `pi` (set `worker_models.pi`) |
 
 Unknown requested worker name: list the supported ids and stop; never substitute
-silently.
+silently. Distinguish explicit user intent:
 
-When no worker is specified, choose automatically among installed, non-benched
-subscription CLIs:
+- **One-off exact pin** (e.g. "use X this time" or an exact owner model/effort demand): bind strictly for that run with no fallback, constraining `workers` and reconciling only conflicting queued row pins while preserving other rows without broadening; do not persist as project default, and do not feed route-order learning. An ordinary queued row worker pin is not a strict owner demand—`gate/gate.py` preserves its fall-through to the run-wide `workers` list.
+- **Tolerant preference** (e.g. "prefer X"): place X first with verified policy-eligible fallbacks (preserving conditionally eligible fallbacks); do not persist as project default unless asked.
+- **Explicitly persisted scoped project default** (durable preference, e.g. "default this repo/class to X"): save the scoped default in `CONTEXT.md` (and apply to `.gate/config.json`) only when explicitly requested; never treat historic `.gate/config.json` state or the current host CLI as a durable default.
 
-- **Eligibility**: apply the [owner model-policy authority](../../../docs/autonomy.md#model-routing-authority).
-  An explicit CLI choice does not authorize a model outside its allowed role.
-  A custom worker needs a verified headless edit/shell/git contract in
-  `worker_cmds`; tools-off success is not coding capability. The first useful
-  authorized implementation call establishes live capability; no trial ping.
+Filter candidates by live policy eligibility and availability first, then order eligible choices by **user override > explicit durable preference > learned/default class rank** among installed, non-benched subscription CLIs:
+
+- **Eligibility vs entitlement**: apply the [owner model-policy authority](../../../docs/autonomy.md#model-routing-authority) first; all overrides, preferences, and helper rankings are subordinate to live installed policy, and missing or invalid policy is never bypassed. Filter out policy-ineligible, unavailable, owner-excluded, or evidenced-exhausted choices while preserving conditionally eligible fallbacks; if no authorized eligible route remains, stop and report. Local CLI presence, `--help` model visibility, or a `route.py` candidate entry shows candidate visibility only—never subscription entitlement, role permission, or paid/overage allowance. An explicit CLI choice does not authorize a model outside its allowed role. A custom worker needs a verified headless edit/shell/git contract in `worker_cmds`; tools-off success is not coding capability. The first useful authorized implementation call establishes live capability; never run benchmarks, trial pings, or probes.
+- **Deterministic class routing (`route.py recommend`)**: for a **new** package (unless an owner strict pin locks a single worker), classify the package as `routine` or `complex` and run `python3 "$(flow home)/skills/flow-run/scripts/route.py" recommend --repo . --class routine` (use `--class complex` when appropriate) to obtain learned/default exact model+effort pins and reason, ordered behind any tolerant user override or explicit durable preference. On resume of an active stopped package, keep its reconciled current pin while it remains live-policy eligible and available unless overridden; if the resumed pin is blocked/missing or `route.py` is unavailable, apply any explicit durable preference in `CONTEXT.md`, otherwise validate the same class defaults (`routine` to Gemini and `complex` to Codex with mutual backup) independently against live owner policy—never use historic `.gate/config.json` or the current host CLI as a durable default, and report if no authorized eligible route remains. Vendor docs state model tier positioning as facts ([Antigravity models](https://antigravity.google/docs/models), [OpenAI model selection](https://developers.openai.com/api/docs/guides/model-selection)), whereas Flow's chosen defaults route `routine` to Gemini and `complex` to Codex with mutual backup. Qualifying backup rescues adjust subsequent class order; a policy-confirmed same-role successor takes its predecessor's slot with zeroed scores, and an unsuccessful trial is demoted after two attributable implementation failures. Empty history is neutral/untested—never report empty state as "good".
 - **Honest quota handling**: read only local/read-only capacity evidence that is
   already available; never run an inference quota sweep (`flow usage` or
   candidate pings) and never use an implicit paid API or overage fallback.
   `UNKNOWN` metadata and cross-unit allowances (percent vs currency vs tokens vs
   requests) are never treated as `0`/exhausted and must not be ranked as
-  comparable numeric capacity. When trustworthy comparable capacity cannot decide (same units alone are insufficient
-  without account scope, window/reset time and task-cost context),
-  follow the documented project preference in `.gate/config.json` / `CONTEXT.md`
-  (otherwise the available current host CLI if coding-capable) and state the
-  explicit unknown-quota rationale.
+  comparable numeric capacity (same units alone are also insufficient without
+  account scope, window/reset time and task-cost context). Evidenced lack of
+  capacity filters choices first while preserving conditionally eligible
+  fallbacks; `flow-run` does no capacity-first re-ranking among eligible choices,
+  keeping **user override > explicit durable preference > learned/default rank**
+  and stating observed freshness or the explicit unknown-quota rationale.
 - **Persistence**: keep inter-model packets, worker prompts and machine state
   in English; report in the user's language. Say `host: <CLI> / worker: <id>
-  (<pin or auto rationale>)`. Save the role/model/effort choice and capacity
+  (<pin or auto rationale>)`. Save the role/model/effort choice, route reason, and capacity
   freshness or `unknown` in existing CONTEXT and stopped-run configuration.
-  Reconcile prompts, models and queue pins before admission; do not modify a
-  running configuration or closed receipts.
+  Reconcile prompts, models and any conflicting queue pins (preserving other rows
+  without broadening) before admission; do not modify a running configuration or
+  closed receipts.
 
 ## 1. Inspect (always)
 
