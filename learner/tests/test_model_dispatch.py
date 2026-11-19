@@ -78,6 +78,76 @@ class ModelDispatchTests(unittest.TestCase):
         os.chmod(cli_path, os.stat(cli_path).st_mode | stat.S_IEXEC)
         return cli_path
 
+    def test_hydrogen_role_accepts_only_exact_owner_high_pins(self) -> None:
+        policy_path, _ = self._write_routing_files()
+        baseline = json.loads(policy_path.read_text(encoding="utf-8"))
+
+        for model in ("gemini-4-neon-high", "gemini-4-hydrogen-high"):
+            with self.subTest(model=model):
+                data = json.loads(json.dumps(baseline))
+                data["coding"]["gemini"]["model"] = model
+                policy_path.write_text(json.dumps(data), encoding="utf-8")
+                pin, err = model_dispatch.resolve_policy_pin("hydrogen", policy_path=policy_path)
+                self.assertIsNone(err)
+                self.assertIsNotNone(pin)
+                assert pin is not None
+                self.assertEqual((pin.role, pin.model, pin.effort), ("hydrogen", model, "high"))
+                self.assertEqual(pin.policy_path, str(policy_path))
+                self.assertTrue(pin.subscription_only)
+                self.assertFalse(pin.automatic_paid_fallback)
+                carbon, err = model_dispatch.resolve_policy_pin("carbon", policy_path=policy_path)
+                self.assertIsNone(err)
+                assert carbon is not None
+                self.assertEqual((carbon.model, carbon.effort), ("gemini-4-carbon-medium", "medium"))
+
+                # Exercise receipt pinning offline, without invoking a CLI.
+                runner = model_dispatch.FixtureModelRunner(lambda role, prompt: {"ok": True}, policy_path=policy_path)
+                receipt = runner.invoke("hydrogen", "ping")
+                self.assertEqual(receipt.status, "ok")
+                self.assertEqual(receipt.role, "hydrogen")
+                self.assertEqual(receipt.requested_model, model)
+                self.assertEqual(receipt.returned_model, model)
+                self.assertEqual(receipt.requested_effort, "high")
+
+        for model, effort in (
+            ("gemini-4-neon-high", "medium"),
+            ("gemini-4-hydrogen-high", "medium"),
+            ("gemini-4-neon-high", "HIGH"),
+            ("gemini-4-carbon-medium", "high"),
+            ("other-gemini-4-neon-high", "high"),
+            ("gemini-4-neon-high-preview", "high"),
+            ("gemini-4-hydrogen-high-preview", "high"),
+            ("claude-hydrogen-high", "high"),
+            ("claude-neon-high", "high"),
+        ):
+            with self.subTest(model=model, effort=effort):
+                data = json.loads(json.dumps(baseline))
+                data["coding"]["gemini"] = {"model": model, "effort": effort}
+                policy_path.write_text(json.dumps(data), encoding="utf-8")
+                pin, err = model_dispatch.resolve_policy_pin("hydrogen", policy_path=policy_path)
+                self.assertIsNone(pin)
+                self.assertEqual(err, f"policy_hydrogen_mismatch:{model}:{effort}")
+
+        for model in ("gemini-4-neon-high", "gemini-4-hydrogen-high"):
+            for flag, value in (("enabled", False), ("disabled", True)):
+                with self.subTest(model=model, flag=flag):
+                    data = json.loads(json.dumps(baseline))
+                    data["coding"]["gemini"].update(model=model, **{flag: value})
+                    policy_path.write_text(json.dumps(data), encoding="utf-8")
+                    pin, err = model_dispatch.resolve_policy_pin("hydrogen", policy_path=policy_path)
+                    self.assertIsNone(pin)
+                    self.assertEqual(err, "model_disabled:hydrogen")
+
+            data = json.loads(json.dumps(baseline))
+            data["design"]["gemini"] = {"model": model, "effort": "high"}
+            policy_path.write_text(json.dumps(data), encoding="utf-8")
+            pin, err = model_dispatch.resolve_policy_pin("carbon", policy_path=policy_path)
+            self.assertIsNone(pin)
+            self.assertEqual(err, f"policy_carbon_mismatch:{model}:high")
+
+        with self.assertRaises(model_dispatch.ValidationError):
+            model_dispatch.resolve_policy_pin("neon", policy_path=policy_path)
+
     def test_tools_off_prompt_supplies_current_routing_docs_digests_and_blind_symmetry(self) -> None:
         policy_path, doc_path = self._write_routing_files(policy_note="rev1")
         assert doc_path is not None

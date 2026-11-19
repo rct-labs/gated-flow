@@ -139,7 +139,10 @@ def resolve_policy_pin(
 
     model_clean = model.strip()
     effort_clean = effort.strip()
-    if role == "hydrogen" and ("hydrogen" not in model_clean.lower() or effort_clean != "high"):
+    # Hydrogen is a stable internal role; the owner policy pins its concrete model.
+    if role == "hydrogen" and (
+        model_clean not in ("gemini-4-neon-high", "gemini-4-hydrogen-high") or effort_clean != "high"
+    ):
         return None, f"policy_hydrogen_mismatch:{model_clean}:{effort_clean}"
     if role == "carbon" and ("carbon" not in model_clean.lower() or effort_clean != "medium"):
         return None, f"policy_carbon_mismatch:{model_clean}:{effort_clean}"
