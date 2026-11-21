@@ -47,3 +47,13 @@ on every poll. Do not run `flow usage` at startup; normal execution dispatches u
 | `needs_approval:<id>` | irreversible path without `approved:` | the user approves that task, then relaunch |
 
 Stopping is good. The only unacceptable outcome is a green light that lies.
+
+
+Technical escalation or a mapped repair retaining all blockers now arranges one
+blind senior consultation round in the gate. Read the reported episode in
+`.gate/consult/state.json` once, check both replies against primary evidence and
+record one repair/test plus dissent using `flow consult-settle`. Pending seats,
+outages and unresolved advice remain holds; do not repeat an unchanged review or
+reset reservations. Advice cannot settle acceptance. Follow
+[host settlement](../../../docs/autonomy.md#senior-consultation-after-technical-rejection)
+and hand the repair to the coding pool before fresh independent review.

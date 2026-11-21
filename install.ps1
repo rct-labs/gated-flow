@@ -106,6 +106,9 @@ foreach ($cap in Get-Skills) {
 
     Remove-Target $canon
     Copy-Item $cap.FullName $canon -Recurse -Force
+    if ($name -eq 'flow-run') {
+        Copy-Item (Join-Path $root 'gate/model_routes.py') (Join-Path $canon 'scripts/model_routes.py') -Force
+    }
     "canonical $name -> $canon"
     Link-Or-Copy $name $canon (Join-Path $claudeRoot $name)
     Link-Or-Copy $name $canon (Join-Path $codexRoot $name)

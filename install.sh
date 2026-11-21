@@ -70,6 +70,9 @@ for s in "${skills[@]}"; do
     mkdir -p "$d"
     rm -rf "$d/$s"
     cp -r "$src" "$d/$s"
+    if [[ "$s" == flow-run ]]; then
+      cp "$REPO_DIR/gate/model_routes.py" "$d/$s/scripts/model_routes.py"
+    fi
     echo "installed $s -> $d/$s"
   done
 done

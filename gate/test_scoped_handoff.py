@@ -130,6 +130,12 @@ class ScopedHandoffExtractionTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.gate = load_gate_module()
+        # Portable contract fixture: this installation has no machine owner policy.
+        portable_home = tempfile.TemporaryDirectory()
+        self.addCleanup(portable_home.cleanup)
+        home_env = mock.patch.dict(os.environ, HOME=portable_home.name)
+        home_env.start()
+        self.addCleanup(home_env.stop)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()

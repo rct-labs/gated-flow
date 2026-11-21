@@ -76,3 +76,30 @@ full acceptance: PASS, 561 passed
 ```
 
 If heartbeats stop for much longer than the interval, say so.
+
+### Supervised batches
+
+`flow supervise watch` owns a separate persisted byte cursor and one OS watcher
+lease. It performs a bounded local tick about every 30 minutes; duplicate ticks
+skip journal reads, healthy idle produces no update, and meaningful events go to
+the exact origin session through the selected Codex UUID adapter or registered
+IPC receiver. Idle ticks use no model/network. A meaningful pending native
+notification may consume one status turn from the same cumulative budget; it
+waits for a nonbusy runner, and stop prevents dispatch. Exact thread plus turn
+completion is delivery evidence; ambiguous starts require host reconciliation.
+Missing transport/ACK remains `pending`;
+inspect `flow supervise status` on reconnect instead of starting another thread.
+
+Use `flow supervise stop --repo ...` for a durable user stop. It serializes with
+dispatch reservation and survives process restarts. Clean interrupted work may
+resume only inside the immutable batch and cumulative budgets; outstanding calls,
+claimed tasks, edits, ownership uncertainty or repeated failures require the
+responsible host. Host holds never auto-clear merely because files later look
+clean. Boot/process-start identities prevent a reused PID from masquerading as
+its original owner. `run_end` alone is never package completion: relay actual
+gate settlement/stage, unavailable reviews and remaining delivery acceptance.
+
+Clean `no_workers` endings wait for a changed local eligible route/cooldown expiry,
+without live probes. `flow supervise resume --repo ...` is an explicit same-owner
+reconciliation after effects and rows are resolved, preserving scope and limits.
+A separately authorized new batch archives settled/stopped evidence automatically.

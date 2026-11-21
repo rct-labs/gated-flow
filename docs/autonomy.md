@@ -648,3 +648,54 @@ design choice. Run `flow learn feedback` only when an actual learner-tracked
 item and applicable supported command apply (no new CLI behavior); never claim
 learner database persistence unless it occurred, and record owner-curated source
 notes in existing `evidence.md`.
+
+
+## Senior consultation after technical rejection
+
+A first concrete rejection allows one targeted repair. An explicit technical
+escalation/dispute, or a mapped repair retaining all earlier blockers, arranges
+one blind round through the gate's existing read-only review invocation contracts.
+Healthy review, routing and idle supervision add no model calls. Infrastructure
+failures are unavailable reviews, not technical rejections; human authorization
+remains an owner decision. Actual acceptance reviewers remain independent of the
+actual implementer, including after fallback. Advisers use fresh sessions and may
+share an implementer's provider; they never supply acceptance.
+
+`flow review --repo . --tasks FIX --base <accepted-base>` uses the same coordinator
+as ordinary run/checkpoint review. Read `.gate/consult/state.json` and the review
+packet once when a consultation is reported. The two advisers receive identical
+bounded facts, never each other's replies. Inspect the diagnoses against the
+actual diff, acceptance, failed evidence and proposed discriminating test. Record
+one actionable repair and disposition of any dissent in a local JSON file:
+
+```json
+{"status":"ready","evidence_checked":"specific assertion/diff checked and result",
+ "dissent":"specific disagreement and evidence-based disposition, or none",
+ "repair":"one scoped change for the coding pool","test":"concrete discriminating regression"}
+```
+
+Then run `flow consult-settle --repo . --tasks FIX --episode <id>
+--disposition <json-file>` (on one shell line). Use `blocked` instead of `ready`
+when evidence cannot resolve the advice. Settlement is local host attestation,
+not an automated proof of correctness. A ready disposition permits one coding
+handoff; it cannot approve tests/review, bypass a stop or reset existing budgets.
+The repaired candidate needs a fresh independent review and existing checks.
+
+Counter semantics: two seat reservations per episode, at most four consultation
+reservations per task lineage across runs, stages and task regrouping. Each reservation is spent
+before dispatch, even on an outage or uncertain crash. The supervised cumulative
+owner counter reserves both seats atomically and checks stop/deadline at each
+spawn. Normal run counters count actual calls separately; no probes are added.
+One OS lease serializes reviews, reservations and host settlement. A reserved
+seat is never automatically replayed. Successful partial replies are retained;
+a partial or uncertain round stays pending for host reconciliation. A round with
+no reservations can be retried explicitly when seats/budget become available.
+
+Receipts bind substantive tracked tree content, original tasks/package/queue,
+review contract (including scope and policy) and the preceding episode. Notes,
+queue status, run IDs and restarts cannot buy another review of an unchanged
+rejected candidate. New task IDs do not share history merely because BUG IDs
+match. State is bounded and fails closed if damaged; do not delete it to recover
+budget. Owner hosts resolve exact design pins from central JSON and local
+availability; portable hosts require explicit project chains and argv contracts.
+No inferred Opus eligibility, paid default or model call from idle supervision.

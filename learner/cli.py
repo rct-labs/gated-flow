@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 from pathlib import Path
 import sys
@@ -169,6 +170,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="Emit JSON output")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_inventory = sub.add_parser("inventory", parents=[common], help="Local model inventory and explicit owner observations; no inference")
+    p_inventory.add_argument("action", choices=("status", "refresh", "exclude-fable", "release-fable", "recheck"))
+    p_inventory.add_argument("--model", help="Exact subscription model for recheck (default: current Fable)")
+    p_inventory.add_argument("--route", default="claude", help="Native subscription route for recheck")
+    p_inventory.add_argument("--cache", help="Explicit machine inventory path (default: per-user Flow cache)")
+    p_inventory.add_argument("--catalog", action="append", default=[], metavar="ROUTE=PATH")
+    p_inventory.add_argument("--reason", default="")
+    p_inventory.add_argument("--reviewed-hints", help="JSON object with a sources list: model, provider, reviewed_at, reviewed_by and dated secondary evidence")
+    p_inventory.add_argument("--live", action="store_true", help="Discover native agy catalog and fetch bounded release/capability hints")
+
     p_draft = sub.add_parser("draft", parents=[common], help="Build an unregistered profile draft from bounded docs")
     p_draft.add_argument("--project-id", required=True)
     p_draft.add_argument("--root-path", required=True)
@@ -301,6 +312,55 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        if args.command == "inventory":
+            if not (Path(__file__).resolve().parents[1] / "gate/model_routes.py").is_file():
+                raise LearnerError("inventory requires the shared Flow runtime; standalone learning remains available")
+            from learner import model_inventory as inventory
+            cache = Path(args.cache) if args.cache else inventory.inventory_path()
+            if args.action == "status":
+                payload = inventory.read_json(cache)
+            elif args.action == "recheck":
+                payload = inventory.recheck_subscription(args.model, route=args.route, reason=args.reason, path=cache)
+            elif args.action in ("exclude-fable", "release-fable"):
+                payload = inventory.exclude_current_fable(args.reason, path=cache, release=args.action == "release-fable")
+            else:
+                catalogs = None
+                if args.catalog:
+                    catalogs = {}
+                    for item in args.catalog:
+                        route, sep, path = item.partition("=")
+                        if not sep or not route or not path: raise LearnerError("catalog requires ROUTE=PATH")
+                        catalogs[route] = Path(path)
+                sources = inventory.PRIMARY_SOURCES
+                if args.reviewed_hints:
+                    sources = inventory.read_json(Path(args.reviewed_hints)).get("sources", [])
+                    if not isinstance(sources, list) or not sources:
+                        raise LearnerError("reviewed hints require a nonempty sources list")
+                if args.live:
+                    # Reuse immutable evidence storage; no project enrollment or inference.
+                    with closing(LearnerStore(args.storage_root)) as evidence_store:
+                        payload = inventory.refresh_due(path=cache,
+                            collector=lambda: inventory.collect_local(catalogs=catalogs, native_agy=True),
+                            hint_collector=lambda: inventory.collect_hints(evidence_store, HttpTransport(), sources=sources),
+                            account_collector=inventory.collect_claude_account)
+                else:
+                    payload = inventory.refresh_due(path=cache, collector=lambda: inventory.collect_local(catalogs=catalogs))
+            summary = json.dumps(payload, sort_keys=True)
+            _emit(payload, as_json=args.json, summary=summary)
+            if args.action == "status" and not args.json:
+                hints = []
+                for row in payload.get('observations', []):
+                    route, model = row.get('route'), row.get('model')
+                    if not route or not model or model == '*':
+                        continue
+                    scope = inventory.routes.account_scope(route)
+                    hint = inventory.routes.credit_hold_hint(route, model, state=payload,
+                                                             scope=scope, cache=args.cache)
+                    if hint and hint not in hints:
+                        hints.append(hint)
+                if hints:
+                    print('\n'.join(hints), file=sys.stderr)
+            return 0
         if args.command == "draft":
             draft = draft_profile_from_docs(
                 args.project_id,
@@ -503,6 +563,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 else:
                     raise LearnerError("Offline by default: pass --fixture-map <file> or explicit --live")
                 if args.command == "due":
+                    live_inventory = args.live and (Path(__file__).resolve().parents[1] / "gate/model_routes.py").is_file()
+                    if live_inventory:
+                        from learner import model_inventory as inventory
                     result = run_due(
                         store,
                         transport,
@@ -511,6 +574,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                         arxiv_query=args.arxiv_query,
                         plan_queries=args.plan_queries,
                         refresh_deferred=args.refresh_deferred,
+                        inventory_refresh=(lambda: inventory.refresh_due(
+                            collector=lambda: inventory.collect_local(native_agy=True),
+                            hint_collector=lambda: inventory.collect_hints(store, transport),
+                            account_collector=inventory.collect_claude_account)) if live_inventory else None,
                     )
                 else:
                     result = run_review(

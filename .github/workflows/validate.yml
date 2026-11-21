@@ -14,7 +14,7 @@ jobs:
           python-version: '3.12'
       - run: python scripts/verify_repository.py
       - run: bash -n install.sh gate/selftest.sh gate/watch-journal.sh
-      - run: python -m py_compile gate/gate.py gate/model_policy.py gate/review_packet.py gate/usage.py gate/worker_result.py flow/flow.py flow/audit.py flow/continuity.py flow/learning.py flow/publication.py flow/release.py flow/skills.py learner/__init__.py learner/__main__.py learner/assessment.py learner/cli.py learner/contracts.py learner/model_dispatch.py learner/pipeline.py learner/privacy.py learner/sources.py learner/store.py
+      - run: python -m py_compile gate/gate.py gate/model_policy.py gate/model_routes.py gate/review_consult.py gate/review_packet.py gate/usage.py gate/worker_result.py flow/flow.py flow/supervision.py flow/audit.py flow/continuity.py flow/learning.py flow/publication.py flow/release.py flow/skills.py learner/__init__.py learner/__main__.py learner/assessment.py learner/cli.py learner/contracts.py learner/model_dispatch.py learner/model_inventory.py learner/pipeline.py learner/privacy.py learner/sources.py learner/store.py
   gate-tests:
     runs-on: ubuntu-latest
     steps:
@@ -35,5 +35,8 @@ jobs:
           HOME="$SMOKE_HOME" FLOW_BIN_DIR="$SMOKE_HOME/.local/bin" bash install.sh
           RUNTIME="$(HOME="$SMOKE_HOME" "$SMOKE_HOME/.local/bin/flow" home)"
           test -d "$RUNTIME/learner"
+          test -f "$RUNTIME/flow/supervision.py"
+          test -f "$RUNTIME/gate/review_consult.py"
+          cmp "$RUNTIME/gate/model_routes.py" "$SMOKE_HOME/.codex/skills/flow-run/scripts/model_routes.py"
           HOME="$SMOKE_HOME" "$SMOKE_HOME/.local/bin/flow" learn --storage-root "$RUNNER_TEMP/smoke-store" status --json >/dev/null
           (cd "$RUNNER_TEMP" && env -u PYTHONPATH python -I -B -c "import json, sys; sys.path.insert(0, '$RUNTIME'); import learner, learner.cli; assert 'flow' not in sys.modules and 'gate' not in sys.modules; raise SystemExit(learner.cli.main(['--storage-root', '$RUNNER_TEMP/smoke-store-iso', 'status', '--json']))") >/dev/null

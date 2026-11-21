@@ -2,15 +2,40 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 from pathlib import Path
 import random
+import re
+import shutil
 import sqlite3
 import sys
 import time
 from typing import Any
+
+_route_parents = Path(__file__).resolve().parents
+_route_source = (_route_parents[3] / "gate" / "model_routes.py"
+                 if len(_route_parents) > 3 else Path(__file__).with_name("model_routes.py"))
+if not _route_source.is_file():
+    _route_source = Path(__file__).with_name("model_routes.py")
+if not _route_source.is_file():
+    # Copied skills resolve the shared runtime through the existing installer
+    # shim protocol. Read its fixed template; never execute shell contents or
+    # spend another Python startup on normal local route selection.
+    _shim = shutil.which("flow")
+    if _shim:
+        with Path(_shim).open("rb") as _stream:
+            _shim_text = _stream.read(8193).decode("utf-8", errors="replace")
+        _match = re.fullmatch(r'#!/bin/sh\nexec (?:python|python3) "([^"\n]+)/flow/flow.py" "\$@"\n', _shim_text)
+        if _match:
+            _route_source = Path(_match[1]) / "gate/model_routes.py"
+_spec = importlib.util.spec_from_file_location("_flow_model_routes", _route_source)
+if _spec is None or _spec.loader is None:
+    raise ImportError("Cannot load shared model route eligibility")
+_routes = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_routes)
 
 ROLES = ("gemini", "codex")
 CLASSES = ("routine", "complex")
@@ -352,11 +377,31 @@ def cmd_recommend(repo: Path, task_class: str) -> dict[str, Any]:
         "effort": b_pin.effort,
         "pin": b_pin.label,
     }
+    try:
+        inventory = _routes.read_json(_routes.inventory_path())
+        ranked, excluded = [], []
+        for obj in (primary_obj, backup_obj):
+            blocked = _routes.unavailable(obj["role"], obj["model"], state=inventory)
+            if blocked:
+                excluded.append(dict(obj, eligibility=blocked))
+            else:
+                ranked.append(obj)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        raise RoutingError(f"Invalid local eligibility state: {exc}") from exc
+    if not ranked:
+        raise RoutingError("No eligible local coding route; no discovery or inference attempted")
+    for rank, obj in enumerate(ranked, 1): obj["rank"] = rank
+    primary_obj = ranked[0]
+    backup_obj = ranked[1] if len(ranked) > 1 else None
+    if excluded:
+        reason += " Local exclusions: " + ", ".join(o["role"] + ":" + o["eligibility"] for o in excluded) + "."
     return {
         "class": task_class,
-        "ranked": [primary_obj, backup_obj],
+        "ranked": ranked,
+        "excluded": excluded,
+        "capacity": "unknown unless locally evidenced; catalog visibility is not entitlement",
         "primary": {k: v for k, v in primary_obj.items() if k != "rank"},
-        "backup": {k: v for k, v in backup_obj.items() if k != "rank"},
+        "backup": {k: v for k, v in backup_obj.items() if k != "rank"} if backup_obj else None,
         "provisional": is_provisional,
         "epoch": state.epoch,
         "reason": reason,

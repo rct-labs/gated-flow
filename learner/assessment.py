@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
+from pathlib import Path
 import json
 import re
 import time
@@ -3370,6 +3371,7 @@ def run_due(
     lease_owner: str = "due-scheduler",
     clock_monotonic: Callable[[], float] = time.monotonic,
     run_id: str | None = None,
+    inventory_refresh: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Single scheduled CLI entry handling daily opportunity-led sweep and weekly project-led review fairly."""
     env = envelope or SharedEnvelope()
@@ -3383,6 +3385,16 @@ def run_due(
             "coverage": [],
         }
 
+    # Independent seven-day discovery cache; never an inference call or a wait
+    # for another refresh. Fixture/API use stays inside the explicit store root.
+    if inventory_refresh:
+        inventory_result = inventory_refresh()
+    elif (Path(__file__).resolve().parents[1] / "gate/model_routes.py").is_file():
+        from learner.model_inventory import refresh_due
+        inventory_result = refresh_due(path=store.storage_root / "model-inventory.json", now=store.now())
+    else:
+        # The separately packaged learner has no dependency on Flow's gate.
+        inventory_result = {"status": "unavailable", "reason": "shared_flow_runtime_absent"}
     runner = model_runner or AgyCliRunner()
     effective_run_id = run_id or f"due_{uuid.uuid4().hex[:12]}"
     start_mono = clock_monotonic()
@@ -3441,6 +3453,7 @@ def run_due(
             return {
                 "status": "degraded" if import_errors else due_status,
                 "outcome_import_errors": import_errors,
+                "model_inventory": inventory_result,
                 "reason": "resumed_pending_work" if did_work and due_status == "ok" else "not_due",
                 "modes_run": [],
                 "assessment": assess_res,
@@ -3575,6 +3588,7 @@ def run_due(
             "status": status,
             "run_id": effective_run_id,
             "outcome_import_errors": import_errors,
+            "model_inventory": inventory_result,
             "modes_run": modes_run,
             "assessments_created": created_total,
             "assessments_deduplicated": deduped_total,

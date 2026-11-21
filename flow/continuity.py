@@ -469,6 +469,8 @@ def _summarize_meaningful_event(c: dict, raw_ev: dict) -> str:
         score = _nonneg_number(c.get("score"))
         return (f"review_verdict passed={passed}"
                 + (f" score={int(score) if score.is_integer() else score}" if score is not None else ""))
+    if ev_name in ("review_consultation", "review_consultation_settled"):
+        return f"{ev_name} ({_clean_str(c.get('status'), 64) or 'pending'})"
     if ev_name == "review_skipped":
         return f"review_skipped ({_clean_str(c.get('reason'), 128) or _clean_str(c.get('outcome'), 64) or '?'})"
     if ev_name == "review_findings":
@@ -1397,6 +1399,19 @@ def build_resume(
         sec = parsed["sections"].get(n)
         sections[n] = {"title": sec["title"], "line": sec["line"], "body": sec["body"]} if sec else None
     next_step = sections[4]["body"] if sections.get(4) else []
+    supervision = {"phase": "unbound"}
+    supervision_path = p.root / ".gate/supervision/state.json"
+    if supervision_path.exists():
+        try:
+            if supervision_path.stat().st_size > 256 * 1024:
+                raise ValueError("oversized supervision record")
+            saved = json.loads(supervision_path.read_text(encoding="utf-8"))
+            if not isinstance(saved, dict) or saved.get("repo") != str(p.root):
+                raise ValueError("invalid supervision repository binding")
+            supervision = {key: saved.get(key) for key in
+                           ("session", "phase", "stopped", "pending", "reason", "accepted")}
+        except (OSError, ValueError, TypeError) as exc:
+            supervision = {"phase": "needs_host", "reason": str(exc)}
     learning = _learning_summary(
         p,
         include_status=include_learning_status,
@@ -1414,6 +1429,7 @@ def build_resume(
         "publication": pub,
         "work_packages": wp,
         "learning": learning,
+        "supervision": supervision,
         "warnings": warnings,
         "gate_overrides": overrides,
         "next_step": next_step,
@@ -1432,6 +1448,8 @@ def _clip(lines: list[str], n: int, width: int = 200) -> list[str]:
 def render_resume(r: dict, max_chars: int) -> str:
     L: list[str] = []
     pj, c, g, q, gf = r["project"], r["context"], r["git"], r["queue"], r["gate"]
+    if r.get("supervision", {}).get("phase") != "unbound":
+        L.append("Supervision: " + json.dumps(r["supervision"], ensure_ascii=False)[:1600])
     L.append(f"# flow resume - {pj['root']}" + (f" (prefix {pj['prefix']})" if pj["prefix"] else ""))
     L.append("")
     if r["gate_overrides"] or r["warnings"] or pj["diagnostics"] or c["problems"]:

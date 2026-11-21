@@ -138,3 +138,15 @@ Disclose extra calls before launch, and never label a single-round review
 a completed two-round debate. For changes to this skill or an adapter, use
 [acceptance.md](references/acceptance.md); offline checks are the default, and
 live smoke requires a concrete unresolved runtime risk and call budget.
+
+
+## Gate-owned technical consultation
+
+For repeated mapped technical blockers or an explicit technical dispute in a
+native Flow review, reuse the gate-owned two-seat blind round and durable
+`.gate/consult/state.json` receipts. Do not launch an additional debate or replay
+a reserved seat. The host checks primary evidence, records dissent and one
+repair/test with `flow consult-settle`; unresolved advice remains blocked.
+Consultation is never acceptance or permission expansion. Fresh independent
+review remains required after coding. See
+[bounded settlement](../../docs/autonomy.md#senior-consultation-after-technical-rejection).

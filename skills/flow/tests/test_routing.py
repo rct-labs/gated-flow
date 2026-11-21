@@ -56,6 +56,60 @@ class RoutingCLITest(unittest.TestCase):
         self.assertTrue(isinstance(data["reason"], str) and data["reason"] and "\n" not in data["reason"])
         return data
 
+    @unittest.skipIf(os.name == 'nt', 'POSIX installer')
+    def test_installer_copies_shared_module_for_skill_without_shim(self):
+        source = ROUTE_PY.parents[3]
+        env = dict(os.environ, HOME=str(self.home))
+        result = subprocess.run(['bash', str(source / 'install.sh'), '--agent', 'codex',
+                                 '--skill', 'flow-run', '--no-shim'], env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        copied = self.home / '.codex/skills/flow-run/scripts'
+        self.assertEqual((copied / 'model_routes.py').read_bytes(),
+                         (source / 'gate/model_routes.py').read_bytes())
+        result = subprocess.run([sys.executable, str(copied / 'route.py'), 'recommend',
+                                 '--repo', str(self.repo), '--class', 'routine'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['primary']['role'], 'gemini')
+
+    def test_account_outage_filters_routes_without_changing_quality_history(self):
+        import time
+        cache = self.home / '.local/share/flow/model-inventory.json'
+        cache.parent.mkdir(parents=True)
+        cache.write_text(json.dumps({'observations': [dict(
+            route='agy', model='gem-a', status='cooldown', authority='account',
+            observed_at=time.time() - 1, until=time.time() + 1000)]}))
+        data = self.recommend()
+        self.assertEqual(data['primary']['role'], 'codex')
+        self.assertIsNone(data['backup'])
+        self.assertEqual(data['excluded'][0]['eligibility'], 'account_cooldown')
+        self.assertFalse((self.repo / '.gate/routing.sqlite3').exists())
+        cache.write_text(json.dumps({'observations': [dict(
+            route='agy', model='gem-a', status='cooldown', authority='account',
+            observed_at=1, until=2)]}))
+        self.assertEqual(self.recommend()['primary']['role'], 'gemini')
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX installer shim contract')
+    def test_installed_skill_resolves_shared_runtime_without_running_shim(self):
+        skill = self.root / 'copied-skill/scripts/route.py'
+        skill.parent.mkdir(parents=True)
+        skill.write_text(ROUTE_PY.read_text())
+        runtime = self.root / 'release/runtime'
+        (runtime / 'gate').mkdir(parents=True)
+        (runtime / 'gate/model_routes.py').write_text(
+            (ROUTE_PY.parents[3] / 'gate/model_routes.py').read_text())
+        binary = self.home / '.local/bin/flow'
+        binary.parent.mkdir(parents=True)
+        binary.write_text('#!/bin/sh\nexec python3 "' + str(runtime) + '/flow/flow.py" "$@"\n')
+        binary.chmod(0o755)
+        # There is no flow.py in this fixture: executing the shim must fail.
+        env = dict(os.environ, HOME=str(self.home), PATH=str(binary.parent) + os.pathsep + os.environ.get('PATH', ''))
+        result = subprocess.run([sys.executable, str(skill), 'recommend', '--repo', str(self.repo),
+                                 '--class', 'routine'], capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['primary']['role'], 'gemini')
+
     def record(
         self,
         run_id: str,
@@ -122,6 +176,8 @@ class RoutingCLITest(unittest.TestCase):
 
         exec_copy = self.root / "route_exec.py"
         exec_copy.write_text(ROUTE_PY.read_text(encoding="utf-8"), encoding="utf-8")
+        (self.root / "model_routes.py").write_text(
+            (ROUTE_PY.parents[3] / "gate" / "model_routes.py").read_text(), encoding="utf-8")
         exec_copy.chmod(exec_copy.stat().st_mode | stat.S_IXUSR)
         env = dict(os.environ, HOME=str(self.home))
         env.pop("MINI_MODEL_ROUTING_POLICY", None)

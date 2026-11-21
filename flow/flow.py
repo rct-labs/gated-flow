@@ -25,6 +25,8 @@ Usage:
   flow recall QUERY... [--repo DIR] [--limit N] [--json]
   flow publish-verify --repo DIR --remote NAME --branch NAME --expect FULL_SHA [--json]
   flow learn  onboard|check|results|feedback|pause|resume|status [options]
+  flow supervise launch|tick|watch|stop|status|resume [options]
+  flow inventory status|refresh|exclude-fable|release-fable|recheck [options]
   flow skills index|select [options]
   flow admit --plan [--repo DIR]
   flow metrics [--repo DIR] [--last N] [--json]
@@ -269,6 +271,12 @@ def main() -> None:
         if not LEARNING.exists():
             die(f"missing {LEARNING}")
         sys.exit(run_py(LEARNING, rest))
+    if cmd == "supervise":
+        sys.exit(run_py(HERE / "supervision.py", rest))
+    if cmd == "inventory":
+        sys.path.insert(0, str(HERE.parent))
+        from learner.cli import main as learner_main
+        sys.exit(learner_main(["inventory", *rest]))
     if cmd == "skills":
         if not SKILLS_MOD.exists():
             die(f"missing {SKILLS_MOD}")
@@ -278,7 +286,7 @@ def main() -> None:
             die(f"missing {PUBLICATION}")
         sys.exit(run_py(PUBLICATION, rest))
     if cmd in ("admit", "doctor", "run", "verify", "usage", "metrics", "install-hook",
-               "check-commit"):
+               "check-commit", "review", "consult-settle"):
         sys.exit(run_py(GATE, [cmd, *rest]))
     if cmd == "audit-gate":  # gate.py's history audit, distinct from tree audit
         sys.exit(run_py(GATE, ["audit", *rest]))

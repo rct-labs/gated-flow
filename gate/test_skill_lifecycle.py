@@ -113,6 +113,7 @@ def _setup_release_sandbox(tmp_root: Path) -> tuple[Path, Path]:
         (base / "gate" / "gate.py").write_text("print('ok')\n", encoding="utf-8")
         (base / "gate" / "model_policy.py").write_text("policy\n", encoding="utf-8")
         (base / "docs" / "autonomy.md").write_text((ROOT / "docs" / "autonomy.md").read_text(encoding="utf-8"), encoding="utf-8")
+        shutil.copy(ROOT / "docs/usage.md", base / "docs/usage.md")
         (base / "README.md").write_text("flow\n", encoding="utf-8")
         shutil.copytree(ROOT / "skills", base / "skills")
 

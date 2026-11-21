@@ -248,12 +248,30 @@ class SpawnIntegrationTests(unittest.TestCase):
         with patch.object(gate, 'validate_worker', side_effect=AssertionError('probe must bypass')):
             self._allowed_spawn('probe', prompt=gate.PROBE_PROMPT)
 
-    def test_missing_policy_blocks_actual_spawn(self):
-        with patch.object(gate._model_policy, 'POLICY_PATH', self.root / 'missing-policy.json'), \
+    def test_invalid_installed_policy_blocks_actual_spawn(self):
+        with patch.object(gate._model_policy, 'POLICY_PATH', POLICY), \
+             patch.object(gate._model_policy, '_json', side_effect=ValueError('invalid policy')), \
              patch.object(gate, 'resolve_tool', return_value='/native/codex'), \
              patch.object(gate.subprocess, 'Popen') as popen:
             _, error = self.spawn()
             self.assertTrue(error.startswith('model_policy:'))
+            self.assertEqual(gate.RUN_BUDGET['calls'], 0)
+            popen.assert_not_called()
+
+    def test_missing_skill_pinned_policy_blocks_before_dispatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            skill = Mock()
+            skill.resolve_pinned_policy_for_spawn.return_value = (root / 'missing.json', None)
+            with patch.object(gate._model_policy, 'POLICY_PATH', root / 'absent-owner.json'), \
+                 patch.object(gate, 'skills_module', return_value=skill), \
+                 patch.object(gate, 'worker_policy_context', return_value=None), \
+                 patch.object(gate, 'resolve_tool', return_value='/native/codex'), \
+                 patch.object(gate.subprocess, 'Popen') as popen:
+                result, error = gate.spawn_worker(root, self.cfg, 'codex', 'Implement task',
+                                                  root / 'prompt.md', task='FIX')
+            self.assertIsNone(result)
+            self.assertTrue(error.startswith('model_policy:'), error)
             self.assertEqual(gate.RUN_BUDGET['calls'], 0)
             popen.assert_not_called()
 
@@ -277,6 +295,7 @@ class AbsoluteImportTests(unittest.TestCase):
             shutil.copyfile(gate.__file__, gate_path)
             shutil.copyfile(model_policy.__file__, sibling / 'model_policy.py')
             shutil.copyfile(Path(gate.__file__).with_name('usage.py'), sibling / 'usage.py')
+            shutil.copyfile(Path(gate.__file__).with_name('model_routes.py'), sibling / 'model_routes.py')
             original_cwd = Path.cwd()
             try:
                 os.chdir(tmp)

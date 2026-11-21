@@ -355,7 +355,7 @@ class HandoffTests(unittest.TestCase):
             cfg["verify_cmd"] = subprocess.list2cmdline(oracle) if os.name == "nt" else shlex.join(oracle)
             engine_dir = Path(td) / "engine with spaces"
             engine_dir.mkdir()
-            for name in ("gate.py", "model_policy.py", "usage.py", "review_packet.py"):
+            for name in ("gate.py", "model_policy.py", "model_routes.py", "usage.py", "review_packet.py"):
                 shutil.copyfile(Path(self.gate.__file__).parent / name, engine_dir / name)
             with mock.patch.object(self.gate, "__file__", str(engine_dir / "gate.py")):
                 check = self.packet(repo, cfg).split("local check: ", 1)[1].split("  (runs:", 1)[0]
@@ -373,7 +373,8 @@ class HandoffTests(unittest.TestCase):
             path = repo / "spec.md"
             path.write_text("## Acceptance\nKeep acceptance intact.\n")
             packet = self.packet(repo)
-            self.assertNotIn("handoff", packet.lower())
+            self.assertEqual(self.gate.spec_handoff(repo, self.gate.load_config(repo),
+                                                     (repo / "TASK_QUEUE.md").read_text(), "EAV-2"), "")
             self.assertIn("Keep acceptance intact.", packet)
 
     def test_nonancestor_and_git_errors_cannot_claim_freshness(self):
@@ -478,6 +479,12 @@ class PlanningTests(unittest.TestCase):
 class MetricsTests(unittest.TestCase):
     def setUp(self):
         self.gate = load_gate_module()
+        # Portable contract fixture: this installation has no machine owner policy.
+        portable_home = tempfile.TemporaryDirectory()
+        self.addCleanup(portable_home.cleanup)
+        home_env = mock.patch.dict(os.environ, HOME=portable_home.name)
+        home_env.start()
+        self.addCleanup(home_env.stop)
 
     def test_timings_are_separate_and_legacy_unknown_is_not_zero(self):
         events = [

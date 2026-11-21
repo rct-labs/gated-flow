@@ -9,7 +9,7 @@ import time
 
 EVENTS = frozenset('run_start attempt_start task_done worker_left_changes scope_drift '
     'scope_request prompt_too_large review_start review_verdict review_skipped '
-    'review_findings stage_acceptance full_acceptance full_acceptance_wait '
+    'review_consultation review_consultation_settled review_findings stage_acceptance full_acceptance full_acceptance_wait '
     'needs_approval task_end tool_disabled admit_refused run_end '
     'worker_protocol_error worker_error worker_incomplete attempt_timeout '
     'task_mismatch repair_paused package_settled'.split())
@@ -19,7 +19,7 @@ ERROR_EVENTS = frozenset('scope_request prompt_too_large needs_approval admit_re
 FIELDS = ('at', 'event', 'run', 'task', 'worker', 'commit', 'stop', 'result',
           'count', 'reason', 'outcome', 'member', 'verdict', 'log', 'passed', 'score',
           'stage', 'seconds', 'runner_pid', 'holder', 'holder_pid', 'waited_s',
-          'scope', 'attempt', 'err', 'mode', 'retry')
+          'scope', 'attempt', 'err', 'mode', 'retry', 'head', 'episode', 'status')
 MAX_LINE = 256 * 1024
 MAX_READ = 1024 * 1024
 
@@ -27,8 +27,17 @@ MAX_READ = 1024 * 1024
 def save(path, state):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + '.tmp')
-    tmp.write_text(json.dumps(state), encoding='utf-8')
+    with tmp.open('w', encoding='utf-8') as stream:
+        stream.write(json.dumps(state))
+        stream.flush()
+        os.fsync(stream.fileno())
     os.replace(tmp, path)
+    if os.name != 'nt':
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def identity(stream):
@@ -55,8 +64,22 @@ def initialize(journal, cursor):
 
 def compact(event):
     # Do not forward prompts, heartbeat log tails, full config or arbitrary payloads.
-    return {key: (value[:256] if isinstance(value, str) else value)
-            for key in FIELDS if isinstance((value := event.get(key)), (str, int, float, bool))}
+    result = {key: (value[:256] if isinstance(value, str) else value)
+              for key in FIELDS if isinstance((value := event.get(key)), (str, int, float, bool))}
+    tasks = event.get('tasks')
+    if (event.get('event') == 'package_settled' and isinstance(tasks, list)
+            and len(tasks) <= 100 and all(isinstance(t, str) and len(t) <= 80 for t in tasks)):
+        result['tasks'] = tasks
+    return result
+
+
+def process_identity(pid):
+    try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        return [pid, Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                stat[stat.rfind(')') + 2:].split()[19]]
+    except (OSError, IndexError):
+        return None
 
 
 def process_alive(pid):
@@ -78,6 +101,12 @@ def process_alive(pid):
         finally:
             kernel.CloseHandle(handle)
     try:
+        stat = Path(f'/proc/{pid}/stat').read_text()
+        if stat[stat.rfind(')') + 2:].split()[0] in ('Z', 'X'):
+            return False
+    except (OSError, IndexError):
+        pass
+    try:
         os.kill(pid, 0)
         return True
     except ProcessLookupError:
@@ -86,8 +115,8 @@ def process_alive(pid):
         return None
 
 
-def read_events(journal, cursor, limit=20):
-    state = json.loads(cursor.read_text(encoding='utf-8'))
+def read_events(journal, cursor, limit=20, *, state=None, persist=True):
+    state = (json.loads(cursor.read_text(encoding='utf-8')) if state is None else dict(state))
     if state['journal'] != str(journal.resolve()):
         raise ValueError('cursor belongs to a different journal')
     events, consumed, scanned, incomplete = [], 0, 0, False
@@ -135,7 +164,8 @@ def read_events(journal, cursor, limit=20):
                         state['last_activity_at'] = event['at'][:64]
                     if event.get('event') == 'run_start':
                         pid = event.get('runner_pid')
-                        state.update(runner_pid=pid if type(pid) is int and pid > 0 else None,
+                        state.update(runner_identity=event.get("runner_identity"),
+                                     runner_pid=pid if type(pid) is int and pid > 0 else None,
                                      owner_exit_reported=False)
                     elif event.get('event') == 'run_end':
                         state['runner_pid'] = None
@@ -147,16 +177,22 @@ def read_events(journal, cursor, limit=20):
     else:
         more = False
     if (not more and state.get('runner_pid') and not state.get('owner_exit_reported')
-            and process_alive(state['runner_pid']) is False):
+            and (process_alive(state['runner_pid']) is False
+                 or (state.get('runner_identity') and process_identity(state['runner_pid'])
+                     and state['runner_identity'] != process_identity(state['runner_pid'])))):
         events.append({'event': 'run_interrupted', 'reason': 'runner_exited_without_run_end',
                        'runner_pid': state['runner_pid']})
         state['owner_exit_reported'] = True
     state['idle'] = 0 if events else min(state['idle'] + 1, 3)
-    save(cursor, state)
-    return {'status': 'events' if events else 'idle', 'events': events,
+    if persist:
+        save(cursor, state)
+    result = {'status': 'events' if events else 'idle', 'events': events,
             'more': more, 'next_poll_s': 0 if more else (60, 120, 300, 300)[state['idle']],
             'bytes_read': consumed, 'records_scanned': scanned,
             'last_activity_at': state.get('last_activity_at')}
+    if not persist:
+        result['cursor_state'] = state
+    return result
 
 
 def main():

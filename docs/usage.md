@@ -653,3 +653,258 @@ Each worker CLI runs whatever model its own configuration selects, unless
 `.gate/config.json` pins one in `worker_cmds` (the full command line) or, for
 the `pi` worker, in `worker_models.pi` (an OpenRouter model id). The engine
 never reads the host session's model; a queue runs the same way from any CLI.
+
+## Local model inventory
+
+`flow inventory status --json` reads bounded local state without discovery,
+network, inference, or enrollment. When installed, optional role/model/effort policy remains in
+`~/.config/mini-model-routing/policy.json`; inventory visibility never establishes
+entitlement or changes a policy pin. Standalone installations use explicit project worker/reviewer contracts
+without requiring that policy. Normal routing, planning, admission and dispatch
+read local state only and never wait for a learner refresh.
+
+Real-work quota observations are shared across projects by exact route, model
+and account scope, ordered by event time. A successful exit alone never clears a
+limit: native terminal metadata must report the actual matching model. Unknown
+identity stays unknown, and success never clears an owner exclusion. Set an
+opaque `FLOW_ACCOUNT_SCOPE_CODEX`, `FLOW_ACCOUNT_SCOPE_CLAUDE` or
+`FLOW_ACCOUNT_SCOPE_AGY` label consistently in routing and runner environments
+when using separate subscriptions. Known CLI profile/home selectors also split
+scopes using a local hash; credential contents are never inspected. Without a
+binding/profile, `default-login` explicitly assumes one login per CLI route.
+Catalog discovery remains advisory; it does not clear account restrictions.
+
+A terminal native refusal requiring extra usage credits holds that exact
+subscription route/model/profile indefinitely. Rate limits, periodic quota and
+network errors retain their ordinary behavior. The exact historical account
+cooldown reason `Actual subscription CLI requires usage credits; no paid fallback.`
+is treated as a credit hold even after expiry and migrated on the next inventory
+write. Other historical cooldowns remain ordinary. Identified project credit
+holds yield only to newer recheck evidence; ambiguous old project `quota` records
+cannot be attributed to credits and retain their expiry. Historical project
+credit records without an event timestamp use their expiry as the ordering bound.
+
+Weekly live refresh also reads bounded `claude auth status --json`, without
+inference. It records hashed identity/profile and subscriptionType/planTier as a
+baseline. Only changed entitlement signals for the same identity/profile allow
+the next authorized subscription call to revalidate. Missing auth, a changed
+login, catalog/news updates and time alone do not release holds. If identity or
+plan signals are unavailable, or a same-tier grant is invisible to auth status,
+use `flow inventory recheck --model EXACT_MODEL` (defaults to current Fable;
+`--route` defaults to `claude`). This local command permits useful revalidation;
+it makes no provider call and does not claim success. Keep the same profile/scope
+in the command environment as in dispatch. Owner exclusions, regular quota,
+other profiles/models and task budgets remain in force. Another credit refusal
+immediately reinstates the hold. No auth status command runs during selection,
+ordinary dispatch, or fresh/idle inventory ticks.
+
+Inventory is an optional Flow integration. The separately packaged learner keeps
+working without Flow: ordinary status and due commands do not import gate modules;
+due reports inventory unavailable when the shared Flow runtime is absent.
+
+```sh
+# Local catalog files only; an explicit cache keeps fixtures isolated.
+flow inventory refresh --catalog codex=/path/to/models_cache.json --cache /path/to/inventory.json --json
+# Out-of-band discovery through existing subscription/catalog routes; no inference.
+flow inventory refresh --live --json
+# Version-specific source review supplied by the owner/reviewer.
+flow inventory refresh --live --reviewed-hints /path/to/reviewed-hints.json --json
+# Record/release an owner report against the current exact central Fable model.
+flow inventory exclude-fable --reason 'Owner reports this machine unavailable' --json
+flow inventory release-fable --reason 'Owner confirms availability restored' --json
+```
+
+`flow inventory status` retains the existing raw inventory payload on stdout in
+both human and JSON modes. Human mode adds a hint on stderr for effective
+subscription credit holds for models in the current account/profile; no holds
+means no added message. Explicit worker and review pins (including
+Fable audit members) also explain a credit hold when skipped, even if another
+route succeeds. The hint names the exact model, route, profile and last verified
+tier when available, and provides a shell-quoted `flow inventory recheck` command.
+For a different profile, switch to that profile and request status there before
+rechecking. Default-cache guidance uses plain `flow inventory recheck --model
+EXACT_MODEL --route ROUTE`; an explicit `--cache` is preserved exactly and safely
+quoted in status guidance. `--json` adds no hint. These local diagnostics neither check access nor
+release holds automatically; ordinary quota cooldowns do not produce this hint.
+
+The machine cache is `~/.local/share/flow/model-inventory.json`. Existing learner
+`due --live` refreshes it independently every seven days. Offline/API due calls
+use a cache inside their explicit store root and never launch catalog commands.
+Local refresh reads Codex's existing catalog and any explicit `ROUTE=PATH` files;
+`--live` also runs native `agy models`, capped at ten seconds and one MiB. Listings
+record route, exact identifier, CLI version when exposed, source and observation
+time. Missing catalogs and unknown account state remain unknown.
+
+Discovery uses a nonblocking writer lock, atomic replacement and boot/process
+start identity where available. A failed refresh preserves the last-good snapshot;
+a separate attempt timestamp prevents repeated discovery within seven days.
+Readers keep using local stale-good evidence. Release/capability sources for
+OpenAI, Google and Anthropic are advisory, fetched only during explicit live weekly
+refresh through the existing bounded learner HTTPS/evidence facilities. Failed
+hints preserve prior hints from each failed source and report errors separately.
+Stable primary markdown sources provide bounded readable evidence slices,
+literal model/family mentions, links and observation dates. Exact host protection
+and the 64 KiB ceiling remain enforced. Discovery releases the account writer
+lock before collection/network work and merges into the latest atomic state,
+preserving account events and owner exclusions received during refresh.
+
+A reviewed-hints file is an object with a `sources` list. Each version-specific
+entry requires `url` (HTTPS), `provider`, `model` (exact version present in the
+fetched evidence), `authority` (`primary` or `secondary`), `reviewed_by` and
+`reviewed_at` (ISO date); secondary evidence also requires `as_of` (ISO date).
+Review provenance is an explicit attestation supplied by the caller; discovery
+does not invent review or authorize model adoption. Evidence is stored by digest
+using the existing learner store (`--storage-root` can isolate it).
+
+`learner.model_inventory.record_observation` records exact route/model account
+success, cooldown or unknown state with event timestamps; permanent exclusions
+and their releases require owner authority. Shared-pool limits need explicit
+route/model membership evidence. Newer account success or weekly catalog data
+cannot clear an owner exclusion; stale events cannot clear newer limits. Quota
+and infrastructure failures are availability evidence, separate from learned
+implementation quality. Recommendations expose filtered routes and may have no
+backup; they fail closed if none remain eligible. Keep strict owner pins restricted
+to their configured single worker; ordinary queue pins retain existing fallback.
+
+With mini policy, implicit gate reviews use exact read-only Carbon/Astra adapters.
+Explicit compatible custom review contracts remain eligible, including healthy
+centrally authorized Fable contracts regardless of their display alias. Historical
+explicit chains and templates are validated unchanged against current policy;
+stale pins, missing pins and unsafe mode overrides fail closed at admission and
+review. Independence is rechecked against workers that actually completed tasks
+after fallback. Unavailable review preserves completed work as unreviewed, with
+existing budgets and acceptance gates intact.
+
+### Durable supervision of an authorized batch
+
+For new authorized flow-run batches with a known origin session, select
+`flow supervise` by default over the ordinary gate runner. Opt out explicitly
+when session metadata or a durable host owner is unavailable. Bind
+only the admitted TODO tasks, the package specification and the originating host
+session. Use finite cumulative calls and wall-clock seconds under the existing
+authorization. For example (replace every path and session identifier):
+
+```sh
+flow supervise launch --repo /absolute/project --session <exact-origin-UUID> \
+  --package docs/work/package/spec.md --tasks A,B --max-calls 12 --seconds 7200 \
+  --transport codex --watch
+```
+
+Launch this command as the existing user systemd transient service when available
+(see the run-queue launch reference). `--watch` owns one watcher without requiring
+another user turn. Without it, launch detaches the gate and exits; the host must
+explicitly run `flow supervise watch --repo ...` under a supported owner. The
+adapter neither installs a scheduler nor enables lingering. User-manager lifetime
+still depends on the platform's existing login settings. Attached watch is
+available where there is no detached owner; disclose that lifetime limitation.
+Use `--transport codex` for an existing local Codex UUID. The adapter checks
+local session metadata against both UUID and repository before launch. Generic
+Unix IPC remains available when the host has an explicit compatible receiver;
+otherwise delivery stays pending. Windows retains its existing launcher.
+
+`.gate/supervision/state.json` binds the resolved repo, package and configuration
+hashes, admitted task metadata (including scope, checks, pins and dependencies),
+origin session, absolute deadline and cumulative model calls. Task status and
+completion commits may advance normally. All new gate runners share a
+process-lifetime writer lock; supervised worker, probe and reviewer dispatches
+reserve calls under the same short transaction as user stop. Existing policy,
+strict pins, clean fallback, required review and acceptance remain gate-owned.
+`flow supervise stop --repo ...` persists the stop and prevents later dispatch;
+an already-started call may finish. Stop never resets the envelope or budget.
+
+The idle `tick` is a bounded no-model/no-network check, due about every 30 minutes and
+persistently deduplicated; duplicate ticks return without reading the journal.
+It uses the existing byte cursor, reading at most one bounded page per due tick.
+Backlog pages are immediately due. Healthy idle checks do not scan history or
+send empty updates. Boot ID and process-start identity distinguish reused Linux
+PIDs; unavailable identity requires host reconciliation. Only clean interrupted
+work with no unresolved call, claimed task or competing runner can resume, once
+per progress signature. A failed or unchanged outcome, dirty/uncertain work,
+journal integrity warning, configuration/scope change or exhausted cumulative
+limit becomes a durable host hold. Clean `no_workers` endings instead enter
+`waiting_routes`; later due ticks check local eligibility and known cooldown
+expiry, with no network probe or inference. Recovery is attempted once per
+changed eligible-route/progress signature within the same cumulative envelope.
+Startup with no available routes also records a normal `no_workers` end; an
+unsupervised run still refuses at startup. Terminal accepted/stopped watchers
+exit after a delivery attempt even when a final message remains pending on disk.
+Codex delivery binds only in the explicitly invoked originating session with
+its exact trusted UUID; the repo may be nested under its persisted working
+directory. Unrelated threads and `--last` remain unsupported.
+Use `flow supervise resume --repo ...` only after same-owner reconciliation of
+partial effects and task rows, from the bound session. The default session is
+trusted `CODEX_THREAD_ID`; `--session <same-bound-ID>` is also supported. It preserves the token, counters, scope and deadline
+and refuses live/uncertain calls, edits or unresolved delivery. A separately
+authorized launch after settlement/stop archives the old envelope (including any
+pending message); it never silently resets the old batch. No transcript text is
+executed or replayed.
+No automatic source discard or worker takeover occurs.
+
+The native Codex adapter uses a bounded `codex exec resume --json` targeting
+only the verified UUID, exact configured design pin and read-only sandbox.
+With an installed policy, its design Codex pin is authoritative. Without one,
+set `supervision.notification_pin` in `.gate/config.json` to an object containing
+exact `model` and `effort` strings before binding the batch. Missing pins keep
+notifications pending without a call. It sends a
+fixed status prompt with supervisor phase/counts, acceptance boundary and event
+ID, never transcript text or event
+commands. The turn consumes the same cumulative call budget and deadline. It
+waits while the runner or a detected exact-session resume is busy; stop prevents
+new turns. A matching `thread.started` and successful `turn.completed` establish
+`exact_session_turn_completed`, not proof the user read the message. Missing
+CLI/metadata, busy/offline routes or exhausted limits retain pending. An
+ambiguous started turn is not replayed automatically; the host must reconcile
+it against that exact thread. Disposable real-session verification is a separate
+host acceptance step; offline fixtures never call a vendor.
+
+The optional generic transport is a host-owned Unix stream socket with owner UID
+verification where supported. The host registers that socket for the exact
+originating session. A receiver accepts a bounded newline JSON notification:
+`version`, `session`, `id`, `repo`, `notification` (phase/reason/bounded event
+summaries/accepted tasks), routes it only to that registered session and replies
+`{"session":"exact-origin-thread","id":"received-id","ack":true}`.
+Receiver deduplication uses session plus ID; delivery may repeat after a lost ACK.
+A changed summary gets a new ID. Receivers must treat all fields as data and must
+never create owner threads, run transcript commands or start competing writers.
+This IPC contract requires an actual host adapter; a CLI shell alone does not
+provide chat delivery. Missing transport or ACK remains visibly `pending` and
+retries on later due ticks. Native Codex delivery requires explicit
+`--transport codex`; `status` and read-only `flow resume --json`
+expose the pending message on reconnect.
+
+`run_end` is not acceptance. Only the gate's successful package settlement records
+accepted task IDs; supervision reports `accepted` after the runner exits with
+fresh, clean settlement evidence for every bound task. Report the selected stage
+and any remaining delivery checks from RUN-REPORT; a development-stage settlement
+does not establish delivery acceptance. Outages and switches are notifications,
+never learned quality scores. Run the full offline suites and focused review
+before activating this code. Sandbox tests cover CLI launch/hook/settlement,
+restart/stop races, PID reuse, bounded idle, duplicate ticks and no-user-turn IPC.
+
+Rollback: stop the supervisor service and persist `stop`, inspect and wait for any
+existing runner/call to finish, then retain the supervision directory and journal
+as evidence. Restore the prior runtime only after confirming no writer remains.
+Do not delete locks/state to force a restart. A responsible host may archive a
+held envelope only after reconciling side effects, ownership and remaining
+authorization; a same-batch resume retains its counters/deadline.
+No live project, installed runtime, scheduled job or active thread is migrated by
+this feature or its tests.
+
+The built-in Carbon reviewer stays in plan mode with session-only scoped
+`read_file` access to the repository, `.gate/final-review-evidence` and owner
+model policy files. A shared contract builder/validator upgrades legacy plan
+commands while preserving env/TLS wrappers. Writes, shell commands and remote
+tools are denied; no persistent settings are changed.
+
+
+### Technical review consultation
+
+Repeated mapped blockers or an explicit technical dispute arrange two blind
+senior sessions through existing guarded read-only providers. The run report and
+supervision notification identify pending/needs-host advice; it is never a pass.
+Inspect `.gate/consult/state.json`, check the evidence, and use
+`flow consult-settle --tasks <ids> --episode <id> --disposition <json-file> --repo .`
+to record one repair and dissent disposition. Then hand the scoped repair to the
+coding pool and obtain fresh independent review. Unchanged rejected candidates
+are deduplicated across explicit review/restart. See
+[consultation accounting and settlement](autonomy.md#senior-consultation-after-technical-rejection).

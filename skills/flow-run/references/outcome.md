@@ -54,3 +54,28 @@ warnings. If the run brought a user correction or a verified failure and fix,
 record one candidate lesson in the package's `evidence.md` ([evidence learning](../../../docs/autonomy.md#evidence-learning-and-bounded-experiments)) and the decision in the spec; otherwise none. When a learning-backed or skill experiment completes (accepted, rejected, or inconclusive), record the project-owned experiment/review outcome and any natural-language matching preference via `flow learn feedback` without relying on model opinion alone. Checkpoint again at
 package closure. If the user asked to finish everything and TODO rows
 remain for a reason other than a genuine blocker, say so and launch again.
+
+For supervised batches, inspect `flow supervise status --repo ...` once on
+reconnect (also exposed by `flow resume`). Relay pending delivery explicitly.
+`run_end` is distinct from acceptance of every bound task; report settlement and
+its actual stage from gate evidence. `needs_host` is a durable hold: reconcile
+partial edits, side effects, ownership and cumulative limits before any successor
+launch; do not clear state to replay. `stop` persists across watcher restarts and
+blocks subsequent dispatch, including reviewers. Existing outages remain
+availability evidence, never implementation-quality misses.
+
+For native notifications, report `delivery_evidence` literally: exact-session turn
+completion is distinct from pending, busy, unsupported or uncertain delivery.
+A clean `no_workers` run can remain `waiting_routes` under the original envelope;
+a host hold still requires explicit reconciliation. Never reset cumulative limits
+or replay an uncertain status turn to make delivery appear successful.
+
+
+Technical escalation or a mapped repair retaining all blockers now arranges one
+blind senior consultation round in the gate. Read the reported episode in
+`.gate/consult/state.json` once, check both replies against primary evidence and
+record one repair/test plus dissent using `flow consult-settle`. Pending seats,
+outages and unresolved advice remain holds; do not repeat an unchanged review or
+reset reservations. Advice cannot settle acceptance. Follow
+[host settlement](../../../docs/autonomy.md#senior-consultation-after-technical-rejection)
+and hand the repair to the coding pool before fresh independent review.

@@ -62,6 +62,12 @@ class ReviewHarness(unittest.TestCase):
 
     def setUp(self) -> None:
         self.gate = load_gate_module()
+        # Portable contract fixture: this installation has no machine owner policy.
+        portable_home = tempfile.TemporaryDirectory()
+        self.addCleanup(portable_home.cleanup)
+        home_env = mock.patch.dict(os.environ, HOME=portable_home.name)
+        home_env.start()
+        self.addCleanup(home_env.stop)
 
     @staticmethod
     def args(repo: Path, max_tasks: int | None = None) -> SimpleNamespace:
@@ -708,14 +714,24 @@ class ReviewIsAGateTests(ReviewHarness):
             self.assertEqual(calls["n"], 1)
             self.assertFalse(self.gate.repair_continuation_required(repo))
 
+    def _seed_lineage_blockers(self, repo, blockers):
+        # Historical id-only events cannot identify a task lineage. Model a
+        # prior scoped rejection rather than borrowing another task's BUG IDs.
+        cfg = self.gate.load_config(repo)
+        module = self.gate.consult_module()
+        key, _, _ = self.gate.consultation_identity(repo, cfg, ['EAV-2'])
+        with module.locked(repo, self.gate._try_os_lock) as directory:
+            state = module.load(directory)
+            module.entry(state, key)['last'] = {'blockers': blockers}
+            module.save(directory, state)
+
     def test_a_repair_stops_only_when_recorded_blockers_do_not_improve(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             (Path(td) / "own").mkdir()
             (Path(td) / "other").mkdir()
             repo = judged_runner_repo(Path(td) / "own", ["claude"])
             self._mark_repair_row(repo)
-            self.gate.journal(repo, {"event": "review_verdict", "passed": False,
-                                    "blocker_ids": [self.gate.defect_id(HIGH[0])]})
+            self._seed_lineage_blockers(repo, [self.gate.defect_id(HIGH[0])])
             judge, _ = self._judge([verdict(90, "pass", findings=HIGH)])  # high on eav2.txt
             report = self._run(repo, self._spawn([]), judge, expect_exit="3")
             self.assertIn("stopped because: **review_loop:eav2.txt**", report)
@@ -742,8 +758,7 @@ class ReviewIsAGateTests(ReviewHarness):
                 self._mark_repair_row(repo)
                 if findings:
                     old = self._finding("high", "not fixed", file=location)
-                    self.gate.journal(repo, {"event": "review_verdict", "passed": False,
-                                            "blocker_ids": [self.gate.defect_id(old)]})
+                    self._seed_lineage_blockers(repo, [self.gate.defect_id(old)])
                 judge, calls = self._judge([verdict(70, kind, findings=[
                     self._finding("high", "not fixed", file=location)] if findings else [])])
                 report = self._run(repo, self._spawn([]), judge, expect_exit="3")
@@ -1098,6 +1113,12 @@ class FullOracleTurnTests(unittest.TestCase):
 class JudgeChainTests(unittest.TestCase):
     def setUp(self) -> None:
         self.gate = load_gate_module()
+        # Portable contract fixture: this installation has no machine owner policy.
+        portable_home = tempfile.TemporaryDirectory()
+        self.addCleanup(portable_home.cleanup)
+        home_env = mock.patch.dict(os.environ, HOME=portable_home.name)
+        home_env.start()
+        self.addCleanup(home_env.stop)
 
     def test_chain_falls_through_on_outage_and_unparsable(self) -> None:
         with tempfile.TemporaryDirectory() as td:
